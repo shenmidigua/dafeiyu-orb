@@ -141,6 +141,31 @@ describe('typing frame', () => {
     }
   })
 
+  it('resolves the release frame with the length of its own animation', async () => {
+    // The release is a one-shot, so unlike `drag` it has to come back carrying a duration: the
+    // page holds the face for exactly one pass and the step counter restarts the GIF.
+    const root = await pack()
+    try {
+      const config = join(root, 'memes.json')
+      await writeFile(config, JSON.stringify({ dir: root, drop: { file: 'in.gif' } }))
+      assert.deepEqual(await createMemePicker(config).drop(), {
+        src: `data:image/gif;base64,${tinyGif().toString('base64')}`,
+        ms: 500,
+      })
+      // A bare name is matched anywhere in the pack, the same way every other slot resolves.
+      await writeFile(config, JSON.stringify({ dir: root, drop: { file: 'PNGTuber 闲置.gif' } }))
+      assert.notEqual(await createMemePicker(config).drop(), null)
+      await writeFile(config, JSON.stringify({ dir: root, drop: { file: 'gone.gif' } }))
+      assert.equal(await createMemePicker(config).drop(), null)
+      // Unnamed means no release face at all, which is what a profile written before this slot
+      // existed looks like.
+      await writeFile(config, JSON.stringify({ dir: root }))
+      assert.equal(await createMemePicker(config).drop(), null)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('resolves the click reaction with the length of its own animation', async () => {
     const root = await pack()
     try {

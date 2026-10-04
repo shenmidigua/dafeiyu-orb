@@ -445,6 +445,13 @@ function main() {
   let wakeStep = 0
   // The drag face: worn for as long as the ball is being carried.
   let dragSrc
+  // The release face: one pass of a GIF the moment the pointer lets go. It is an event, not a
+  // state — the carry wears `drag`, and what follows the carry is this, so it is kept apart from
+  // `dragSrc` rather than being a second loop the carry could fall back to.
+  let dropFrame
+  let dropShown
+  let dropTimer
+  let dropStep = 0
   let agentState = ''
   // The nap timeline: how long the ball has been untouched, and which frame it reached.
   let sleepInfo
@@ -901,6 +908,17 @@ function main() {
       if (gif.dataset.mode !== 'drag') {
         gif.dataset.mode = 'drag'
         gif.src = dragSrc
+      }
+      return
+    }
+    // The release that follows the carry. It sits directly under `drag` so that picking the ball
+    // up again cuts the drop short — the ball is being carried, and that is the more current fact
+    // — and above everything else because it is the other half of the gesture the user just made.
+    if (dropShown !== undefined) {
+      const mode = `drop-${dropShown.step}`
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = dropShown.src
       }
       return
     }
@@ -1418,6 +1436,10 @@ function main() {
       const frame = await fetchWake()
       if (frame !== null) wakeFrame = frame
     }
+    if (dropFrame === undefined || dropFrame === null) {
+      const frame = await fetchDrop()
+      if (frame !== null) dropFrame = frame
+    }
     if (voiceSrc === undefined) await loadVoiceFrame()
     if (speakSrc === undefined) await loadSpeakFrame()
     if (dragSrc === undefined) {
@@ -1482,6 +1504,50 @@ function main() {
       return null
     }
     return timedFrameOf(frame)
+  }
+
+  /** The release frame, or `null` while it is off or unreadable. */
+  async function fetchDrop() {
+    if (typeof api.memeDrop !== 'function') return null
+    let frame
+    try {
+      frame = await api.memeDrop()
+    } catch {
+      return null
+    }
+    return timedFrameOf(frame)
+  }
+
+  /**
+   * Play the release frame once, the moment the pointer lets go of a carried ball.
+   *
+   * The frame is normally already in hand: `refreshFrames()` asks for it at startup. But the
+   * first drag after a restart can beat the burst cycle to it, and the drop is the one reaction
+   * the user is guaranteed to be looking at — they just let go — so a frame that is not cached
+   * yet is fetched here on demand rather than skipped. That is the same choice `playWakeFrame`
+   * makes, for the same reason.
+   *
+   * It carries a step like every other one-shot: a new mode is what makes the image element
+   * reload the GIF from its first frame instead of holding the last one it stopped on. Without
+   * it, a second drag in the same session would replay nothing at all.
+   */
+  function playDropFrame() {
+    if (dropFrame === undefined || dropFrame === null) {
+      void fetchDrop().then((frame) => {
+        if (frame === null) return
+        dropFrame = frame
+        playDropFrame()
+      })
+      return
+    }
+    dropStep += 1
+    dropShown = { src: dropFrame.src, step: dropStep }
+    clearTimeout(dropTimer)
+    dropTimer = setTimeout(() => {
+      dropShown = undefined
+      syncGif()
+    }, Math.max(dropFrame.ms, ONE_SHOT_MIN_MS))
+    syncGif()
   }
 
   /**
@@ -3445,6 +3511,10 @@ function main() {
       // where the pointer let it go even when loading the next GIF costs this page a frame.
       const landed = skipDock || origin === undefined ? undefined : moveBall(origin.x, origin.y)
       syncGif()
+      // The other half of the carry. It is played after the redraw above rather than instead of
+      // it, so a drop frame that is not cached yet leaves the ball repainting to its resting pose
+      // immediately instead of freezing on the drag face until the read comes back.
+      playDropFrame()
       // The drag is over, so the window goes back to capturing over the elements alone. Reported
       // after the move and the clamp, both of which can dock and change the answer.
       if (landed !== undefined) {

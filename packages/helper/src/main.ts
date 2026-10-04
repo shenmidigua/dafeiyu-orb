@@ -616,6 +616,11 @@ ipcMain.handle('orb:meme-speak', (event) => {
   return picker().speak()
 })
 
+ipcMain.handle('orb:meme-drop', (event) => {
+  if (!fromBall(event)) return null
+  return picker().drop()
+})
+
 ipcMain.handle('orb:meme-skit', (event) => {
   if (!fromBall(event)) return null
   return picker().skit()

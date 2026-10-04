@@ -163,6 +163,9 @@ contextBridge.exposeInMainWorld('dshOrb', {
   memeDrag() {
     return ipcRenderer.invoke('orb:meme-drag')
   },
+  memeDrop() {
+    return ipcRenderer.invoke('orb:meme-drop')
+  },
   memeFrame() {
     return ipcRenderer.invoke('orb:meme-frame')
   },

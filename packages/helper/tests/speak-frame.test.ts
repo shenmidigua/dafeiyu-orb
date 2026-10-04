@@ -90,7 +90,7 @@ function modeFor(inputs: GifInputs): string {
   const factory = new Function('deps', `
     const { document, pageClosed, syncSleep, dragging, clickShown, wakeShown, doneShown,
             typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive, voiceSrc,
-            dictationPhase } = deps
+            dictationPhase, dropShown, dropStep } = deps
     ${pageFunction(shell, 'syncGif')}
     return syncGif
   `)
@@ -110,6 +110,11 @@ function modeFor(inputs: GifInputs): string {
     speakActive: inputs.speakActive ?? false,
     voiceSrc: inputs.voiceSrc,
     dictationPhase: inputs.dictationPhase ?? 'idle',
+    // A new branch above this one has to be named here, or the harness dies with
+    // "dropShown is not defined" instead of reporting which mode won. It stays undefined because
+    // no release is in progress while the speaker is talking.
+    dropShown: undefined,
+    dropStep: 0,
   }) as () => void
   syncGif()
   assert.notEqual(gif.dataset.mode, undefined, 'syncGif fell through every branch without painting')

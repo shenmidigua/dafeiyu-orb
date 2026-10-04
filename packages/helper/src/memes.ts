@@ -198,6 +198,8 @@ export interface MemePicker {
   wake(): Promise<TimedFrame | null>
   /** A `data:` URL the ball wears while it is being dragged around the screen. */
   drag(): Promise<string | null>
+  /** The release reaction, played once the pointer lets go: the drop, not the carry. */
+  drop(): Promise<TimedFrame | null>
   /** The nap timeline, or `null` while it is off or no file resolves. */
   sleep(): Promise<SleepPlanInfo | null>
   /** One nap frame by index, read when the page reaches that step. */
@@ -224,6 +226,7 @@ interface MemeConfig extends MemeSchedule {
   readonly done: NamedFrame
   readonly wake: NamedFrame
   readonly drag: NamedFrame
+  readonly drop: NamedFrame
   readonly sleep: SleepPlan
   readonly skit: SkitFrame
 }
@@ -236,7 +239,7 @@ interface MemeConfig extends MemeSchedule {
  *    "voice": { "file": "nod.gif" }, "speak": { "file": "talk.gif" },
  *    "thinking": { "file": "reasoning.gif" }, "tool": { "file": "tool.gif" },
  *    "click": { "file": "pat.gif" }, "done": { "file": "bell.gif" }, "wake": { "file": "bang.gif" },
- *    "drag": { "file": "scared.gif" },
+ *    "drag": { "file": "scared.gif" }, "drop": { "file": "land.gif" },
  *    "sleep": { "afterMs": 300000, "stepMs": 300000, "yawn": { "file": "yawn.gif", "times": 2 },
  *               "files": ["nap1.gif", "nap2.gif"] },
  *    "skit": { "gapMs": [120000, 300000], "file": "skit.gif", "times": [3, 5], "interject": "mid.gif" } }`
@@ -394,6 +397,11 @@ export function createMemePicker(configPath: string, random: () => number = Math
       const current = await loadConfig()
       return named(current.drag, current.dirs)
     },
+    async drop() {
+      const current = await loadConfig()
+      if (!current.drop.enabled) return null
+      return timedFrame(current.drop.file, current.dirs)
+    },
     async sleep() {
       const current = await loadConfig()
       if (!current.sleep.enabled) return null
@@ -460,6 +468,7 @@ async function readConfig(path: string): Promise<MemeConfig> {
     done: FRAME_DEFAULTS,
     wake: FRAME_DEFAULTS,
     drag: FRAME_DEFAULTS,
+    drop: FRAME_DEFAULTS,
     sleep: SLEEP_DEFAULTS,
     skit: SKIT_DEFAULTS,
   }
@@ -491,6 +500,7 @@ async function readConfig(path: string): Promise<MemeConfig> {
     done: readNamed(record.done),
     wake: readNamed(record.wake),
     drag: readNamed(record.drag),
+    drop: readNamed(record.drop),
     sleep: readSleep(record.sleep),
     skit: readSkit(record.skit),
   }
