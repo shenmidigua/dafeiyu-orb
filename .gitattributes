@@ -1,0 +1,27 @@
+# Normalize line endings in the repository. The working tree is Windows
+# (core.autocrlf=true), so without this every fresh clone would rewrite every
+# text file and produce a dirty tree on first checkout.
+* text=auto eol=lf
+
+# Shell/CI entry points must keep LF even on Windows.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows script hosts expect CRLF; LF breaks some of them.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+*.lnk binary
+
+# Never touched by the EOL filter.
+*.gif binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.webp binary
+*.onnx binary
+*.wasm binary
+*.tgz binary
+*.node binary

@@ -1,0 +1,82 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+.turbo/
+.cache/
+
+# Compiled from packages/*/src by `pnpm build` — never hand-edited
+packages/*/lib/
+packages/helper/assets/vendor/
+
+# Package artifacts
+*.tgz
+*.tgz.bak-*
+
+# Electron helper runtime (downloaded, not vendored)
+.electron/
+electron-cache/
+
+# Native modules
+*.node
+native/**/build/
+packages/native-selection/build/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+
+# Logs and coverage
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*~
+
+# Local agent / tooling state
+.cursor/
+.zcode/
+.zcodeignore
+
+# Assembled by packages/bundle/scripts/assemble.mjs
+packages/bundle/lib/
+packages/bundle/client.js
+
+# assemble.mjs leaves the previous build behind as a dot-prefixed copy inside the
+# output root (retired is mkdtemp'd *inside* outRoot). Each rebuild adds one more.
+packages/bundle/.retired-*/
+packages/bundle/.assemble-*/
+
+# Scratch dirs from probing the DSH asar
+_asar_probe/
+
+# Local verification leftovers (dsh_orb/ holds the real wake-word training tools)
+dsh_orb/__pycache__/
+dsh_orb/*.log
+dsh_orb/*.jsonl
+_probe*.mjs
+
+# onnxruntime-web runtime (MIT, fetched from CDN — not source)
+dsh-voice-dialog/assets/ort/
+dsh-voice-dialog/logs/
