@@ -46,10 +46,16 @@ PROFILE = pathlib.Path(r"C:\Users\digua\.dsh\profiles\desktop")
 WAKE_CONFIG = PROFILE / "orb-wake.json"
 
 KEYWORD = "dafeiyu"
-# Chosen from `wake_eval.py`'s table, not guessed: the lowest threshold whose held-out filler
-# false-positive rate stays under 1% while recall stays above 99%. Missing the wake word is the
-# failure a user cannot work around, so the rule leans towards recall.
-THRESHOLD = 0.75
+# Written into orb-wake.json by the `install` stage, so this is the value that gets shipped when the
+# pipeline deploys a freshly trained model.
+#
+# The owner asked for silence over recall on 2026-10-04, so the rule is the same one `wake_eval.py`
+# applies when it reports a `chosen` threshold: take the highest threshold whose held-out recall
+# stays at or above 97%. On the model trained that day that rule landed on 0.95, and the honest way
+# to keep this number current is to read it back out of the eval report rather than to keep editing
+# it here after every training run — `wake_eval.py` writes `chosen.threshold` into
+# `features/dafeiyu-eval.json`.
+THRESHOLD = 0.95
 
 STAGES = ["synth", "features", "train", "eval", "probe", "install"]
 COST = {"synth": "~4 min, needs the Edge read-aloud service",

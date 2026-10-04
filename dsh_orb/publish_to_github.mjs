@@ -179,6 +179,16 @@ async function ensure(dir) {
     const r = await api('/git/trees', { method: 'POST', body: JSON.stringify({ tree: children }) });
     if (r.status === 201) { made.set(dir, r.json.sha); return r.json.sha; }
     const body = JSON.stringify(r.json);
+    // "Your request timed out" on a large directory, with every blob already present. GitHub
+    // rebuilds the whole subtree to answer, so a 274 MB asset directory can fail here no matter
+    // how many times it is retried — and when that directory is unchanged since the last publish,
+    // the previous commit already holds the exact sha this one wants. Point at it instead.
+    if (/timed out/i.test(body) && reused.size > 0 && reused.get(dir) !== undefined) {
+      const sha = reused.get(dir);
+      console.log(`  ${dir || '<root>'}: timed out, reusing the sha the last commit already has`);
+      made.set(dir, sha);
+      return sha;
+    }
     const m = MISSING_RE.exec(body);
     if (!m) { console.error('tree failed:', dir || '<root>', r.status, body.slice(0, 400)); process.exit(1); }
     console.log(`  missing blob ${m[1].slice(0, 10)}  ${bySha.get(m[1])?.path ?? '(unknown)'}`);
@@ -186,6 +196,58 @@ async function ensure(dir) {
   }
   console.error('tree did not converge:', dir);
   process.exit(1);
+}
+
+/**
+ * Subtree shas the previous commit already holds, keyed by directory path.
+ *
+ * Read once, from the tree of the commit the new one will hang off, so `ensure()` can reuse a sha
+ * for any directory whose contents did not change. Only consulted after a timeout — never
+ * substituted for a build that succeeds — because a stale entry would silently publish the old
+ * contents under the new message.
+ */
+const reused = new Map();
+{
+  const ref = await api('/git/ref/heads/main', {}, 3);
+  const commitSha = ref.json?.object?.sha;
+  if (commitSha) {
+    const tree = await api(`/git/commits/${commitSha}`, {}, 3);
+    const root = tree.json?.tree?.sha;
+    if (root) {
+      const flat = await api(`/git/trees/${root}?recursive=1`, {}, 3);
+      // Reuse needs proof that nothing in the directory changed, and a sha comparison cannot
+      // supply it: a blob whose contents were edited keeps its path, so a directory whose entry
+      // list is identical may still need a new subtree. What does prove it is the previous commit —
+      // see DSH_UNCHANGED_DIRS, which the caller derives from git itself.
+      //
+      // So this is only consulted for directories the caller vouched for, and the caller's claim is
+      // checked here in one respect that costs nothing: the directory must exist remotely with the
+      // same number of direct children. A wrong claim then fails loudly instead of publishing a
+      // stale tree.
+      const remoteChildren = new Map();
+      for (const entry of flat.json?.tree ?? []) {
+        if (entry.type !== 'tree') continue;
+        const path = entry.path.split('/');
+        const parent = path.slice(0, -1).join('/');
+        if (!remoteChildren.has(parent)) remoteChildren.set(parent, []);
+        remoteChildren.get(parent).push(entry.path.split('/').pop());
+      }
+      for (const dir of (process.env.DSH_UNCHANGED_DIRS ?? '').split(',').map((s) => s.trim())
+        .filter(Boolean)) {
+        const sha = flat.json?.tree?.find((e) => e.path === dir && e.type === 'tree')?.sha;
+        const mine = dirs.has(dir) ? [...dirs.get(dir).keys()].sort() : null;
+        const theirs = remoteChildren.get(dir)?.slice().sort();
+        if (!sha || mine === null || theirs === undefined || mine.length !== theirs.length
+            || !mine.every((v, i) => v === theirs[i])) {
+          console.log(`  ${dir}: not reusable (vouched unchanged, but the two listings disagree)`);
+          continue;
+        }
+        reused.set(dir, sha);
+        console.log(`  ${dir}: reusable, ${theirs.length} entries match the last commit`);
+      }
+      console.log(`${reused.size} unchanged subtrees available for reuse`);
+    }
+  }
 }
 
 const rootSha = await ensure('');

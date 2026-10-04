@@ -174,6 +174,8 @@ export class WakeEngine {
     this.frames = 0
     this.peak = 0
     this.dictation = undefined
+    // Read-aloud is in progress. See `mute()` for why this is more than a cosmetic flag.
+    this.muted = false
     // One measured level per audio frame, newest at `levelCursor`. The ball draws this
     // while the microphone is open for an utterance; nothing else reads it.
     this.levels = new Float32Array(WAVE_BARS)
@@ -359,15 +361,28 @@ export class WakeEngine {
    * @returns a short human-readable detail for the status line.
    */
   async openMicrophone() {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    // Echo cancellation is not a refinement here, it is what keeps the wake word from hearing
+    // the ball: read-aloud audio leaves the same speakers the microphone is beside, and the
+    // training data is Mandarin in synthesised voices, so a non-cancelled copy of our own output
+    // is close to a positive sample. `mute()` covers the windows while a reply is playing; this
+    // covers the bleed that arrives outside those windows — the tail of a reply, the chime, the
+    // tail of the chime.
+    const want = { echoCancellation: true, noiseSuppression: false, autoGainControl: false }
+    let stream = await navigator.mediaDevices.getUserMedia({ audio: want })
+    // A device or driver may refuse the constraint and hand back the default capture anyway, which
+    // the browser reports without throwing. There is no way to read the applied settings back
+    // reliably across platforms, so the fact is stated rather than verified: `mute()` is what
+    // makes this safe to live without.
+    const applied = stream.getAudioTracks()[0]?.getSettings?.()
+    const ecNote = applied?.echoCancellation === false ? '回声消除不可用' : ''
     let audioContext
-    let detail = ''
+    let rateNote = ''
     try {
       audioContext = new AudioContext({ sampleRate: SAMPLE_RATE })
     } catch {
       // The device refused 16 kHz; take its own rate and resample per frame below.
       audioContext = new AudioContext()
-      detail = `${audioContext.sampleRate} Hz`
+      rateNote = `${audioContext.sampleRate} Hz`
     }
     // A context created without a preceding gesture stays suspended and produces no
     // audio callbacks at all: the feature would look healthy and never detect. Opening
@@ -411,7 +426,9 @@ export class WakeEngine {
     this.audioContext = audioContext
     this.source = source
     this.node = node
-    return detail === '' ? '' : `采样率 ${detail}`
+    // Both parts are notes for the status line, neither is a failure: a refused sample rate is
+    // resampled per frame and a device without echo cancellation is covered by `mute()`.
+    return detail === '' ? '' : `${detail}${ecNote} 采样率 ${rateNote}`.trim()
   }
 
   /** Release the microphone and every audio object. */
@@ -493,6 +510,10 @@ export class WakeEngine {
       await this.collectDictation(frame)
       return
     }
+    // Same early return, different reason: the speakers are playing the ball's own voice and the
+    // model would score it. Checked after the dictation branch because an in-flight recording has
+    // to keep collecting silence — dropping those frames would end the utterance as "no speech".
+    if (this.muted) return
     const speech = await this.runVad(frame)
     if (speech) {
       this.speechActive = true
@@ -502,6 +523,37 @@ export class WakeEngine {
       if (this.vadHangover <= 0) this.speechActive = false
     }
     await this.runModels(frame, this.speechActive)
+  }
+
+  /**
+   * Stop scoring for as long as the ball is talking.
+   *
+   * Without this the model transcribes its own voice: `/speak` returns audio that plays out of
+   * the same speakers the microphone sits next to, and `openMicrophone()` asks for no echo
+   * cancellation, so every word read aloud arrives at the classifier intact. That is not
+   * "background noise" to the model — it is Mandarin speech in the same voices and prosody the
+   * positives were synthesised with, which is the one input it has no reason to distrust.
+   *
+   * The buffers are dropped on the way in, for the same reason `finishDictation()` drops them
+   * on its way out: the ring buffer would otherwise still hold the last frames of audio from
+   * before the mute, and the classifier scores a 16-frame window, so the wake word could fire
+   * once more on audio recorded before anyone said anything.
+   *
+   * Counting rather than a flag, because the mute is edge-triggered from a cosmetic callback
+   * that fires on both edges and can be re-entered: two overlapping utterances must not have
+   * the first one to finish unmute a still-playing second.
+   */
+  mute() {
+    this.muted = true
+    this.reset()
+  }
+
+  /** Score again now that the speakers have gone quiet. */
+  unmute() {
+    this.muted = false
+    // Symmetric with `mute()`: the frames that arrived during the mute are speaker bleed and
+    // the frame before them may be the end of it. Both must not reach the classifier.
+    this.reset()
   }
 
   /**

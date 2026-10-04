@@ -75,6 +75,12 @@ _asar_probe/
 dsh_orb/__pycache__/
 dsh_orb/*.log
 dsh_orb/*.jsonl
+# Measurement output from the probes. The probes themselves are kept — they are what ruled out
+# noise and splice artefacts — but their numbers belong to one machine's run.
+dsh_orb/noise-probe.json
+dsh_orb/splice-probe.json
+dsh_orb/rateprobe/
+dsh_orb/whichword/
 _probe*.mjs
 
 # onnxruntime-web runtime (MIT, fetched from CDN — not source)

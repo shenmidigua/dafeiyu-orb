@@ -2384,6 +2384,14 @@ function main() {
     // a service that died mid-sentence — so neither edge can slip through by hooking it here.
     if (state.speaking !== speakActive) {
       speakActive = state.speaking
+      // The wake word must not hear the ball. `/speak` plays out of the speakers beside the
+      // microphone and the positives were synthesised in exactly these voices, so our own reply
+      // is close to a positive sample. This is the only place both edges of that state are
+      // visible, which is why the mute lives here rather than in the two call sites that start
+      // and stop playback — they do not know about each other, and the automatic path never
+      // touches this code at all.
+      if (speakActive) wake.mute()
+      else wake.unmute()
       // The first reply of a session can start before `refreshFrames` has made its round, so ask
       // for the frame now rather than wearing nothing for the opening sentence.
       if (speakActive && speakSrc === undefined) void loadSpeakFrame()

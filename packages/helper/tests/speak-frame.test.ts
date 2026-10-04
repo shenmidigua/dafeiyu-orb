@@ -160,17 +160,19 @@ describe('the read-aloud frame', () => {
  * they are the two things this function assigns, and a `const` binding would fail the first
  * assignment instead of testing the branch that follows it.
  */
-function repaintsFor(sequence: boolean[], frameLoaded = true): { repaints: number; loads: number } {
+function repaintsFor(sequence: boolean[], frameLoaded = true): {
+  repaints: number; loads: number; mutes: number; unmutes: number
+} {
   const status = { textContent: '' }
   const factory = new Function('deps', `
     const { speechButtons, status, speechStatusText, paintSpeakButton, speakSrc,
-            loadSpeakFrame, syncGif } = deps
+            loadSpeakFrame, syncGif, wake } = deps
     let speakActive = false
     let speechStatus = ''
     ${assignedFunction(shell, 'syncSpeechButtons')}
     return (state) => syncSpeechButtons(state)
   `)
-  const counter = { repaints: 0, loads: 0 }
+  const counter = { repaints: 0, loads: 0, mutes: 0, unmutes: 0 }
   const call = factory({
     speechButtons: new Map(),
     status,
@@ -181,10 +183,18 @@ function repaintsFor(sequence: boolean[], frameLoaded = true): { repaints: numbe
     speakSrc: frameLoaded ? SPEAK : undefined,
     loadSpeakFrame: () => { counter.loads += 1 },
     syncGif: () => { counter.repaints += 1 },
+    // Declared, and counted, rather than merely defined: the mute rides the same edge as the
+    // repaint, and a stub that swallowed it would let this file keep passing after the wake word
+    // had stopped being muted. `wake-mute-wiring.test.ts` covers the shape; this covers the fact
+    // that this function is what calls it.
+    wake: {
+      mute: () => { counter.mutes += 1 },
+      unmute: () => { counter.unmutes += 1 },
+    },
   }) as (state: { speaking: boolean; enabled: boolean }) => void
 
   for (const speaking of sequence) call({ speaking, enabled: true })
-  return { repaints: counter.repaints, loads: counter.loads }
+  return { ...counter }
 }
 
 describe('the read-aloud repaint', () => {
@@ -211,6 +221,28 @@ describe('the read-aloud repaint', () => {
     assert.equal(repaintsFor([true], false).loads, 1)
     assert.equal(repaintsFor([true, false, true], false).loads, 2)
     assert.equal(repaintsFor([true], true).loads, 0, 'no refetch when the frame is already in hand')
+  })
+
+  it('mutes the wake word on exactly the edges it repaints on', () => {
+    // The mute shares this function's edge because this function is the only place both edges of
+    // the speaking state are visible. Counting them separately is the point: a mute on the level
+    // rather than the edge would reset the embedding ring on every per-sentence state the speaker
+    // emits, so the wake word would restart from silence between clauses.
+    const both = repaintsFor([true, false])
+    assert.equal(both.mutes, 1, 'starting to speak did not mute the wake word')
+    assert.equal(both.unmutes, 1, 'finishing the last sentence left the wake word muted')
+
+    const repeated = repaintsFor([true, true, true, false, false])
+    assert.equal(repeated.mutes, 1, 'per-sentence states re-muted an engine that was already muted')
+    assert.equal(repeated.unmutes, 1, 'per-sentence states un-muted an engine that was still speaking')
+    assert.equal(repeated.repaints, 2)
+  })
+
+  it('keeps the wake word scoring when read-aloud never runs', () => {
+    // The mute is driven entirely by the speaking edge, so a session in which the feature is off
+    // must leave the wake word untouched. A mute on `state.speaking` rather than on the change
+    // would fire here on every state and leave the feature permanently deaf after one reply.
+    assert.equal(repaintsFor([false, false, false]).mutes, 0)
   })
 })
 

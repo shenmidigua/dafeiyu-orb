@@ -179,9 +179,17 @@ def main() -> int:
           f"p95 {np.percentile(filler_best, 95):.3f}  "
           f"p99 {np.percentile(filler_best, 99):.3f}")
 
-    # Chosen, not maximised: a wake word that sometimes ignores its owner is worse than one that
-    # occasionally misunderstands a near-miss, because the user cannot tell whether it is broken.
-    # The rule is therefore "highest threshold still keeping recall at or above 97%".
+    # Chosen, not maximised. The owner asked for silence over recall on 2026-10-04: a ball that
+    # wakes on ordinary conversation is unusable, because it cannot be talked over, while one that
+    # occasionally needs the word said again is merely annoying. So the rule is "highest threshold
+    # still keeping recall at or above 97%", and the number it lands on is the shipped default.
+    #
+    # The reasoning below used to argue the opposite — that a missed wake word is worse because the
+    # user cannot tell whether it is broken. Both readings are defensible and the choice is the
+    # owner's, so what matters is that the code and the comment agree about which one is in force.
+    # `false_alarms_per_hour_of_speech` is the number the complaint was actually about: the clip
+    # rate above hides that a 2-second clip counts as one accept even when only one window of it
+    # crosses, so it badly understates what happens in a room where somebody is talking for hours.
     viable = [row for row in rows if row["recall"] >= 0.97]
     chosen = max(viable, key=lambda row: row["threshold"]) if viable else max(
         rows, key=lambda row: row["recall"])
