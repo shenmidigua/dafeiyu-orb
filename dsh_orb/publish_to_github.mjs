@@ -18,7 +18,14 @@
 //   - GET /git/blobs/<sha> returns the whole base64 body, so probing for
 //     existence re-downloads the entire repo. POST /git/trees instead: a 422
 //     names the sha it could not resolve, which is a free existence check.
+//   - `spawnSync git` can fail with EBUSY where the process is not allowed to
+//     fork (sandboxes, some Windows setups). Pass DSH_TREE_FILE to read a
+//     `git ls-tree -r HEAD` dump produced beforehand instead of shelling out:
+//       git -c core.quotepath=false ls-tree -r HEAD > tree.txt
+//       DSH_TREE_FILE=tree.txt node dsh_orb/publish_to_github.mjs
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const TOKEN = process.env.GITHUB_TOKEN;
 const REPO = process.env.GITHUB_REPO || 'shenmidigua/dafeiyu-orb';
@@ -58,8 +65,15 @@ async function api(path, init = {}, tries = 5) {
   return { status: 0, json: { error: String(last) } };
 }
 
-const raw = execFileSync('git', ['-c', 'core.quotepath=false', 'ls-tree', '-r', 'HEAD'],
-  { cwd: CWD, maxBuffer: 1 << 30 }).toString('utf8');
+// `core.quotepath=false` is not optional: without it ls-tree octal-escapes every
+// non-ASCII path and the 215 CJK-named entries cannot be read back. DSH_TREE_FILE
+// skips the subprocess entirely, so whoever produced the dump owns that flag.
+const TREE_FILE = process.env.DSH_TREE_FILE;
+const raw = TREE_FILE
+  ? readFileSync(TREE_FILE, 'utf8')
+  : execFileSync('git', ['-c', 'core.quotepath=false', 'ls-tree', '-r', 'HEAD'],
+    { cwd: CWD, maxBuffer: 1 << 30 }).toString('utf8');
+if (TREE_FILE) console.log(`tree from ${TREE_FILE} (no subprocess)`);
 const files = [];
 for (const line of raw.split('\n')) {
   if (!line.trim()) continue;
@@ -93,11 +107,55 @@ const made = new Map();
 const uploaded = new Set();
 const MISSING_RE = /tree\.sha ([0-9a-f]{40}) is not a valid/;
 
+/**
+ * Every blob in `DSH_BLOB_FILE`, keyed by sha.
+ *
+ * `git cat-file --batch` prints `<sha> blob <size>\n<bytes>\n` per record, so the
+ * format is self-delimiting and a Buffer walk is enough — no length-prefixed
+ * framing to trust. Empty when the variable is unset, and `loadBlob` then falls
+ * back to one subprocess per file.
+ */
+function loadBlobBatch(file) {
+  const buf = readFileSync(file);
+  const map = new Map();
+  let at = 0;
+  while (at < buf.length) {
+    const nl = buf.indexOf(0x0a, at);
+    if (nl === -1) break;
+    const header = buf.toString('latin1', at, nl);
+    const parts = header.split(' ');
+    if (parts.length < 3) break;
+    const size = Number(parts[2]);
+    if (!Number.isFinite(size)) break;
+    const start = nl + 1;
+    map.set(parts[0], buf.subarray(start, start + size));
+    at = start + size + 1;
+  }
+  return map;
+}
+
+const batch = process.env.DSH_BLOB_FILE ? loadBlobBatch(process.env.DSH_BLOB_FILE) : null;
+if (batch) console.log(`blob bodies from ${process.env.DSH_BLOB_FILE}: ${batch.size} blobs`);
+
+// The one spawn that cannot be avoided from inside this process: reading blob
+// bodies. It is a single `git cat-file --batch` for the whole repo rather than
+// one `cat-file blob <sha>` per file, because the per-file form is what turns a
+// fork restriction (EBUSY) into an unusable script.
+//
+// The bodies come from the object store, never from the working tree: five files
+// in this repo differ between the two (CRLF on checkout), and reading those from
+// disk would upload content whose sha is not the one the tree names.
+function loadBlob(sha) {
+  if (!batch) return execFileSync('git', ['cat-file', 'blob', sha], { cwd: CWD, maxBuffer: 1 << 30 });
+  if (batch.has(sha)) return batch.get(sha);
+  throw new Error(`${sha} is not in the batch dump; regenerate it after new commits`);
+}
+
 async function uploadBlob(sha) {
   if (uploaded.has(sha)) return true;
   const f = bySha.get(sha);
   if (!f) return false;
-  const data = execFileSync('git', ['cat-file', 'blob', sha], { cwd: CWD, maxBuffer: 1 << 30 });
+  const data = loadBlob(sha);
   for (let a = 0; a < 6; a++) {
     const r = await api('/git/blobs', {
       method: 'POST',
@@ -132,7 +190,10 @@ async function ensure(dir) {
 
 const rootSha = await ensure('');
 const prev = (await api('/git/ref/heads/main', {}, 3)).json?.object?.sha;
-const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: CWD, encoding: 'utf8' }).trim();
+// The commit message is the last thing that would fork, and it is the one field
+// a caller is most likely to have in hand already, so it takes an override.
+const message = (process.env.DSH_COMMIT_MSG
+  ?? execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: CWD, encoding: 'utf8' })).trim();
 
 const commit = await api('/git/commits', {
   method: 'POST',

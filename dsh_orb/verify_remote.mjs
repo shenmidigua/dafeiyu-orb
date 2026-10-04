@@ -1,4 +1,15 @@
+// Compare path+sha in both directions between the local HEAD and the remote main.
+//
+// Counting files is not enough: an early build reported a 14-entry tree with
+// `truncated: false`, which looks like success while every nested directory is
+// missing.
+//
+// DSH_TREE_FILE takes a `git -c core.quotepath=false ls-tree -r HEAD` dump
+// instead of spawning git, for the same reason publish_to_github.mjs has it:
+// `spawnSync git` fails with EBUSY wherever the process may not fork, and this
+// script is the one that says whether a publish worked.
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 const TOKEN = process.env.GITHUB_TOKEN;
 const REPO = process.env.GITHUB_REPO || 'shenmidigua/dafeiyu-orb';
@@ -6,8 +17,12 @@ const H = { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+js
 const B = `https://api.github.com/repos/${REPO}`;
 const CWD = process.argv[2] || process.cwd();
 
-const raw = execFileSync('git', ['-c', 'core.quotepath=false', 'ls-tree', '-r', 'HEAD'],
-  { cwd: CWD, maxBuffer: 1 << 30 }).toString('utf8');
+const TREE_FILE = process.env.DSH_TREE_FILE;
+const raw = TREE_FILE
+  ? readFileSync(TREE_FILE, 'utf8')
+  : execFileSync('git', ['-c', 'core.quotepath=false', 'ls-tree', '-r', 'HEAD'],
+    { cwd: CWD, maxBuffer: 1 << 30 }).toString('utf8');
+if (TREE_FILE) console.log(`tree from ${TREE_FILE} (no subprocess)`);
 const local = new Map();
 for (const line of raw.split('\n')) {
   if (!line.trim()) continue;
