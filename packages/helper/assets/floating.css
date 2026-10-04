@@ -749,11 +749,19 @@ body.expand-down #selection-chip {
   padding: 0;
   border-radius: 50%;
   background: transparent;
+  /* A `<button>` gets Chromium's default focus ring, and this one had no `outline: none`, so a
+     click left a light ring around the ball. The ball is not a form control the user tabs through
+     — the panel's own inputs are, and they keep their rings — so the ring was decoration here. */
+  outline: none;
   cursor: grab;
 }
 
+/* The ball wears no ring at all, including when it is pinned. `pinned` used to add
+   `box-shadow: 0 0 0 6px var(--pin)`, which on the dark theme is a light grey circle close to
+   white and read as a border rather than as a state. Pinned still does its real work — it holds
+   the panel open and stops it from auto-collapsing; only the ring is gone. */
 body.pinned #ball {
-  box-shadow: 0 0 0 6px var(--pin);
+  box-shadow: none;
 }
 
 /* ── wake word ─────────────────────────────────────────────────────────────
@@ -767,8 +775,10 @@ body.pinned #ball {
    animation that is going to replace it, so a detection is now heard (the chime)
    and named by the badge rather than seen on the ball. */
 body.wake-listening #ball {
-  /* Still load-bearing rather than a leftover: this rule sits after `body.pinned #ball`,
-     so a ball that is only listening wears no ring at all, the pinned one included. */
+  /* Redundant with the two rules above and kept only so that adding a ring to any ball state later
+     has an obvious place to be overridden from. It used to matter: it sat after `body.pinned #ball`
+     and was the reason a ball that was only listening wore no ring. The pinned ring is gone, so
+     there is nothing left for it to win against. */
   box-shadow: none;
 }
 
