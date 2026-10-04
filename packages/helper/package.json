@@ -1,0 +1,29 @@
+{
+  "name": "@dsh-orb/helper",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent always-on-top ball. A separate Electron process owned by the official dsh host.",
+  "main": "lib/main.js",
+  "exports": {
+    ".": "./lib/main.js",
+    "./package.json": "./package.json",
+    "./preload.cjs": "./preload.cjs",
+    "./selection-preload.cjs": "./selection-preload.cjs"
+  },
+  "files": [
+    "lib",
+    "preload.cjs",
+    "selection-preload.cjs",
+    "assets"
+  ],
+  "scripts": {
+    "build": "tsdown && tsdown --config tsdown.vendor.config.ts",
+    "build:vendor": "tsdown --config tsdown.vendor.config.ts"
+  },
+  "devDependencies": {
+    "@shikijs/langs": "^4.3.1",
+    "shiki": "^4.3.1"
+  },
+  "license": "MIT"
+}

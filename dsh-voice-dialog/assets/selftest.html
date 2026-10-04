@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>本地唤醒自检 · dsh-voice-dialog</title>
+<style>
+  body{font:14px/1.7 -apple-system,"Segoe UI",system-ui,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;background:#16181d;color:#e6e8ec}
+  h1{font-size:18px}
+  code{background:#23262e;padding:1px 5px;border-radius:4px}
+  #log{background:#0e1013;border:1px solid #2a2e37;border-radius:10px;padding:12px;height:320px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap}
+  button{font:inherit;padding:8px 16px;border:0;border-radius:8px;background:#4d6bfe;color:#fff;cursor:pointer}
+  button:disabled{opacity:.45;cursor:default}
+  .ok{color:#3ddc84}.warn{color:#ffc53d}.err{color:#ff6b6b}.dim{color:#8b93a1}
+  #meter{height:8px;background:#23262e;border-radius:4px;overflow:hidden;margin:10px 0}
+  #meter>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4d6bfe,#3ddc84);transition:width .08s}
+  #bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+</style>
+</head>
+<body>
+<h1>本地唤醒自检</h1>
+<p>这个页面独立于 DSH，直接验证 openWakeWord 流水线：<code>onnxruntime-web</code> 加载 → 4 个模型下载 → 麦克风采集 → 实时打分。
+音频全程在本机处理，不上传。唤醒词是 <code>hey_jarvis</code>，请对着麦克风清楚地念 <b>“Hey Jarvis”</b>。</p>
+
+<div id="bar">
+  <button id="run" disabled>开始自检</button>
+  <span id="status" class="dim">等待中</span>
+</div>
+<div id="meter"><i></i></div>
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const meterEl = document.querySelector('#meter > i');
+const runBtn = document.getElementById('run');
+
+const t0 = performance.now();
+function log(msg, cls) {
+  const el = document.createElement('div');
+  if (cls) el.className = cls;
+  el.textContent = '+' + String(Math.round(performance.now() - t0)).padStart(6) + 'ms  ' + msg;
+  logEl.appendChild(el);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || 'dim'; }
+
+// ── 和插件里完全相同的模型链参数 ──────────────────────────────────────────
+const FRAME = 1280, RATE = 16000, MEL_WINDOW = 76;
+// 本页由 /voice-assets/selftest.html 提供，模型就在同一目录，所以不能再用 .. 退出去
+const ASSET = '.';
+const WORKLET = `
+class Tap extends AudioWorkletProcessor{
+  constructor(){super();this.n=1280;this.b=new Float32Array(this.n);this.p=0;}
+  process(inputs){const i=inputs[0]&&inputs[0][0];
+    if(i){for(let k=0;k<i.length;k++){this.b[this.p]=i[k];this.p++;
+      if(this.p===this.n){this.port.postMessage(this.b.slice(0));this.p=0;}}}
+    return true;}
+}
+registerProcessor('selftest-tap', Tap);
+`;
+
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = () => res(); s.onerror = () => rej(new Error('脚本加载失败: ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+(async () => {
+  // 前置能力探测
+  const missing = [];
+  if (typeof AudioContext !== 'function') missing.push('AudioContext');
+  if (typeof AudioWorkletNode !== 'function') missing.push('AudioWorkletNode');
+  if (!navigator.mediaDevices?.getUserMedia) missing.push('getUserMedia');
+  if (missing.length) {
+    log('缺少必要 API: ' + missing.join(', '), 'err');
+    log('请用 Edge / Chrome 打开本页（file:// 下可能限制麦克风，建议通过 http 访问）', 'warn');
+    return;
+  }
+  log('浏览器支持检查通过', 'ok');
+  runBtn.disabled = false;
+})();
+
+runBtn.addEventListener('click', async () => {
+  runBtn.disabled = true;
+  try {
+    setStatus('加载 onnxruntime…');
+    log('加载 onnxruntime-web (wasm-only 构建)');
+    // 用 ort.wasm.min.js（纯 wasm 构建），它配套的 loader 是 ort-wasm-simd-threaded.mjs，
+    // 与我们的 ort-wasm-simd-threaded.wasm 是同一套。主构建 ort.min.js 硬编码的是
+    // WebGPU 变体 jsep loader，和普通 wasm 二进制不匹配，会抛 "c is not a function"。
+    await loadScript('ort/ort.wasm.min.js');
+    const ort = window.ort;
+    if (!ort) throw new Error('window.ort 未暴露');
+    ort.env.wasm.numThreads = 1;
+    // 对象形式：传绝对 URL，绕开 wasmPaths 字符串拼接导致的裸模块说明符。
+    ort.env.wasm.wasmPaths = {
+      mjs:  new URL('ort/ort-wasm-simd-threaded.mjs', location.href).href,
+      wasm: new URL('ort/ort-wasm-simd-threaded.wasm', location.href).href
+    };
+    log('onnxruntime 版本 ' + (ort.env.versions?.web || '?') + '；numThreads=1（无跨域隔离）', 'ok');
+    log('wasm loader 路径 ' + ort.env.wasm.wasmPaths.mjs, 'dim');
+
+    setStatus('下载模型…');
+    const files = {
+      mel: ASSET + '/melspectrogram.onnx',
+      emb: ASSET + '/embedding_model.onnx',
+      vad: ASSET + '/silero_vad.onnx',
+      kw: ASSET + '/hey_jarvis_v0.1.onnx'
+    };
+    const opts = { executionProviders: ['wasm'] };
+    for (const [k, url] of Object.entries(files)) {
+      const t = performance.now();
+      const head = await fetch(url);
+      if (!head.ok) throw new Error('模型 404: ' + url + '（HTTP ' + head.status + '）');
+      log('  ' + url.split('/').pop() + '  HTTP ' + head.status + '  ' +
+          (Number(head.headers.get('content-length')) / 1024).toFixed(0) + ' KB');
+    }
+    const mel = await ort.InferenceSession.create(files.mel, opts);
+    const emb = await ort.InferenceSession.create(files.emb, opts);
+    const vad = await ort.InferenceSession.create(files.vad, opts);
+    const kw  = await ort.InferenceSession.create(files.kw, opts);
+    log('4 个模型全部就绪', 'ok');
+
+    setStatus('打开麦克风…');
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ac = new AudioContext({ sampleRate: RATE });
+    log('AudioContext 实际采样率 ' + ac.sampleRate + ' Hz' + (ac.sampleRate === RATE ? '' : '（注意：与模型期望的 16000 不一致，可能影响精度）'),
+        ac.sampleRate === RATE ? 'ok' : 'warn');
+
+    const blob = new Blob([WORKLET], { type: 'application/javascript' });
+    const bu = URL.createObjectURL(blob);
+    await ac.audioWorklet.addModule(bu);
+    URL.revokeObjectURL(bu);
+    const src = ac.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(ac, 'selftest-tap');
+    const mute = ac.createGain(); mute.gain.value = 0;
+    src.connect(node); node.connect(mute); mute.connect(ac.destination);
+
+    // 状态
+    let melBuf = [];
+    const hist = [];
+    for (let i = 0; i < 16; i++) hist.push(new Float32Array(96).fill(0));
+    let st = { h: new ort.Tensor('float32', new Float32Array(128).fill(0), [2, 1, 64]),
+               c: new ort.Tensor('float32', new Float32Array(128).fill(0), [2, 1, 64]) };
+    let speech = false, hang = 0, peak = 0, frames = 0;
+    let lastReport = performance.now();
+    let cooling = false;
+
+    node.port.onmessage = async (ev) => {
+      const chunk = ev.data; if (!chunk) return;
+      frames++;
+      // VAD
+      let isSpeech = false;
+      try {
+        const out = await vad.run({ input: new ort.Tensor('float32', chunk, [1, chunk.length]),
+                                    sr: new ort.Tensor('int64', [16000n], []), h: st.h, c: st.c });
+        st.h = out.hn; st.c = out.cn; isSpeech = out.output.data[0] > 0.5;
+      } catch (e) { log('VAD 失败: ' + e.message, 'err'); }
+      if (isSpeech) { speech = true; hang = 12; } else if (speech) { hang--; if (hang <= 0) speech = false; }
+
+      // mel
+      const mo = await mel.run({ [mel.inputNames[0]]: new ort.Tensor('float32', chunk, [1, FRAME]) });
+      const md = new Float32Array(mo[mel.outputNames[0]].data);
+      for (let i = 0; i < md.length; i++) md[i] = md[i] / 10 + 2;
+      for (let f = 0; f < 5; f++) melBuf.push(md.subarray(f * 32, (f + 1) * 32).slice());
+
+      while (melBuf.length >= MEL_WINDOW) {
+        const flat = new Float32Array(MEL_WINDOW * 32);
+        for (let f = 0; f < MEL_WINDOW; f++) flat.set(melBuf[f], f * 32);
+        const eo = await emb.run({ [emb.inputNames[0]]: new ort.Tensor('float32', flat, [1, MEL_WINDOW, 32, 1]) });
+        const vec = new Float32Array(eo[emb.outputNames[0]].data);
+        hist.shift(); hist.push(vec);
+        const fe = new Float32Array(hist.length * 96);
+        for (let i = 0; i < hist.length; i++) fe.set(hist[i], i * 96);
+        const ko = await kw.run({ [kw.inputNames[0]]: new ort.Tensor('float32', fe, [1, hist.length, 96]) });
+        const score = ko[kw.outputNames[0]].data[0];
+        if (score > peak) peak = score;
+        meterEl.style.width = Math.min(100, score * 100) + '%';
+
+        if (score > 0.5 && speech && !cooling) {
+          cooling = true; setTimeout(() => { cooling = false; }, 2500);
+          log('★ 检测到 hey_jarvis！分数 ' + score.toFixed(3), 'ok');
+          setStatus('检测成功！', 'ok');
+          speakBeep();
+        }
+        melBuf.splice(0, 8);
+      }
+
+      const now = performance.now();
+      if (now - lastReport > 1500) {
+        lastReport = now;
+        log('帧 ' + frames + '  当前分数 ' + (peak).toFixed(3) + '  ' + (speech ? '有语音' : '静音'), 'dim');
+      }
+    };
+
+    setStatus('监听中 — 请念 “Hey Jarvis”', 'ok');
+    log('开始监听。请清楚地说 “Hey Jarvis”。', 'ok');
+  } catch (e) {
+    log('失败: ' + (e && e.message ? e.message : String(e)), 'err');
+    setStatus('失败', 'err');
+    runBtn.disabled = false;
+  }
+});
+
+/** 极短的提示音，确认检测真的触发了。 */
+function speakBeep() {
+  try {
+    const ac = new AudioContext();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.value = 880; g.gain.value = 0.08;
+    o.connect(g); g.connect(ac.destination);
+    o.start(); o.stop(ac.currentTime + 0.12);
+    setTimeout(() => ac.close(), 400);
+  } catch {}
+}
+</script>
+</body>
+</html>

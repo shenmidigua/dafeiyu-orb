@@ -1,0 +1,279 @@
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Readable } from 'node:stream'
+import { after, describe, it } from 'node:test'
+import assert from 'node:assert/strict'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { normalizeCatalog } from '../src/catalog.ts'
+import { ProfileStore } from '../src/preferences.ts'
+import { orbSupported, registerOrbRoutes, tokensMatch, type OrbControl } from '../src/routes.ts'
+import { TccMonitor } from '../src/tcc.ts'
+
+const root = mkdtempSync(join(tmpdir(), 'orb-routes-'))
+after(() => { rmSync(root, { recursive: true, force: true }) })
+
+const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01])
+
+function request(method: string, url: string, body?: Buffer | string, headers: Record<string, string> = {}): IncomingMessage {
+  const payload = body === undefined ? Buffer.alloc(0) : Buffer.isBuffer(body) ? body : Buffer.from(body)
+  const stream = Readable.from(payload.length === 0 ? [] : [payload])
+  return Object.assign(stream, { method, url, headers }) as IncomingMessage
+}
+
+function response(): ServerResponse & { status: number; body: Buffer } {
+  const res = {
+    status: 0,
+    body: Buffer.alloc(0),
+    writeHead(status: number) { this.status = status },
+    end(chunk?: Buffer | string) {
+      if (chunk) this.body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    },
+  }
+  return res as ServerResponse & { status: number; body: Buffer }
+}
+
+describe('settings routes', () => {
+  it('normalizes the official model catalog', () => {
+    assert.deepEqual(normalizeCatalog({
+      groups: [
+        { id: '', name: 'skip' },
+        {
+          id: 'deepseek-official',
+          name: 'DeepSeek',
+          models: [
+            { id: 'plain', name: 'Plain' },
+            { id: 'think', name: 'Think', reasoning: { efforts: [{ id: 'max', name: 'Max' }], defaultEffort: 'max' } },
+            { id: 'bad' },
+          ],
+        },
+        { id: 'empty', name: 'Empty', models: [] },
+      ],
+    }), {
+      groups: [{
+        id: 'deepseek-official',
+        name: 'DeepSeek',
+        models: [
+          { id: 'plain', name: 'Plain' },
+          { id: 'think', name: 'Think', reasoning: { efforts: [{ id: 'max', name: 'Max' }], defaultEffort: 'max' } },
+        ],
+      }],
+    })
+    assert.deepEqual(normalizeCatalog(null), { groups: [] })
+    assert.equal(orbSupported('linux'), false)
+    assert.equal(orbSupported('darwin'), true)
+    assert.equal(orbSupported('win32'), true)
+    assert.equal(tokensMatch('same-token', 'same-token'), true)
+    assert.equal(tokensMatch('same-token', 'other-token'), false)
+    assert.equal(tokensMatch('', ''), false)
+  })
+
+  it('serves the snapshot on the official port and lets the helper read only the avatar', async () => {
+    const profile = join(root, 'profile')
+    mkdirSync(profile, { recursive: true })
+    const store = new ProfileStore(profile)
+    const calls: unknown[] = []
+    const control: OrbControl = {
+      helperAuthorized: (token) => tokensMatch(token, 'helper-secret'),
+      async publishChrome() { calls.push('chrome') },
+      async setOverlayModel(selection) { store.setOverlay(selection); calls.push(['overlay', selection]) },
+      async setBackgroundModel(selection) { store.setBackground(selection); calls.push(['background', selection]) },
+      async setSelectionEnabled(enabled) { store.setSelectionEnabled(enabled) },
+      async setMillifractionEnabled(enabled) { store.setMillifractionEnabled(enabled) },
+      async setBallEnabled(enabled) { store.setBallEnabled(enabled) },
+      async setWakeEnabled(enabled) { store.setWakeEnabled(enabled) },
+      async setSpeech(settings) { store.setSpeech(settings) },
+    }
+    let handler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined
+    const dispose = registerOrbRoutes({
+      ctx: {
+        webServer: {
+          register(route) {
+            assert.equal(route.kind, 'prefix')
+            assert.equal(route.path, '/.dsh-orb')
+            handler = route.handler
+            return () => { handler = undefined }
+          },
+        },
+        connection: {
+          admit(req) {
+            return req.headers['x-dsh-user'] === 'ok' ? { peer: { id: 'local' } } : { rejection: 401 }
+          },
+        },
+        sessionController: {
+          modelCatalog: () => ({ groups: [{ id: 'deepseek-official', name: 'DeepSeek', models: [{ id: 'deepseek-flash', name: 'Flash' }] }] }),
+        },
+      },
+      store,
+      tcc: new TccMonitor(),
+      control,
+    })
+    assert.ok(handler)
+    const denied = response()
+    await handler(request('GET', '/.dsh-orb/settings'), denied)
+    assert.equal(denied.status, 401)
+    assert.equal(denied.body.length, 0)
+
+    const helperSettings = response()
+    await handler(request('GET', '/.dsh-orb/settings', undefined, { 'x-dsh-orb-helper': 'helper-secret' }), helperSettings)
+    assert.equal(helperSettings.status, 401)
+
+    const avatar = response()
+    await handler(request('GET', '/.dsh-orb/avatar?v=0', undefined, { 'x-dsh-orb-helper': 'helper-secret' }), avatar)
+    assert.equal(avatar.status, 200)
+    assert.equal(avatar.body.subarray(0, 6).toString('ascii'), 'GIF89a')
+
+    const wrong = response()
+    await handler(request('GET', '/.dsh-orb/avatar', undefined, { 'x-dsh-orb-helper': 'nope' }), wrong)
+    assert.equal(wrong.status, 401)
+
+    const settings = response()
+    await handler(request('GET', '/.dsh-orb/settings', undefined, { 'x-dsh-user': 'ok' }), settings)
+    const snapshot = JSON.parse(settings.body.toString('utf8')) as {
+      avatarUrl: string
+      ballEnabled: boolean
+      overlay: { model: string }
+      supported: boolean
+      permissionFallback: boolean
+    }
+    assert.equal(settings.status, 200)
+    assert.equal(snapshot.avatarUrl, '/.dsh-orb/avatar?v=0')
+    assert.equal(snapshot.avatarUrl.includes('token'), false)
+    assert.equal(snapshot.ballEnabled, true)
+    assert.equal(snapshot.overlay.model, 'deepseek-flash')
+    assert.equal(snapshot.supported, process.platform === 'darwin' || process.platform === 'win32')
+    assert.equal(snapshot.permissionFallback, false)
+
+    const models = response()
+    await handler(request('GET', '/.dsh-orb/models', undefined, { 'x-dsh-user': 'ok' }), models)
+    assert.equal(JSON.parse(models.body.toString('utf8')).groups[0].models[0].id, 'deepseek-flash')
+
+    const overlay = response()
+    await handler(request('POST', '/.dsh-orb/overlay-model', JSON.stringify({
+      provider: 'deepseek-official',
+      model: 'deepseek-pro',
+      reasoningEffort: 'high',
+    }), { 'x-dsh-user': 'ok' }), overlay)
+    assert.equal(JSON.parse(overlay.body.toString('utf8')).overlay.model, 'deepseek-pro')
+
+    const background = response()
+    await handler(request('POST', '/.dsh-orb/background-model', JSON.stringify({
+      provider: 'deepseek-official',
+      model: 'background',
+    }), { 'x-dsh-user': 'ok' }), background)
+    assert.equal(JSON.parse(background.body.toString('utf8')).background.model, 'background')
+    assert.equal(JSON.parse(background.body.toString('utf8')).overlay.model, 'deepseek-pro')
+
+    const selection = response()
+    await handler(request('POST', '/.dsh-orb/selection', JSON.stringify({ enabled: false }), { 'x-dsh-user': 'ok' }), selection)
+    assert.equal(JSON.parse(selection.body.toString('utf8')).selectionEnabled, false)
+
+    const fraction = response()
+    await handler(request('POST', '/.dsh-orb/millifraction', JSON.stringify({ enabled: true }), { 'x-dsh-user': 'ok' }), fraction)
+    assert.equal(JSON.parse(fraction.body.toString('utf8')).millifractionEnabled, true)
+    assert.equal(store.coordinateMode(), 'millifraction')
+
+    const ball = response()
+    await handler(request('POST', '/.dsh-orb/ball', JSON.stringify({ enabled: false }), { 'x-dsh-user': 'ok' }), ball)
+    assert.equal(JSON.parse(ball.body.toString('utf8')).ballEnabled, false)
+    assert.equal(store.ballEnabled(), false)
+
+    // Read-aloud: each switch is sent on its own, so the others must survive the round trip.
+    const speechOn = response()
+    await handler(request('POST', '/.dsh-orb/speech', JSON.stringify({ enabled: true }), { 'x-dsh-user': 'ok' }), speechOn)
+    assert.deepEqual(JSON.parse(speechOn.body.toString('utf8')).speech, {
+      enabled: true,
+      autoPlay: false,
+      endpoint: 'http://127.0.0.1:8765',
+    })
+
+    const speechEndpoint = response()
+    await handler(request('POST', '/.dsh-orb/speech', JSON.stringify({ endpoint: 'http://127.0.0.1:9000' }), { 'x-dsh-user': 'ok' }), speechEndpoint)
+    assert.equal(JSON.parse(speechEndpoint.body.toString('utf8')).speech.endpoint, 'http://127.0.0.1:9000')
+
+    const speechAuto = response()
+    await handler(request('POST', '/.dsh-orb/speech', JSON.stringify({ autoPlay: true }), { 'x-dsh-user': 'ok' }), speechAuto)
+    // A later write must not quietly reset the endpoint set above.
+    assert.deepEqual(JSON.parse(speechAuto.body.toString('utf8')).speech, {
+      enabled: true,
+      autoPlay: true,
+      endpoint: 'http://127.0.0.1:9000',
+    })
+
+    // A bad endpoint rejects the whole request rather than half-applying it.
+    const speechBad = response()
+    await handler(request('POST', '/.dsh-orb/speech', JSON.stringify({ endpoint: 'file:///secret' }), { 'x-dsh-user': 'ok' }), speechBad)
+    assert.equal(speechBad.status, 400)
+    assert.equal(JSON.parse(speechBad.body.toString('utf8')).error, 'invalid-speech')
+    assert.equal(store.speech().endpoint, 'http://127.0.0.1:9000')
+
+    const speechWrongType = response()
+    await handler(request('POST', '/.dsh-orb/speech', JSON.stringify({ enabled: 'yes' }), { 'x-dsh-user': 'ok' }), speechWrongType)
+    assert.equal(speechWrongType.status, 400)
+    assert.equal(store.speech().enabled, true)
+
+    const uploaded = response()
+    await handler(request('POST', '/.dsh-orb/avatar', png, { 'x-dsh-user': 'ok' }), uploaded)
+    const uploadedSnapshot = JSON.parse(uploaded.body.toString('utf8')) as { avatarUrl: string }
+    assert.match(uploadedSnapshot.avatarUrl, /^\/\.dsh-orb\/avatar\?v=[1-9]/)
+    const custom = response()
+    await handler(request('GET', '/.dsh-orb/avatar?v=2', undefined, { 'x-dsh-user': 'ok' }), custom)
+    assert.equal(custom.body.equals(png), true)
+
+    const invalid = response()
+    await handler(request('POST', '/.dsh-orb/avatar', Buffer.from('nope'), { 'x-dsh-user': 'ok' }), invalid)
+    assert.equal(invalid.status, 400)
+    assert.equal(JSON.parse(invalid.body.toString('utf8')).error, 'invalid-type')
+
+    const restored = response()
+    await handler(request('POST', '/.dsh-orb/avatar/restore', '{}', { 'x-dsh-user': 'ok' }), restored)
+    assert.equal(JSON.parse(restored.body.toString('utf8')).avatarUrl, '/.dsh-orb/avatar?v=0')
+    assert.equal(calls.includes('chrome'), true)
+
+    // Built-in avatars: the page lists them, reads their bytes, and picks one.
+    const gallery = JSON.parse(settings.body.toString('utf8')) as {
+      avatarPresetId: string | null
+      avatarPresets: { id: string; url: string }[]
+    }
+    assert.equal(gallery.avatarPresetId, null)
+    assert.equal(gallery.avatarPresets.length > 0, true)
+    const [first] = gallery.avatarPresets
+    assert.equal(first.url, `/.dsh-orb/avatar/preset/${first.id}`)
+
+    const presetBytes = response()
+    await handler(request('GET', first.url, undefined, { 'x-dsh-user': 'ok' }), presetBytes)
+    assert.equal(presetBytes.status, 200)
+    assert.equal(presetBytes.body.subarray(0, 6).toString('ascii'), 'GIF89a')
+    assert.equal(presetBytes.body.length > 100_000, true)
+
+    const anonymousPreset = response()
+    await handler(request('GET', first.url), anonymousPreset)
+    assert.equal(anonymousPreset.status, 401)
+
+    const unknownPreset = response()
+    await handler(request('GET', `/.dsh-orb/avatar/preset/${first.id}%2F..%2Frestore`, undefined, { 'x-dsh-user': 'ok' }), unknownPreset)
+    assert.equal(unknownPreset.status, 404)
+
+    const picked = response()
+    await handler(request('POST', '/.dsh-orb/avatar/preset', JSON.stringify({ preset: first.id }), { 'x-dsh-user': 'ok' }), picked)
+    const pickedSnapshot = JSON.parse(picked.body.toString('utf8')) as { avatarUrl: string; avatarPresetId: string | null }
+    assert.equal(pickedSnapshot.avatarPresetId, first.id)
+    assert.match(pickedSnapshot.avatarUrl, /^\/\.dsh-orb\/avatar\?v=[1-9]/)
+    assert.equal(calls.includes('chrome'), true)
+
+    // The ball's own route (and the settings preview) then serves the same bytes.
+    const currentPreset = response()
+    await handler(request('GET', pickedSnapshot.avatarUrl, undefined, { 'x-dsh-orb-helper': 'helper-secret' }), currentPreset)
+    assert.equal(currentPreset.body.equals(presetBytes.body), true)
+
+    const wrongPreset = response()
+    await handler(request('POST', '/.dsh-orb/avatar/preset', JSON.stringify({ preset: 'gone' }), { 'x-dsh-user': 'ok' }), wrongPreset)
+    assert.equal(wrongPreset.status, 400)
+    assert.equal(JSON.parse(wrongPreset.body.toString('utf8')).error, 'invalid-preset')
+
+    const missing = response()
+    await handler(request('GET', '/.dsh-orb/nope', undefined, { 'x-dsh-user': 'ok' }), missing)
+    assert.equal(missing.status, 404)
+    dispose()
+  })
+})

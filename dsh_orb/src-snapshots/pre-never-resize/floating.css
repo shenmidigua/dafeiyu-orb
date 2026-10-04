@@ -1,0 +1,1016 @@
+:root {
+  color-scheme: light;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  --ball: 288px;
+  /* The panel card is its own rectangle beside the ball; `--panel-gap` mirrors PANEL_GAP. */
+  --panel-width: 420px;
+  --panel-height: 520px;
+  --panel-gap: 10px;
+  /* The input box is its own size: enlarging the ball must not enlarge the composer.
+     It is a wide bar at the card's bottom (or top), never behind the ball. */
+  --composer-pill: 52px;
+  --composer-height: var(--composer-pill);
+  --prompt-line: 20px;
+  --prompt-pad: 12px;
+  --composer-max: calc(var(--composer-pill) + var(--prompt-line) * 3);
+  --chrome: 12px;
+  --panel-radius: 36px;
+  --selection-chip: 28px;
+  /* Shell chrome keeps the fork's exact palette — the bar must match the
+   * original ball window pixel for pixel. Chat content styles itself through
+   * the --dsw-* token sheets (theme.css) instead of these variables. */
+  --black: #111111;
+  --white: #ffffff;
+  --input-bg: #eeeeee;
+  --border: #8a8a93;
+  --pin: #5c5c66;
+  --error: #a33;
+  --ball-shadow: 0 3px 8px rgba(17, 17, 17, 0.32);
+  --panel-shadow: 0 4px 8px rgba(17, 17, 17, 0.22);
+  /* Wake word colours. `--wake` and `--wake-strong` are the badge's two greens; the third,
+     `rgba(46, 160, 67, 0.35)`, was the ball's detection glow and went with the ring. */
+  --wake: #2f7de1;
+  --wake-strong: #2ea043;
+}
+
+body[data-ds-dark-theme] {
+  color-scheme: dark;
+  --black: rgb(249, 250, 251);
+  --white: rgb(21, 21, 23);
+  --input-bg: rgb(35, 35, 36);
+  --border: rgba(255, 255, 255, 0.16);
+  --pin: rgb(151, 157, 166);
+  --error: rgb(242, 90, 90);
+  --ball-shadow: 0 3px 8px rgba(0, 0, 0, 0.48);
+  --panel-shadow: 0 4px 8px rgba(0, 0, 0, 0.45);
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Transcript prose selects and copies like the main window; the interactive
+ * chrome inside (buttons, tool toggles) stays selection-free. */
+#transcript {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+
+#transcript button {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#panel {
+  position: absolute;
+  /* A card in its own column beside the ball: to the ball's left by default, to its right
+     when the ball sits near the screen's left edge, and aligned to the same top or bottom
+     edge vertically. Nothing overlaps the ball any more. */
+  width: var(--panel-width);
+  height: var(--panel-height);
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  padding: 16px 16px calc(var(--composer-height) + 14px);
+  color: var(--black);
+  background: var(--white);
+  border-radius: var(--panel-radius);
+  opacity: 0;
+  transform-origin: var(--origin-x) var(--origin-y);
+  transform: scale(0.18);
+  pointer-events: none;
+  transition: opacity 300ms ease-in-out, transform 300ms ease-in-out;
+}
+
+body.expand-left #panel {
+  left: auto;
+  right: calc(var(--chrome) + var(--ball) + var(--panel-gap));
+}
+
+body.expand-right #panel {
+  left: var(--chrome);
+  right: auto;
+}
+
+body.expand-up #panel {
+  top: auto;
+  bottom: var(--chrome);
+}
+
+body.expand-down #panel {
+  top: var(--chrome);
+  bottom: auto;
+}
+
+body.expand-left {
+  --origin-x: 100%;
+}
+
+body.expand-right {
+  --origin-x: 0%;
+}
+
+body.expand-up {
+  --origin-y: 100%;
+}
+
+body.expand-down {
+  --origin-y: 0%;
+}
+
+body.expanded #panel {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+  border: 1px solid var(--border);
+  box-shadow: var(--panel-shadow);
+}
+
+body.expand-down #panel {
+  padding-top: calc(var(--composer-height) + 14px);
+  padding-bottom: 16px;
+}
+
+body.has-selection-chip.expand-up #panel {
+  padding-bottom: calc(var(--composer-height) + var(--selection-chip) + 24px);
+}
+
+body.has-selection-chip.expand-down #panel {
+  padding-top: calc(var(--composer-height) + var(--selection-chip) + 24px);
+}
+
+#panel::after {
+  content: "";
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  height: var(--composer-height);
+  border-radius: calc(var(--composer-height) / 2);
+  background: var(--input-bg);
+}
+
+body.expand-up #panel::after {
+  bottom: 0;
+}
+
+body.expand-down #panel::after {
+  top: 0;
+}
+
+body.pinned #panel {
+  border-color: var(--pin);
+  box-shadow: 0 0 0 3px var(--pin);
+}
+
+#history,
+#new-conversation,
+#permission {
+  position: absolute;
+  top: 12px;
+  z-index: 2;
+}
+
+body.expand-down #history,
+body.expand-down #new-conversation,
+body.expand-down #permission {
+  top: auto;
+  bottom: 12px;
+}
+
+#history,
+#new-conversation {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  color: var(--black);
+  background: var(--input-bg);
+  cursor: pointer;
+}
+
+#history {
+  left: 12px;
+}
+
+#new-conversation {
+  right: 12px;
+  font-size: 18px;
+  line-height: 1;
+}
+
+#permission {
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+#permission-button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 148px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0 10px;
+  color: var(--black);
+  background: var(--input-bg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+#permission-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#permission-button svg {
+  flex: none;
+  width: 10px;
+  height: 10px;
+}
+
+#permission-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  z-index: 3;
+  transform: translateX(-50%);
+  margin: 0;
+  border-radius: 10px;
+  padding: 4px;
+  list-style: none;
+  background: var(--white);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
+}
+
+body.expand-down #permission-menu {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
+#permission-menu button {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: var(--black);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.3;
+  text-align: left;
+  white-space: nowrap;
+}
+
+#permission-menu button[aria-selected="true"] {
+  background: var(--input-bg);
+}
+
+#history svg {
+  width: 16px;
+  height: 16px;
+}
+
+#transcript,
+#history-list,
+#question {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 36px;
+}
+
+body.expand-down #transcript,
+body.expand-down #history-list,
+body.expand-down #question {
+  padding-top: 0;
+  padding-bottom: 36px;
+}
+
+#question {
+  flex: 0 0 auto;
+  max-height: 55%;
+}
+
+#transcript iframe {
+  display: block;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: var(--white);
+}
+
+#transcript[hidden],
+#history-list[hidden],
+#question[hidden] {
+  display: none;
+}
+
+/* The chrome buttons park on the side away from the composer; keep the
+ * transcript clear of that band so rows never slide under them. */
+body.expand-down #transcript {
+  padding-bottom: 36px;
+}
+
+body.expand-up #transcript {
+  padding-top: 36px;
+}
+
+.history-row {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 14px;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--black);
+  background: var(--white);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.history-row.current {
+  border-color: var(--black);
+  background: var(--input-bg);
+}
+
+.history-empty {
+  margin: 0;
+  font-size: 13px;
+  color: var(--pin);
+}
+
+/* ── live level waveform ───────────────────────────────────────────────────
+   The mark the official voice-input capture row draws: eighty rounded bars, one
+   per measured level, the newest scrolling in at the right edge, silent audio
+   left as a dotted baseline. The geometry (640 x 40 box, 24 px tall against the
+   32 px record button) and the bar opacity ramp are the official ones.
+
+   It exists only while the recorder holds the microphone. At rest the row is the
+   status line it always was, which is why the bars are display:none rather than
+   parked — a permanently flat waveform next to every status message would read as
+   a broken meter. */
+#voice-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+#voice-wave {
+  display: none;
+  flex: 1 1 0;
+  width: 0;
+  min-width: 24px;
+  height: 24px;
+  color: var(--pin);
+}
+
+body.wake-recording #voice-row {
+  min-height: 34px;
+}
+
+body.wake-recording #voice-wave {
+  display: block;
+}
+
+body.wake-recording #status {
+  flex: 0 1 auto;
+}
+
+#status {
+  margin: 0;
+  font-size: 12px;
+  color: var(--pin);
+}
+
+#composer {
+  position: absolute;
+  z-index: 2;
+  box-sizing: border-box;
+  left: 16px;
+  right: 16px;
+  height: var(--composer-height);
+  padding: 0 12px;
+}
+
+body.expand-up #composer {
+  bottom: 0;
+}
+
+body.expand-down #composer {
+  top: 0;
+}
+
+body.running #composer,
+body.asking #composer,
+body.tcc-gating #composer,
+body.running #selection-chip,
+body.asking #selection-chip,
+body.tcc-gating #selection-chip {
+  visibility: hidden;
+}
+
+#selection-chip {
+  position: absolute;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  height: var(--selection-chip);
+  width: calc(100% - 32px);
+  padding: 0 12px;
+  color: var(--pin);
+  background: var(--input-bg);
+  border-radius: 999px;
+}
+
+#selection-chip[hidden] {
+  display: none;
+}
+
+body.expand-left #selection-chip {
+  left: 16px;
+}
+
+body.expand-right #selection-chip {
+  right: 16px;
+}
+
+body.expand-up #selection-chip {
+  bottom: calc(var(--composer-height) + 8px);
+}
+
+body.expand-down #selection-chip {
+  top: calc(var(--composer-height) + 8px);
+}
+
+#selection-chip-text {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+#selection-chip-dismiss {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  color: var(--pin);
+  background: transparent;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.question-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.question-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.question-heading-text {
+  flex: 1;
+  min-width: 0;
+}
+
+#question-eyebrow {
+  margin: 0 0 4px;
+  font-size: 11px;
+  color: var(--pin);
+}
+
+#question-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+#question-detail {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--pin);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+#question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 8px 12px;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--black);
+  background: var(--white);
+  cursor: pointer;
+}
+
+.question-option.selected {
+  border-color: var(--black);
+  background: var(--input-bg);
+}
+
+.question-option-mark {
+  flex: none;
+  width: 16px;
+  font-size: 12px;
+  color: var(--pin);
+}
+
+.question-option-copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.question-option-label {
+  overflow-wrap: anywhere;
+}
+
+.question-option-description {
+  width: 100%;
+  font-size: 12px;
+  color: var(--pin);
+  overflow-wrap: anywhere;
+}
+
+.question-recommended {
+  font-size: 11px;
+  color: var(--pin);
+}
+
+#question-custom {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--black);
+  background: var(--white);
+  resize: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+#question-custom:focus {
+  outline: none;
+  border-color: var(--black);
+}
+
+#question-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--error);
+}
+
+.question-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.question-pager,
+.question-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#question-progress {
+  font-size: 12px;
+  color: var(--pin);
+}
+
+#question-cancel,
+#question-prev,
+#question-next-nav,
+#question-skip,
+#question-continue {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--black);
+  background: var(--white);
+  cursor: pointer;
+}
+
+#question-continue {
+  border-color: var(--black);
+  color: var(--white);
+  background: var(--black);
+}
+
+#question-cancel:disabled,
+#question-prev:disabled,
+#question-next-nav:disabled,
+#question-skip:disabled,
+#question-continue:disabled {
+  cursor: default;
+}
+
+#question-continue:disabled {
+  border-color: var(--border);
+  color: var(--pin);
+  background: var(--input-bg);
+}
+
+#input-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+#prompt {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 0;
+  padding: var(--prompt-pad) 8px;
+  color: var(--black);
+  background: transparent;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: var(--prompt-line);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* The input no longer shares the ball's band, so its text never has to flow around
+   the ball: the float that used to carve a circle out of the input is gone, and with
+   it the "capped" padding that reserved the ball's width inside a long draft. */
+#prompt::before {
+  content: none;
+}
+
+#prompt.prompt-empty::after {
+  content: attr(data-placeholder);
+  color: var(--pin);
+  line-height: calc(var(--composer-pill) - 2 * var(--prompt-pad));
+}
+
+#ball {
+  position: absolute;
+  z-index: 1;
+  top: var(--chrome);
+  left: var(--chrome);
+  width: var(--ball);
+  height: var(--ball);
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: grab;
+}
+
+body.expand-left #ball {
+  left: auto;
+  right: var(--chrome);
+}
+
+body.expand-right #ball {
+  right: auto;
+  left: var(--chrome);
+}
+
+body.expand-up #ball {
+  top: auto;
+  bottom: var(--chrome);
+}
+
+body.expand-down #ball {
+  bottom: auto;
+  top: var(--chrome);
+}
+
+body.pinned #ball {
+  box-shadow: 0 0 0 6px var(--pin);
+}
+
+/* ── wake word ─────────────────────────────────────────────────────────────
+   Listening is deliberately invisible. A breathing ring around the ball was far
+   too loud for a state the ball sits in all day, so at rest the ball looks exactly
+   like a ball with the microphone off; the hover tooltip and `#wake-badge` (which
+   only shows with the panel) are what say the feature is on.
+
+   Detection decorates nothing either. The ball used to wear a soft green glow for
+   the few seconds the engine held "detected"; that ring is gone, kept back for the
+   animation that is going to replace it, so a detection is now heard (the chime)
+   and named by the badge rather than seen on the ball. */
+body.wake-listening #ball {
+  /* Still load-bearing rather than a leftover: this rule sits after `body.pinned #ball`,
+     so a ball that is only listening wears no ring at all, the pinned one included. */
+  box-shadow: none;
+}
+
+#wake-badge {
+  position: absolute;
+  z-index: 2;
+  margin: 0;
+  max-width: 60%;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--white);
+  background: var(--wake);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#wake-badge[hidden] {
+  display: none;
+}
+
+body.wake-detected #wake-badge {
+  background: var(--wake-strong);
+}
+
+body.wake-loading #wake-badge {
+  background: var(--pin);
+}
+
+body.wake-error #wake-badge {
+  background: var(--error);
+}
+
+/* Transcribing is the page's own phase, not the engine's: the microphone has been released
+   and the only thing left is the host's answer, so the badge drops the green it wore while
+   recording and goes grey like the other working state. The ball itself needs no rule — with
+   `wake-detected` off it is already at rest. */
+body.wake-transcribing #wake-badge {
+  background: var(--pin);
+}
+
+body.docked #wake-badge {
+  visibility: hidden;
+}
+
+#ball:active {
+  cursor: grabbing;
+}
+
+#dock-tab {
+  position: absolute;
+  top: 8px;
+  display: none;
+  width: 6px;
+  height: var(--ball);
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  background: #75757F;
+  box-shadow:
+    0 0 0 6px rgb(117 117 127 / 7%),
+    0 0 0 4px rgb(117 117 127 / 12.5%),
+    0 0 0 2px rgb(117 117 127 / 19.6%);
+  cursor: pointer;
+  animation: dock-tab-breath 1800ms ease-in-out infinite alternate;
+}
+
+@keyframes dock-tab-breath {
+  from { opacity: 0.5; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #dock-tab {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+body.docked-left #dock-tab {
+  left: 0;
+}
+
+body.docked-right #dock-tab {
+  right: 0;
+}
+
+body.docked #dock-tab {
+  display: block;
+}
+
+body.docked #ball,
+body.docked #panel,
+body.docked #stop {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+#ball-gif {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+#stop {
+  /* Opposite 72px cap of the input pill from #ball; 14px is (72-44)/2. */
+  position: absolute;
+  z-index: 2;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--pin);
+  border-radius: 50%;
+  padding: 0;
+  background: var(--white);
+  cursor: pointer;
+}
+
+#stop::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: 50%;
+  background: var(--black);
+}
+
+body.expand-left #stop {
+  left: calc(var(--chrome) + 14px);
+}
+
+body.expand-right #stop {
+  right: calc(var(--chrome) + 14px);
+}
+
+body.expand-up #stop {
+  bottom: calc(var(--chrome) + 14px);
+}
+
+body.expand-down #stop {
+  top: calc(var(--chrome) + 14px);
+}
+
+body:not(.expanded) #stop,
+body:not(.running) #stop {
+  display: none;
+}
+
+#tcc-gate {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 36px 20px 20px;
+  color: var(--black);
+  background: var(--white);
+  border-radius: var(--panel-radius);
+}
+
+#tcc-gate[hidden] {
+  display: none;
+}
+
+#tcc-dismiss {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  color: var(--pin);
+  background: var(--input-bg);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#tcc-title {
+  margin: 0 28px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+#tcc-app,
+#tcc-footer {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--pin);
+}
+
+.tcc-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
+.tcc-row h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tcc-row p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--pin);
+}
+
+.tcc-row button,
+.tcc-actions button {
+  align-self: flex-start;
+  border: 1px solid var(--black);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--white);
+  background: var(--black);
+  cursor: pointer;
+}
+
+#tcc-later {
+  border-color: var(--border);
+  color: var(--black);
+  background: var(--white);
+}
+
+.tcc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

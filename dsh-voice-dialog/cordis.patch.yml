@@ -1,0 +1,11 @@
+# `dsh-voice-dialog` profile layer: one insert-only row.
+#
+# The bundle exists so `dsh plugin add dsh-voice-dialog` (or the profile's
+# `dsh.profile.bundles` list) can mount this package through the ordinary bundle
+# composition instead of hand-editing the profile patch layer. The row mounts the
+# dual-face plugin: the host half contributes nothing model-facing, and the
+# browser half adds the voice control to the composer plus the Settings row. The
+# client-modules carrier then serves the bundle at /plugins/dsh-voice-dialog/client.js.
+- insert:
+    - id: voice-dialog
+      name: dsh-voice-dialog

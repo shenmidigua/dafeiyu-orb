@@ -1,0 +1,75 @@
+import { describe, it } from 'node:test'
+import assert from 'node:assert/strict'
+import { mainWindowTarget, openCommand, openEnvironment } from '../src/open-main.ts'
+import { isDesktopHost, isTccRight, tccAppName } from '../src/tcc.ts'
+
+describe('open main window', () => {
+  it('uses dsh://open on the desktop host and stays disabled for dsh web', () => {
+    const secret = 'token=do-not-log'
+    const ctx = {
+      webServer: { port: 19387 },
+      connection: {
+        authenticatedUrl: (base: string) => `${base}/?${secret}`,
+      },
+    }
+    assert.equal(mainWindowTarget(ctx, true), 'dsh://open')
+    assert.equal(mainWindowTarget(ctx, false), undefined)
+    assert.equal(mainWindowTarget({
+      webServer: { port: 1 },
+      connection: { authenticatedUrl: () => 'http://example.com/?token=do-not-log' },
+    }, false), undefined)
+    assert.equal(mainWindowTarget({
+      webServer: { port: 1 },
+      connection: { authenticatedUrl: () => { throw new Error('token=do-not-log') } },
+    }, false), undefined)
+    assert.deepEqual(openCommand('dsh://open', 'darwin'), { command: 'open', args: ['dsh://open'] })
+    assert.deepEqual(openCommand('http://127.0.0.1:1/', 'win32'), {
+      command: 'cmd',
+      args: ['/c', 'start', '', 'http://127.0.0.1:1/'],
+    })
+  })
+
+  it('drops the Node-mode marker from the opener environment', () => {
+    const marker = 'ELECTRON_RUN_AS_NODE'
+    assert.equal(openEnvironment({ [marker]: '1', PATH: '/usr/bin' })[marker], undefined)
+    assert.equal(openEnvironment({ [marker]: '1', PATH: '/usr/bin' }).PATH, '/usr/bin')
+    // The caller's environment object is copied, never mutated.
+    const source: NodeJS.ProcessEnv = { [marker]: '1' }
+    openEnvironment(source)
+    assert.equal(source[marker], '1')
+    const previous = process.env[marker]
+    process.env[marker] = '1'
+    try {
+      assert.equal(openEnvironment()[marker], undefined)
+      assert.equal(process.env[marker], '1')
+    } finally {
+      if (previous === undefined) delete process.env[marker]
+      else process.env[marker] = previous
+    }
+  })
+
+  it('names the permission dialog DeepSeek Harness on the desktop host and the terminal otherwise', () => {
+    const previous = process.env.DSH_DESKTOP_NODE_EXECUTABLE
+    process.env.DSH_DESKTOP_NODE_EXECUTABLE = '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness'
+    try {
+      assert.equal(isDesktopHost(), true)
+      assert.equal(tccAppName(), 'DeepSeek Harness')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_DESKTOP_NODE_EXECUTABLE
+      else process.env.DSH_DESKTOP_NODE_EXECUTABLE = previous
+    }
+    if (!process.execPath.includes('DeepSeek Harness')) {
+      const lang = process.env.LANG
+      process.env.LANG = 'zh_CN.UTF-8'
+      try {
+        assert.equal(tccAppName(), '终端')
+      } finally {
+        if (lang === undefined) delete process.env.LANG
+        else process.env.LANG = lang
+      }
+    }
+    assert.equal(isTccRight('screen'), true)
+    assert.equal(isTccRight('accessibility'), true)
+    assert.equal(isTccRight('camera'), false)
+  })
+})
