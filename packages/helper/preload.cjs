@@ -133,6 +133,9 @@ contextBridge.exposeInMainWorld('dshOrb', {
   memeTool() {
     return ipcRenderer.invoke('orb:meme-tool')
   },
+  memeWebfetch() {
+    return ipcRenderer.invoke('orb:meme-webfetch')
+  },
   memeSleep() {
     return ipcRenderer.invoke('orb:meme-sleep')
   },
@@ -147,6 +150,12 @@ contextBridge.exposeInMainWorld('dshOrb', {
   },
   memeClick() {
     return ipcRenderer.invoke('orb:meme-click')
+  },
+  memeArrive() {
+    return ipcRenderer.invoke('orb:meme-arrive')
+  },
+  memePoor() {
+    return ipcRenderer.invoke('orb:meme-poor')
   },
   memeDone() {
     return ipcRenderer.invoke('orb:meme-done')
@@ -210,6 +219,15 @@ contextBridge.exposeInMainWorld('dshOrb', {
   },
   onAppearance(callback) {
     ipcRenderer.on('orb:appearance', (_event, appearance) => callback(appearance))
+  },
+  /**
+   * The account balance the host read: `{ cny, at }`, with `cny: null` for "not known".
+   *
+   * Pushed rather than fetched: the host reads it on its own slow cadence, and a ball that had to ask
+   * would be asking a question the helper has no way to answer — the account lives on the host side.
+   */
+  onBalance(callback) {
+    ipcRenderer.on('orb:balance', (_event, balance) => callback(balance))
   },
   /**
    * Read-aloud settings pushed from the host: `{ enabled, autoPlay, endpoint }`.

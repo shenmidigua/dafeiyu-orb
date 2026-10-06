@@ -79,6 +79,71 @@ export const FRAME_DEFAULTS: NamedFrame = { enabled: false, file: '' }
 /** No peek: the pointer leaves the avatar alone. */
 export const HOVER_DEFAULTS: HoverFrame = { ...FRAME_DEFAULTS, intro: '' }
 
+/**
+ * The carry state: the loop worn while the ball is held, plus an optional one-pass
+ * intro played the moment it is picked up. Same shape as {@link HoverFrame}, so the
+ * pickup reads as a gesture — the lift, then the hang — rather than a state swap.
+ */
+export interface DragFrame extends NamedFrame {
+  /** A file name played once before {@link file}, or `''` for no intro. */
+  readonly intro: string
+}
+
+/** What the ball shows while it is being carried. */
+export interface DragFrames {
+  /** The loop worn for as long as the carry lasts. */
+  readonly src: string
+  /** The one-pass pickup and how long it lasts. */
+  readonly intro: { readonly src: string; readonly ms: number } | null
+}
+
+/** No carry: picking the ball up leaves the avatar alone. */
+export const DRAG_DEFAULTS: DragFrame = { ...FRAME_DEFAULTS, intro: '' }
+
+/**
+ * The arrival: the greeting the ball turns up with, as the clips it plays in order.
+ *
+ * A list rather than one file, because turning up is not always one clip: the ball can arrive and
+ * then wave, and the pack says so by naming both. Every entry is played once, in order, each for one
+ * pass of its own animation. An empty list is the silent startup a profile written before this slot
+ * existed keeps.
+ */
+export interface ArrivePlan {
+  readonly enabled: boolean
+  /** Files played once each, in order. A name that resolves to nothing is skipped. */
+  readonly files: readonly string[]
+}
+
+/** No greeting. */
+export const ARRIVE_DEFAULTS: ArrivePlan = { enabled: false, files: [] }
+
+/**
+ * The poor frame: the face the ball rests in when the account is nearly out of money.
+ *
+ * It replaces {@link NamedFrame} `idle` rather than sitting beside it, because it is the same state —
+ * the ball is not doing anything — seen under a condition. The condition is the balance the host
+ * pushes (see `balance()` below): a number, or nothing at all when it could not be read, which keeps
+ * the ordinary loop rather than reading a failed lookup as an empty wallet.
+ */
+export interface PoorPlan extends NamedFrame {
+  /** The spendable balance, in CNY, below which this frame is worn instead of `idle`. */
+  readonly below: number
+}
+
+/** What the ball needs to make that choice: the frame, and the line it is compared against. */
+export interface PoorFrame {
+  readonly src: string
+  readonly below: number
+}
+
+/**
+ * The line an absent `below` falls back to, in CNY.
+ *
+ * Five yuan: low enough that the poor face only shows up when the account is genuinely nearly out,
+ * which is the whole of what it is for. A pack that wants its own number says so in the slot.
+ */
+export const POOR_DEFAULTS: PoorPlan = { ...FRAME_DEFAULTS, below: 5 }
+
 /** The yawn that opens the nap: one file played a few times before the timeline starts. */
 interface YawnFrame extends NamedFrame {
   /** How many times the file plays before the first nap frame. */
@@ -190,14 +255,41 @@ export interface MemePicker {
   thinking(): Promise<string | null>
   /** A `data:` URL the ball shows while a tool call is running. */
   tool(): Promise<string | null>
+  /**
+   * A `data:` URL the ball shows while a web page is being fetched.
+   *
+   * A loop for the same reason {@link tool} is one: the length of a fetch is nobody's to know in
+   * advance. It is a *separate* slot rather than a variant of `tool` because fetching a page is the
+   * one tool call the user watches rather than waits for, and a pack that gives it its own face
+   * should not have to give up the face every other tool shares.
+   */
+  webfetch(): Promise<string | null>
   /** The click reaction, played once with the length of its own animation. */
   click(): Promise<TimedFrame | null>
+  /**
+   * The arrival, played once as the page opens: the greeting the ball turns up with, in order.
+   *
+   * One-shots like the click reaction rather than loops like {@link idle}, because each says
+   * something true exactly once — the ball has just appeared, and then says hello. The helper starts
+   * the ball's page when the orb is switched on, so this is the sequence a DSH launch opens with as
+   * well as every later enable, and a profile that names no file keeps the old silent startup.
+   */
+  arrive(): Promise<readonly TimedFrame[] | null>
+  /**
+   * The resting face for a nearly empty account: the frame, and the balance line to compare with.
+   *
+   * A loop like {@link idle}, because it *is* the resting loop under a condition rather than a cue of
+   * its own. The page asks the host for the account's spendable balance and picks between the two
+   * every time it repaints, so a balance that falls below the line changes the face the ball is
+   * already wearing.
+   */
+  poor(): Promise<PoorFrame | null>
   /** The finished-task frame, played once with the length of its own animation. */
   done(): Promise<TimedFrame | null>
   /** The wake-word frame, played once as soon as the keyword fires. */
   wake(): Promise<TimedFrame | null>
-  /** A `data:` URL the ball wears while it is being dragged around the screen. */
-  drag(): Promise<string | null>
+  /** The carry: the hang loop plus the one-pass pickup, or `null` while it is off. */
+  drag(): Promise<DragFrames | null>
   /** The release reaction, played once the pointer lets go: the drop, not the carry. */
   drop(): Promise<TimedFrame | null>
   /** The nap timeline, or `null` while it is off or no file resolves. */
@@ -222,10 +314,13 @@ interface MemeConfig extends MemeSchedule {
   readonly reply: NamedFrame
   readonly thinking: NamedFrame
   readonly tool: NamedFrame
+  readonly webfetch: NamedFrame
   readonly click: NamedFrame
+  readonly arrive: ArrivePlan
+  readonly poor: PoorPlan
   readonly done: NamedFrame
   readonly wake: NamedFrame
-  readonly drag: NamedFrame
+  readonly drag: DragFrame
   readonly drop: NamedFrame
   readonly sleep: SleepPlan
   readonly skit: SkitFrame
@@ -234,12 +329,15 @@ interface MemeConfig extends MemeSchedule {
 /**
  * Read the config from `configPath` on demand:
  * `{ "enabled": true, "dir": "D:/packs/fish", "gapMs": [20000, 60000], "holdMs": [600, 1000],
- *    "frames": [3, 6], "idle": { "file": "idle.gif" }, "hover": { "file": "peek.gif", "intro": "in.gif" },
+ *    "frames": [3, 6], "idle": { "file": "idle.gif" }, "poor": { "below": 60, "file": "broke.gif" },
+ *    "hover": { "file": "peek.gif", "intro": "in.gif" },
  *    "typing": { "file": "typing.gif" }, "reply": { "file": "answer.gif" },
  *    "voice": { "file": "nod.gif" }, "speak": { "file": "talk.gif" },
  *    "thinking": { "file": "reasoning.gif" }, "tool": { "file": "tool.gif" },
- *    "click": { "file": "pat.gif" }, "done": { "file": "bell.gif" }, "wake": { "file": "bang.gif" },
- *    "drag": { "file": "scared.gif" }, "drop": { "file": "land.gif" },
+ *    "webfetch": { "file": "fetch.gif" },
+ *    "click": { "file": "pat.gif" }, "arrive": { "files": ["hello.gif", "wave.gif"] },
+ *    "done": { "file": "bell.gif" }, "wake": { "file": "bang.gif" },
+ *    "drag": { "file": "hang.gif", "intro": "lift.gif" }, "drop": { "file": "land.gif" },
  *    "sleep": { "afterMs": 300000, "stepMs": 300000, "yawn": { "file": "yawn.gif", "times": 2 },
  *               "files": ["nap1.gif", "nap2.gif"] },
  *    "skit": { "gapMs": [120000, 300000], "file": "skit.gif", "times": [3, 5], "interject": "mid.gif" } }`
@@ -378,10 +476,32 @@ export function createMemePicker(configPath: string, random: () => number = Math
       const current = await loadConfig()
       return named(current.tool, current.dirs)
     },
+    async webfetch() {
+      const current = await loadConfig()
+      return named(current.webfetch, current.dirs)
+    },
     async click() {
       const current = await loadConfig()
       if (!current.click.enabled) return null
       return timedFrame(current.click.file, current.dirs)
+    },
+    async arrive() {
+      const current = await loadConfig()
+      if (!current.arrive.enabled) return null
+      // In order, and one unreadable name does not cost the rest of the greeting: a pack that lost
+      // the wave file still arrives.
+      const frames: TimedFrame[] = []
+      for (const file of current.arrive.files) {
+        const frame = await timedFrame(file, current.dirs)
+        if (frame !== null) frames.push(frame)
+      }
+      return frames.length === 0 ? null : frames
+    },
+    async poor() {
+      const current = await loadConfig()
+      if (!current.poor.enabled) return null
+      const src = await named(current.poor, current.dirs)
+      return src === null ? null : { src, below: current.poor.below }
     },
     async done() {
       const current = await loadConfig()
@@ -395,7 +515,10 @@ export function createMemePicker(configPath: string, random: () => number = Math
     },
     async drag() {
       const current = await loadConfig()
-      return named(current.drag, current.dirs)
+      const src = await named(current.drag, current.dirs)
+      if (src === null) return null
+      if (current.drag.intro === '') return { src, intro: null }
+      return { src, intro: await timedFrame(current.drag.intro, current.dirs) }
     },
     async drop() {
       const current = await loadConfig()
@@ -464,10 +587,13 @@ async function readConfig(path: string): Promise<MemeConfig> {
     reply: FRAME_DEFAULTS,
     thinking: FRAME_DEFAULTS,
     tool: FRAME_DEFAULTS,
+    webfetch: FRAME_DEFAULTS,
     click: FRAME_DEFAULTS,
+    arrive: ARRIVE_DEFAULTS,
+    poor: POOR_DEFAULTS,
     done: FRAME_DEFAULTS,
     wake: FRAME_DEFAULTS,
-    drag: FRAME_DEFAULTS,
+    drag: DRAG_DEFAULTS,
     drop: FRAME_DEFAULTS,
     sleep: SLEEP_DEFAULTS,
     skit: SKIT_DEFAULTS,
@@ -496,10 +622,13 @@ async function readConfig(path: string): Promise<MemeConfig> {
     reply: readNamed(record.reply),
     thinking: readNamed(record.thinking),
     tool: readNamed(record.tool),
+    webfetch: readNamed(record.webfetch),
     click: readNamed(record.click),
+    arrive: readArrive(record.arrive),
+    poor: readPoor(record.poor),
     done: readNamed(record.done),
     wake: readNamed(record.wake),
-    drag: readNamed(record.drag),
+    drag: readDrag(record.drag),
     drop: readNamed(record.drop),
     sleep: readSleep(record.sleep),
     skit: readSkit(record.skit),
@@ -545,6 +674,35 @@ function readSleep(value: unknown): SleepPlan {
   }
 }
 
+/** The arrival: the files named, in order. A slot that names none is off. */
+function readArrive(value: unknown): ArrivePlan {
+  if (typeof value !== 'object' || value === null) return ARRIVE_DEFAULTS
+  const record = value as Record<string, unknown>
+  const files = Array.isArray(record.files)
+    ? record.files.filter((file): file is string => typeof file === 'string' && file.trim() !== '').map((file) => file.trim())
+    : []
+  return { enabled: record.enabled !== false && files.length > 0, files }
+}
+
+/**
+ * The poor frame: a named file plus the balance that turns it on.
+ *
+ * An absent line takes the default, so a pack that names the file and forgets the amount still does
+ * something sensible. A line that is *there* but unusable — negative, `NaN`, a string — becomes zero
+ * instead, which no balance can be below: a broken amount must not be what turns a face on.
+ */
+function readPoor(value: unknown): PoorPlan {
+  const frame = readNamed(value)
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  const raw = record.below
+  const below = raw === undefined || raw === null
+    ? POOR_DEFAULTS.below
+    : typeof raw === 'number' && Number.isFinite(raw) && raw >= 0
+      ? Math.round(raw * 100) / 100
+      : 0
+  return { ...frame, below }
+}
+
 /** One millisecond duration, clamped to a sane band. */
 function readMs(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
@@ -553,6 +711,14 @@ function readMs(value: unknown, fallback: number, min: number, max: number): num
 
 /** The peek entry: a named frame plus the optional one-pass intro naming another file. */
 function readHover(value: unknown): HoverFrame {
+  const frame = readNamed(value)
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  const intro = typeof record.intro === 'string' ? record.intro.trim() : ''
+  return { ...frame, intro: frame.enabled ? intro : '' }
+}
+
+/** The carry entry: a named frame plus the optional one-pass pickup naming another file. */
+function readDrag(value: unknown): DragFrame {
   const frame = readNamed(value)
   const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
   const intro = typeof record.intro === 'string' ? record.intro.trim() : ''

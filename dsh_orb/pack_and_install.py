@@ -37,6 +37,10 @@ CHECKED = [
     ("dist/helper/assets/floating.html", "assets/floating.html"),
     ("dist/helper/assets/speech.js", "assets/speech.js"),
     ("dist/helper/assets/shell.js", "assets/shell.js"),
+    # `wake.js` holds the classifier ring size, which is part of the trained model's interface — a
+    # package with the new 28-slot model and the old 16-slot ring would throw at load, and nothing in
+    # this list would have noticed. It was missing while the ring changed, which is how it was found.
+    ("dist/helper/assets/wake.js", "assets/wake.js"),
     ("dist/helper/preload.cjs", "preload.cjs"),
     ("dist/helper/lib/main.js", "lib/main.js"),
 ]

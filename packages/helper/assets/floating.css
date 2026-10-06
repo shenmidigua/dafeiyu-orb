@@ -832,6 +832,145 @@ body.docked #wake-badge {
   visibility: hidden;
 }
 
+/* ── the live wake meter ───────────────────────────────────────────────────
+   What the classifier thinks of the window it just scored, drawn under the ball.
+   The ball deliberately shows no wake state at all, so this is the only place the
+   score is ever visible — which is the point of it: it answers "why did that wake
+   me" and "why did it ignore me" by showing the number, not by adding a second
+   readout of a state the badge already names.
+
+   It lives in the empty column below the ball (`--ball-row` + `--ball`, where the
+   panel card never reaches: the card is anchored to the ball's row, so the 244px
+   under the ball are free in every direction). Like the badge it is a label, never
+   a target: the page reports hit-test rects for the ball, the panel, the stop cap
+   and the docked tab only, and this must stay off that list or a 288px strip of
+   dead desktop would start eating clicks. */
+#wake-meter {
+  position: absolute;
+  z-index: 2;
+  top: calc(var(--ball-row) + var(--ball) + 14px);
+  left: var(--ball-column);
+  box-sizing: border-box;
+  width: var(--ball);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-radius: 12px;
+  padding: 7px 10px 6px;
+  /* The meter floats over the wallpaper, where neither theme's surface colours apply. It carries
+     its own scrim rather than a text shadow: the first version drew white text straight onto the
+     desktop and was grey mush over a light background — measured on a screenshot, not guessed.
+     A dark card behind the whole thing also gives the track and the unlit dots something to sit
+     on, so all three read the same way over any wallpaper. */
+  background: rgba(17, 17, 17, 0.58);
+  /* The inset hairline is for a dark wallpaper, where a dark card would otherwise fade into the
+     desktop and take its edges with it; the drop shadow is for a light one. */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+
+/* `display: flex` above would otherwise beat the UA's `[hidden]`, and a meter left at 0.000
+   under a ball whose microphone is off reads as "it scored your silence", not as "it is off". */
+#wake-meter[hidden] {
+  display: none;
+}
+
+body.docked #wake-meter {
+  visibility: hidden;
+}
+
+/* The scrim is now the card behind it, so the track only has to separate itself from that. */
+#wake-meter-track {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+#wake-meter-fill {
+  height: 100%;
+  width: calc(var(--wake-score, 0) * 100%);
+  border-radius: 999px;
+  background: var(--wake);
+  /* No animation on the way up. A run that wakes the ball is three windows and the chime follows
+     two windows later, so an eased fill is still climbing when the user hears the wake — the bar
+     would be explaining a decision after the fact, which is the one thing it exists to prevent.
+     shell.js adds `falling` when the reading drops, and only that direction is eased: downward is
+     where the 128 ms steps would read as flicker, and arriving late there costs nothing. */
+}
+
+#wake-meter-fill.falling {
+  transition: width 90ms linear, background-color 90ms linear;
+}
+
+/* Over the line: the same green the badge wears for a detection, so "it is scoring high
+   and still not waking" cannot be misread as "it never got close". */
+#wake-meter.hot #wake-meter-fill {
+  background: var(--wake-strong);
+}
+
+/* A held reading: the run that fired, kept on screen after the ball has already chimed. It is a
+   record rather than a live score, and it says so — the card takes the crossed colour as its
+   hairline and the readout wears it, so a number left up under a ball that is now recording is not
+   mistaken for what the microphone is hearing. */
+#wake-meter.held {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), inset 0 0 0 1px var(--wake-strong);
+}
+
+#wake-meter.held #wake-meter-score {
+  color: var(--wake-strong);
+}
+
+/* Where the threshold is, on the same scale as the fill. It overhangs the track so the
+   crossing is legible at a glance rather than only when the fill's colour changes. */
+#wake-meter-line {
+  position: absolute;
+  z-index: 1;
+  top: -3px;
+  bottom: -3px;
+  left: calc(var(--wake-threshold, 0.95) * 100%);
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.7);
+}
+
+#wake-meter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  line-height: 1;
+  color: #ffffff;
+}
+
+#wake-meter-score {
+  font-variant-numeric: tabular-nums;
+}
+
+#wake-meter-streak {
+  display: flex;
+  gap: 4px;
+}
+
+/* One per window the detection rule needs in a row (see CONSECUTIVE_WINDOWS): the dots are
+   built by shell.js from that constant, so "how many more windows" is read off the rule
+   instead of being restated here. */
+.wake-meter-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  /* Lit or not, the dots have to be countable over the card: the point of drawing the rule as three
+     pips is that "two more windows" is visible, and an unlit pip nobody can see shows nothing. */
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.wake-meter-dot.on {
+  background: var(--wake-strong);
+  box-shadow: 0 0 4px var(--wake-strong);
+}
+
 #ball:active {
   cursor: grabbing;
 }

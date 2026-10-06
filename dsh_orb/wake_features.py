@@ -27,31 +27,72 @@ EMBEDDING = ASSETS / "embedding_model.onnx"
 KEYWORD = ASSETS / "hey_jarvis_v0.1.onnx"       # the shipped classifier, used as a reference point
 
 FRAME_SAMPLES = 1280
-WINDOW_FRAMES = 16
+# How many embeddings the classifier reads at once. **One slot is 128 ms of audio, not 80 ms** — the
+# melspectrogram turns one 1280-sample frame into five 32-bin frames of 16 ms, and each embedding
+# consumes `MEL_STEP = 8` of them — so a ring of 28 slots spans 3.58 s, not 2.24 s.
+#
+# The number is derived, not chosen. `wake_span_probe.py` measures each candidate phrase's speech
+# span in these slots, and the ring has to hold the *whole* phrase, because a window that catches
+# only part of a repeated phrase is the same input as the phrase said once — which is exactly the
+# confusion this whole change exists to remove. Measured on Edge TTS:
+#
+#     大肥鱼              3.8 ..  7.5 slots
+#     大肥鱼大肥鱼          8.7 .. 15.6 slots
+#     喂，大肥鱼大肥鱼      10.0 .. 19.4 slots
+#
+# 28 slots covers the longest of those with room to spare; `wake_dataset.py` asserts the invariant at
+# build time rather than trusting this comment. openWakeWord's own `hey_jarvis` classifier reads 16,
+# so the engine sizes the ring per keyword — see `RING_SLOTS` in `assets/wake.js`.
+WINDOW_FRAMES = 28
 EMBEDDING_DIM = 96
 MEL_BINS = 32
 MEL_WINDOW_FRAMES = 76
 
 # How much audio to run before a clip so the embedding ring is already full when the clip starts.
 #
-# This is not decoration. The ring holds sixteen embeddings and starts as sixteen zero vectors, so a
-# feature run that begins at the clip leaves zeros on the left of every window it produces. The orb
-# does not work that way: the engine runs continuously, so by the time anyone says the wake word the
-# ring is full of whatever came before — usually silence, sometimes a previous sentence. Only the
-# first ~1.3 s after the engine is created has zeros in the ring.
+# This is not decoration. The ring starts as zero vectors, so a feature run that begins at the clip
+# leaves zeros on the left of every window it produces. The orb does not work that way: the engine
+# runs continuously, so by the time anyone says the wake word the ring is full of whatever came
+# before — usually silence, sometimes a previous sentence. Only the first few seconds after the
+# engine is created have zeros in the ring.
 #
 # A model trained on the zero-padded version learns *that* pattern, and the cost was measured before
 # it was corrected: for phrases it had been fitted to it scored 0.986–1.000, and on ordinary Chinese
 # sentences it went from 0.000 with a cold ring to 1.000 — every single one — with a warm one. It
 # would have woken on every sentence the user spoke.
 #
-# 40 frames is 3.2 s, which yields ~25 embeddings before the clip: comfortably more than the sixteen
-# the ring needs, with room for the cadence to be uneven.
-WARMUP_FRAMES = 40
+# The buffer fills at 5 mel frames per audio frame and drains at 8 per embedding, so `n` frames yield
+# `slots_at(n)` = (5n - 76) // 8 + 1 embeddings — which is 16 at 40 frames, not the "~25" an earlier
+# version of this comment claimed. That earlier number was wrong and mattered: it is the reason the
+# old warm-up landed exactly on the old ring of 16 with no margin. 80 frames yields 41, comfortably
+# more than the 28 the ring needs.
+WARMUP_FRAMES = 80
 
 # The floor of a quiet room, not digital zero. Real silence still carries a noise floor, and the
 # melspectrogram model takes a logarithm, so exact zeros are a different regime again.
 SILENCE_LEVEL = 0.003
+
+
+# Samples of audio one ring slot advances by: MEL_STEP mel frames, each 16 ms. Written as literals
+# because `OrbFeatures` is defined below this point.
+SLOT_SAMPLES = 8 * (FRAME_SAMPLES // 5)
+
+
+def slots_at(frame_count: int) -> int:
+    """Embeddings produced after `frame_count` audio frames have been pushed through the chain.
+
+    The closed form of the loop in `OrbFeatures.windows`: every frame appends five mel frames and
+    every embedding consumes eight, so the count is `(5n - 76) // 8 + 1` once the mel window is
+    full. Exact, not asymptotic — the ramp costs about 8.5 slots, which is most of a ring.
+
+    Kept next to the loop it mirrors because the two have to agree: `wake_dataset` uses this to
+    decide how much of a clip a window must contain before it counts as a positive, and the loop
+    decides when that window actually appears.
+    """
+    mel = OrbFeatures.MEL_FRAMES_PER_CALL * int(frame_count)
+    if mel < MEL_WINDOW_FRAMES:
+        return 0
+    return (mel - MEL_WINDOW_FRAMES) // OrbFeatures.MEL_STEP + 1
 
 
 def warmup_length() -> int:
@@ -130,7 +171,7 @@ class OrbFeatures:
 
     def windows(self, samples: np.ndarray, warmup: np.ndarray | None = None,
                 require_clip_embeddings: int = 0) -> np.ndarray:
-        """`(n, 16, 96)` windows from float32 audio in [-1, 1].
+        """`(n, WINDOW_FRAMES, 96)` windows from float32 audio in [-1, 1].
 
         `warmup` is audio that came *before* `samples`; it fills the embedding ring so the returned
         windows contain no zeros, which is the state the ring is in whenever the orb is actually
@@ -262,7 +303,7 @@ class FeatureExtractor:
                              device=device, ncpu=ncpu)
 
     def windows(self, samples: np.ndarray) -> np.ndarray:
-        """`(n, 16, 96)` windows from float32 audio in [-1, 1]."""
+        """`(n, WINDOW_FRAMES, 96)` windows from float32 audio in [-1, 1]."""
         pcm = to_pcm16(samples)
         self._features.reset()
         rows = []

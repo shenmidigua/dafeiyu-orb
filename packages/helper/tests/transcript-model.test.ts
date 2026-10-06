@@ -62,7 +62,7 @@ const PROBE_MESSAGES = {
  * @param inputs - `wakeState` from the engine, optional `dictationPhase` from the page.
  * @returns the badge text and the body classes the function toggled.
  */
-function drawWakeState(inputs: { wakeState: string; detail?: string; dictationPhase?: string; expanded?: boolean }): { text: string; hidden: boolean; classes: Record<string, boolean> } {
+function drawWakeState(inputs: { wakeState: string; detail?: string; keyword?: string; dictationPhase?: string; expanded?: boolean }): { text: string; hidden: boolean; classes: Record<string, boolean> } {
   const classes: Record<string, boolean> = {}
   const badge = { textContent: '', hidden: false }
   const ball = { title: '', removeAttribute() { ball.title = '' } }
@@ -70,8 +70,15 @@ function drawWakeState(inputs: { wakeState: string; detail?: string; dictationPh
     body: { classList: { toggle: (name: string, on: boolean) => { classes[name] = on === true } } },
     querySelector: (selector: string) => (selector === '#wake-badge' ? badge : ball),
   }
+  // The page's `syncWake` closes over two things this harness has to supply: the message table
+  // and the keyword name. Both arrive through `deps` because the function is lifted out of the
+  // module and has no access to the module scope any more. The wake meter is a third: `syncWake`
+  // is what decides whether it is on screen, so it needs the element, the painter, and the held
+  // reading that can keep it there on its own — none of which this test is about, but all of which
+  // it has to hand over or `syncWake` throws.
   const factory = new Function('deps', `
-    const { document, messages, pageClosed, expanded, wakeState, wakeDetail, dictationPhase } = deps
+    const { document, messages, pageClosed, expanded, wakeState, wakeDetail, dictationPhase,
+            KEYWORD_NAMES, wakeKeyword, wakeMeter, paintWakeMeter, heldWake } = deps
     ${pageFunction(readFileSync(join(here, '../assets/shell.js'), 'utf8'), 'syncWake')}
     return syncWake
   `)
@@ -83,9 +90,24 @@ function drawWakeState(inputs: { wakeState: string; detail?: string; dictationPh
     wakeState: inputs.wakeState,
     wakeDetail: inputs.detail ?? '',
     dictationPhase: inputs.dictationPhase,
+    KEYWORD_NAMES: PROBE_KEYWORD_NAMES,
+    wakeKeyword: inputs.keyword ?? '',
+    wakeMeter: { hidden: true },
+    paintWakeMeter: () => {},
+    heldWake: () => undefined,
   })()
   return { text: badge.textContent, hidden: badge.hidden, classes }
 }
+
+/**
+ * The page's spoken-form table, mirrored rather than imported.
+ *
+ * `syncWake` is lifted out of the module as source text, so the table it closes over is a
+ * constant inside the page rather than something this file can reach. Duplicating it here is
+ * deliberate: if the page gains a keyword and this table does not, the test that asks for the
+ * spoken form fails rather than quietly agreeing with whatever the page happened to do.
+ */
+const PROBE_KEYWORD_NAMES: Record<string, string> = { hey_jarvis: 'Hey Jarvis', dafeiyu: '大肥鱼' }
 
 /**
  * Run the page's real waveform functions against a stubbed SVG and report the geometry.
@@ -580,6 +602,99 @@ describe('wake badge', () => {
   })
 })
 
+/**
+ * The name in the "say this" line.
+ *
+ * The line used to be a fixed string naming the shipped keyword, so a profile that trained its
+ * own word was told to say the wrong one — the feature worked and the instruction was a lie. The
+ * engine reports which keyword it is running, and the page turns that into something sayable:
+ * `dafeiyu` is a file stem, and asking the user to say "dafeiyu" would be no better than the bug.
+ */
+describe('the wake word the status line names', () => {
+  const shell = readFileSync(join(here, '../assets/shell.js'), 'utf8')
+  // The page's two message tables, named as they are declared there, so `shippedLine` knows
+  // which half of the file it is reading rather than trusting the order they appear in.
+  const MESSAGES_ZH = 'const zh = {'
+  const MESSAGES_EN = 'const en = {'
+
+  /** The shipped listening line, read out of the page rather than restated here. */
+  function shippedLine(locale: 'zh' | 'en'): string {
+    // Read from the page because an earlier version of this test passed its own copy in, and
+    // then passed with the hard-coded keyword put back: the substitution was being proved
+    // against a string the test controlled, so the page could say anything at all.
+    const table = locale === 'zh' ? MESSAGES_ZH : MESSAGES_EN
+    const start = shell.indexOf(table)
+    assert.notEqual(start, -1, `the ${locale} message table is missing from the page`)
+    const found = /wakeListening:\s*'([^']*)'/.exec(shell.slice(start, start + 4000))
+    assert.ok(found !== null, `the ${locale} table has no wakeListening line`)
+    return found[1] as string
+  }
+
+  /** Run `syncWake` with the page's own listening line in place. */
+  function draw(keyword: string, locale: 'zh' | 'en' = 'zh'): string {
+    const classes: Record<string, boolean> = {}
+    const badge = { textContent: '', hidden: false }
+    const ball = { title: '', removeAttribute() { ball.title = '' } }
+    const factory = new Function('deps', `
+      const { document, messages, pageClosed, expanded, wakeState, wakeDetail, dictationPhase,
+              KEYWORD_NAMES, wakeKeyword, wakeMeter, paintWakeMeter, heldWake } = deps
+      ${pageFunction(shell, 'syncWake')}
+      return syncWake
+    `)
+    factory({
+      document: {
+        body: { classList: { toggle: (name: string, on: boolean) => { classes[name] = on === true } } },
+        querySelector: (selector: string) => (selector === '#wake-badge' ? badge : ball),
+      },
+      messages: { ...PROBE_MESSAGES, wakeListening: shippedLine(locale) },
+      pageClosed: () => false,
+      expanded: true,
+      wakeState: 'listening',
+      wakeDetail: '',
+      dictationPhase: undefined,
+      KEYWORD_NAMES: PROBE_KEYWORD_NAMES,
+      wakeKeyword: keyword,
+      // `syncWake` owns the wake meter's visibility too; this file is about the badge. See the
+      // matching note in `drawWakeState`.
+      wakeMeter: { hidden: true },
+      paintWakeMeter: () => {},
+      heldWake: () => undefined,
+    })()
+    return badge.textContent
+  }
+
+  it('carries a placeholder rather than a fixed word', () => {
+    // The check that the earlier version of this file could not make: the page's own copy has
+    // to name nobody in particular, or there is nothing left to substitute into.
+    for (const locale of ['zh', 'en'] as const) {
+      assert.match(shippedLine(locale), /\{word\}/,
+        `the ${locale} listening line names a keyword outright`)
+    }
+  })
+
+  it('says the shipped name for the shipped keyword', () => {
+    assert.equal(draw('hey_jarvis'), '语音唤醒已开启 — 说「Hey Jarvis」')
+  })
+
+  it('says the trained name for a trained keyword, not the shipped one', () => {
+    const text = draw('dafeiyu')
+    assert.equal(text, '语音唤醒已开启 — 说「大肥鱼」')
+    assert.doesNotMatch(text, /Jarvis/, 'the shipped keyword is still being announced')
+  })
+
+  it('falls back to the raw name rather than to the shipped one', () => {
+    // A keyword nobody has a spoken form for is still better off named honestly than misnamed:
+    // the user trained it, so they know what its stem sounds like.
+    assert.equal(draw('xiao_ming'), '语音唤醒已开启 — 说「xiao_ming」')
+  })
+
+  it('does not leave the placeholder in the line', () => {
+    // With no report yet there is no keyword, and `{word}` must not reach the screen.
+    assert.doesNotMatch(draw(''), /\{word\}/,
+      'the placeholder survived because no keyword had been reported')
+  })
+})
+
 describe('wake level waveform', () => {
   it('draws one bar per engine level across the official box', () => {
     const { bars, appended } = drawWaveform()
@@ -711,7 +826,10 @@ describe('ball page module', () => {
     // One shot, prompted by the same step trick the click reaction uses.
     const play = pageFunction(shell, 'playDoneFrame')
     assert.match(play, /doneStep \+= 1/)
-    assert.match(play, /Math\.max\(doneFrame\.ms, ONE_SHOT_MIN_MS\)/)
+    // The hold is one uniform rule now, so what this pins is that the frame's own loop flag is
+    // handed to it — a `playDoneFrame` that dropped the second argument would silently hold a
+    // restarting clip past its own end and show its first frame twice.
+    assert.match(play, /oneShotHoldMs\(doneFrame\.ms, doneFrame\.loops\)/)
     assert.match(pageFunction(shell, 'syncGif'), /if \(doneShown !== undefined\)/, 'the pose is actually reachable from syncGif')
   })
 
@@ -740,7 +858,7 @@ describe('ball page module', () => {
     assert.match(shell, /if \(wakeFrame === undefined \|\| wakeFrame === null\) \{/, 'the frame is loaded with the other named ones')
     const play = pageFunction(shell, 'playWakeFrame')
     assert.match(play, /wakeStep \+= 1/)
-    assert.match(play, /Math\.max\(wakeFrame\.ms, ONE_SHOT_MIN_MS\)/)
+    assert.match(play, /oneShotHoldMs\(wakeFrame\.ms, wakeFrame\.loops\)/)
     // The frame is normally prefetched, but the first wake after a restart can beat the burst
     // cycle to it. Waiting for a poll timer before acknowledging your own name is not on.
     assert.match(play, /void fetchWake\(\)\.then\(/, 'a frame that has not arrived yet is fetched on demand rather than skipped')
@@ -758,6 +876,15 @@ describe('ball page module', () => {
     const gate = status.indexOf("if (wakeState !== 'detected') return")
     assert.notEqual(gate, -1, 'the detected check is still the gate')
     assert.ok(status.indexOf('playWakeFrame()') > gate, 'it plays past the detected gate and not before it')
+    // The reading that fired is held out of the same report, and held *first*. The order is the
+    // whole point: everything after this line in the function makes the meter unable to explain the
+    // wake — the engine clears the streak on its very next window, and the recorder that starts
+    // below stops the scoring entirely — so a hold taken afterwards holds nothing that was on
+    // screen, and a user who looks up at the chime finds a bar that never crossed.
+    const held = status.indexOf('holdWake(wakeScoreIn(status.detail))')
+    assert.notEqual(held, -1, 'the score the engine reported with the detection is what gets held')
+    assert.ok(held > gate, 'and only a detection holds one, because a non-detection has no score of its own')
+    assert.ok(held < status.indexOf('playWakeFrame()'), 'the hold is taken before the chime it has to explain')
   })
 
   it('wires the dictation pose to the recording, and only to it', () => {

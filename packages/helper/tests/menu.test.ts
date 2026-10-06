@@ -127,6 +127,7 @@ describe('ball menu', () => {
       millifractionEnabled: false,
       wakeEnabled: false,
       wakeAvailable: true,
+      wakeWord: 'Hey Jarvis',
       dictationReady: true,
       openMain: true,
     }, true, {
@@ -168,6 +169,7 @@ describe('ball menu', () => {
       millifractionEnabled: false,
       wakeEnabled: false,
       wakeAvailable: true,
+      wakeWord: 'Hey Jarvis',
       dictationReady: false,
       openMain: true,
     }, true, {
@@ -188,6 +190,7 @@ describe('ball menu', () => {
       millifractionEnabled: false,
       wakeEnabled: false,
       wakeAvailable: true,
+      wakeWord: 'Hey Jarvis',
       openMain: false,
     }, false, {
       openMain() {},
@@ -203,6 +206,32 @@ describe('ball menu', () => {
     assert.equal(english.at(-1)?.label, 'Disable floating ball')
   })
 
+  it('names the configured wake word, not the one that ships', () => {
+    // The row used to read "语音唤醒（Hey Jarvis）" whatever was configured, so a user with a
+    // self-trained word was shown the wrong one at the exact place they turn it on and off.
+    const template = contextMenuTemplate({
+      catalog: { groups: [] },
+      overlay: { provider: 'deepseek-official', model: 'plain' },
+      background: { provider: 'deepseek-official', model: 'plain' },
+      millifractionEnabled: false,
+      wakeEnabled: true,
+      wakeAvailable: true,
+      wakeWord: '大肥鱼大肥鱼',
+      dictationReady: true,
+      openMain: true,
+    }, true, {
+      openMain() {},
+      setOverlay() {},
+      setBackground() {},
+      setMillifraction() {},
+      setWake() {},
+      dictate() {},
+      disable() {},
+    })
+    const row = template.find((item) => item.label?.startsWith('语音唤醒'))
+    assert.equal(row?.label, '语音唤醒（大肥鱼大肥鱼）')
+  })
+
   it('disables the wake row when no model directory was found', () => {
     const template = contextMenuTemplate({
       catalog: { groups: [] },
@@ -211,6 +240,7 @@ describe('ball menu', () => {
       millifractionEnabled: false,
       wakeEnabled: false,
       wakeAvailable: false,
+      wakeWord: 'Hey Jarvis',
       openMain: false,
     }, true, {
       openMain() {},

@@ -231,4 +231,55 @@ describe('wake preferences', () => {
     const written = JSON.parse(readFileSync(join(path, 'orb-wake.json'), 'utf8')) as { dictation?: unknown }
     assert.deepEqual(written.dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true })
   })
+
+  it('re-reads the file before flipping the switch, so an outside edit is not undone', () => {
+    // The regression in one assertion. `orb-wake.json` is read once into memory at construction,
+    // and `setWakeEnabled` used to write that whole snapshot back — so a field edited on disk
+    // while the host was running (by hand, or by a settings page that has its own copy of the
+    // state) was silently reverted by the next unrelated toggle. What made it bite in practice is
+    // that the helper is launched once per host start and reads `enabled` out of its environment,
+    // so a toggle written *after* launch has no effect until the next restart, while the file on
+    // disk now claims the opposite. Re-reading narrows the window to the fields this call owns.
+    const path = dir('wake-reread')
+    const file = join(path, 'orb-wake.json')
+    writeFileSync(file, JSON.stringify({
+      enabled: true, keyword: 'hey_jarvis', threshold: 0.5, autoExpandOnWake: true,
+    }))
+    const store = new ProfileStore(path)
+
+    // Somebody edits the file underneath the running host: a new keyword, and the switch on.
+    writeFileSync(file, JSON.stringify({
+      enabled: true, keyword: 'dafeiyu', threshold: 0.95, autoExpandOnWake: false,
+      assetDirectory: 'C:/models/dafeiyu/assets',
+    }))
+
+    store.setWakeEnabled(false)
+
+    const written = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+    assert.equal(written.enabled, false, 'the switch this call owns was not written')
+    // Everything else belongs to whoever wrote the file last, not to this process's snapshot.
+    assert.equal(written.keyword, 'dafeiyu', 'the keyword was reverted to the value read at startup')
+    assert.equal(written.threshold, 0.95, 'the threshold was reverted to the value read at startup')
+    assert.equal(written.autoExpandOnWake, false, 'autoExpandOnWake was reverted')
+    assert.equal(written.assetDirectory, 'C:/models/dafeiyu/assets', 'the asset directory was reverted')
+  })
+
+  it('still clamps an outside edit rather than trusting it', () => {
+    // Re-reading is only safe because the same validation runs on the way in. Without it, a
+    // hand-edited threshold of 5 or a negative silence would reach the engine as written, and the
+    // engine would then never detect anything with no way for the user to tell why.
+    const path = dir('wake-reread-clamp')
+    const file = join(path, 'orb-wake.json')
+    writeFileSync(file, JSON.stringify({ enabled: true, keyword: 'hey_jarvis' }))
+    const store = new ProfileStore(path)
+    writeFileSync(file, JSON.stringify({
+      enabled: true, keyword: 'dafeiyu', threshold: 5, autoExpandOnWake: true,
+      dictation: { enabled: true, silenceMs: -1, maxSeconds: 9999, autoSend: false },
+    }))
+    store.setWakeEnabled(false)
+    const reread = new ProfileStore(path).wake()
+    // 5 is above the 0.99 ceiling, so it clamps down to it rather than being taken literally.
+    assert.equal(reread.threshold, 0.99, 'an out-of-range threshold survived the round trip')
+    assert.deepEqual(reread.dictation, { enabled: true, silenceMs: 300, maxSeconds: 120, autoSend: false })
+  })
 })

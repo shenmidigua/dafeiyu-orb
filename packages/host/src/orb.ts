@@ -11,6 +11,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type { Appearance, ThemePreference } from './appearance.ts'
 import { avatarPresetSrc } from './avatar-presets.ts'
+import { accountClientMetadata, readBalance, type AccountService, type BalanceReport } from './balance.ts'
 import { normalizeCatalog } from './catalog.ts'
 import { resolveElectronBinary } from './electron-runtime.ts'
 import { helperMain } from './helper-path.ts'
@@ -34,9 +35,20 @@ import {
 } from './selection.ts'
 import { pinSessionId } from './services.ts'
 import { selectModelKeepDefault } from './select-model.ts'
-import { discoverWakeAssets } from './wake-assets.ts'
+import { resolveWakeAssets } from './wake-assets.ts'
 import { createTranscriber } from './transcribe.ts'
 import { createForegroundMemory } from './windows-foreground.ts'
+
+/**
+ * How often the account balance is re-read.
+ *
+ * Once an hour, and read once when the ball starts besides. The cadence is a trade rather than a
+ * measurement: the number only decides which resting face the ball wears, so its lag is cosmetic,
+ * while every read is a request to somebody else's account API. An hour means a top-up can leave the
+ * poor face up for most of an hour — the read at ball start is what keeps a fresh launch honest, and
+ * a session long enough to cross the line mid-way is the case that waits.
+ */
+const BALANCE_POLL_MS = 60 * 60_000
 
 /** Host services the plugin injects. Shapes match the official 0.1.7-rc.2 controllers. */
 export interface OrbContext {
@@ -239,6 +251,13 @@ export class OrbRuntime {
   private responseKeys: string[] = []
   private helperPid: number | undefined
   private appearance: Appearance = {}
+  /**
+   * The last balance the account reported, in CNY, or `undefined` before the first read. `cny: null`
+   * inside a report means "not known", which is a state the ball acts on: it keeps its ordinary
+   * resting loop rather than wearing the poor one.
+   */
+  private balance: BalanceReport | undefined
+  private balanceTimer: ReturnType<typeof setInterval> | undefined
   private readonly overlayWaiters = new Map<string, () => void>()
   /** Chrome window ids each helper reported, keyed by its socket. */
   private readonly chromeWindows = new Map<Socket, readonly number[]>()
@@ -405,6 +424,9 @@ export class OrbRuntime {
     if (this.halted || generation !== this.generation) return
     this.userData = helperDataDirectory(this.store.dir)
     await mkdir(this.userData, { recursive: true })
+    // Started with the ball rather than with the plugin: the reading only exists to be worn, and a
+    // disabled ball should not be polling somebody else's account API.
+    this.startBalanceWatch()
     this.launch()
   }
 
@@ -425,6 +447,7 @@ export class OrbRuntime {
     if (this.retry) clearTimeout(this.retry)
     this.retry = undefined
     this.stopWatch()
+    this.stopBalanceWatch()
     this.clearDirty()
     this.handQuestionBack()
     this.server?.close()
@@ -551,6 +574,10 @@ export class OrbRuntime {
     }
     this.send(socket, { type: 'turn', running: this.turnRunning })
     if (Object.keys(this.appearance).length > 0) this.send(socket, { type: 'appearance', ...this.appearance })
+    // A ball that has just connected missed every balance the poll pushed, so the reading in hand
+    // travels with the rest of the state. `undefined` means none has been taken yet, and the ball
+    // then keeps its ordinary loop until one arrives.
+    if (this.balance !== undefined) this.send(socket, { type: 'balance', ...this.balance })
     if (this.pending) this.send(socket, this.questionPayload(this.pending.id))
     void this.publishChrome()
     this.selection.sync()
@@ -1158,29 +1185,35 @@ export class OrbRuntime {
    *
    * The models stay where they are on disk: only their absolute paths travel, and
    * `DSH_ORB_WAKE` carries the tuning the ball reads before it starts its engine.
-   * @returns the extra environment variables, or an empty object when unusable.
+   *
+   * The tuning is sent either way, so the helper can tell "off" from "wanted but broken" — the
+   * ball needs the first to stay quiet and the second to say why. Only the assets are withheld
+   * when nothing usable is on disk, because there is nothing to point at.
+   * @returns the extra environment variables, empty only when no models are usable at all.
    */
   private wakeEnvironment(): NodeJS.ProcessEnv {
     const settings = this.store.wake()
-    const assets = settings.assetDirectory !== ''
-      ? resolve(settings.assetDirectory)
-      : discoverWakeAssets(settings.keyword)
+    const tuning = JSON.stringify({
+      enabled: settings.enabled,
+      keyword: settings.keyword,
+      threshold: settings.threshold,
+      autoExpandOnWake: settings.autoExpandOnWake,
+      dictation: settings.dictation,
+    })
+    const assets = resolveWakeAssets(settings)
     if (assets === undefined) {
       if (settings.enabled) {
-        console.error('dsh-orb: wake word is on but no dsh-voice-dialog assets were found')
+        const configured = settings.assetDirectory === ''
+          ? 'none is configured'
+          : `${settings.assetDirectory} does not hold the models for "${settings.keyword}"`
+        console.error(
+          `dsh-orb: wake word is on but no dsh-voice-dialog assets were found: ${configured}. `
+          + 'The ball will report the wake word as unavailable.',
+        )
       }
-      return {}
+      return { DSH_ORB_WAKE: tuning }
     }
-    return {
-      DSH_ORB_WAKE_ASSETS: assets,
-      DSH_ORB_WAKE: JSON.stringify({
-        enabled: settings.enabled,
-        keyword: settings.keyword,
-        threshold: settings.threshold,
-        autoExpandOnWake: settings.autoExpandOnWake,
-        dictation: settings.dictation,
-      }),
-    }
+    return { DSH_ORB_WAKE_ASSETS: assets, DSH_ORB_WAKE: tuning }
   }
 
   private launch(): void {
@@ -1299,6 +1332,36 @@ export class OrbRuntime {
     }
     this.appearance = next
     if (Object.keys(next).length > 0) this.broadcast({ type: 'appearance', ...next })
+  }
+
+  /**
+   * Read the account balance and tell every connected ball about it.
+   *
+   * Cosmetic, so it fails quietly and on purpose: an unreachable Platform, a signed-out account or a
+   * build with no client version all arrive here as "not known", which the ball wears as its ordinary
+   * resting loop. Only a real reading is ever a number — see `readBalance`.
+   */
+  private async refreshBalance(): Promise<void> {
+    const account = this.ctx.get('deepseekAccount') as AccountService | undefined
+    const cny = await readBalance(account, accountClientMetadata(this.appearance.locale))
+    const next: BalanceReport = { cny, at: Date.now() }
+    // Only a *change* is pushed: the poll is the same number almost every time, and the ball has no
+    // use for being told the balance it is already showing.
+    const changed = this.balance === undefined || this.balance.cny !== next.cny
+    this.balance = next
+    if (changed && this.sockets.size > 0) this.broadcast({ type: 'balance', ...next })
+  }
+
+  /** Arm the balance read: once now, then on the slow cadence while the ball is up. */
+  private startBalanceWatch(): void {
+    if (this.balanceTimer !== undefined) return
+    void this.refreshBalance()
+    this.balanceTimer = setInterval(() => { void this.refreshBalance() }, BALANCE_POLL_MS)
+  }
+
+  private stopBalanceWatch(): void {
+    if (this.balanceTimer !== undefined) clearInterval(this.balanceTimer)
+    this.balanceTimer = undefined
   }
 
   async setOverlayModel(selection: AgentModelSelection): Promise<void> {

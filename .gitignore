@@ -83,6 +83,25 @@ dsh_orb/rateprobe/
 dsh_orb/whichword/
 _probe*.mjs
 
+# Audio captured by the wake-word probes, and the traces the ball emits while one runs. Both are
+# run output, not inputs: they are re-recorded on demand and are meaningless on another machine.
+dsh_orb/*.wav
+dsh_orb/trace-*.json
+dsh_orb/trace-*.txt
+dsh_orb/meter-*.txt
+dsh_orb/meter-*.png
+dsh_orb/proc-start.txt
+dsh_orb/wake-meter-*.png
+dsh_orb/wake-mic-*.wav
+dsh_orb/.synth-mark.json
+
+# Per-file backups taken before a loop extension was stripped (dsh_orb/make_oneshot.py).
+# The originals are in the same pack directory, so these only add weight.
+大肥鱼表情包整合/**/*.bak-loop-*
+
+# Superseded wake-word checkpoints, kept locally while a retrain is in flight.
+dsh-voice-dialog/assets/*.onnx.*.bak
+
 # onnxruntime-web runtime (MIT, fetched from CDN — not source)
 dsh-voice-dialog/assets/ort/
 dsh-voice-dialog/logs/

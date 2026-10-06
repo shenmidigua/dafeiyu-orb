@@ -88,9 +88,10 @@ interface GifInputs {
 function modeFor(inputs: GifInputs): string {
   const gif = { dataset: {} as { mode?: string; src?: string } }
   const factory = new Function('deps', `
-    const { document, pageClosed, syncSleep, dragging, clickShown, wakeShown, doneShown,
+    const { document, pageClosed, syncSleep, dragging, clickShown, arriveShown, wakeShown, doneShown,
             typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive, voiceSrc,
-            dictationPhase, dropShown, dropStep } = deps
+            dictationPhase, dropShown, dropStep, webfetchSrc, agentState, agentTool,
+            WEB_FETCH_TOOL, brokeNow } = deps
     ${pageFunction(shell, 'syncGif')}
     return syncGif
   `)
@@ -98,8 +99,15 @@ function modeFor(inputs: GifInputs): string {
     document: { querySelector: () => gif },
     pageClosed: () => false,
     syncSleep: () => {},
+    // The poor face is off: this file is about the ball talking, and the account's balance has
+    // nothing to do with that. `dsh_orb/walk_poor_sequence.mjs` walks the real predicate.
+    brokeNow: () => false,
     dragging: false,
     clickShown: undefined,
+    // The arrival is disarmed the same way and for the same reason: this page has been open for
+    // longer than its greeting lasts, and leaving it undefined is what shows the speaking frame
+    // does not have to wait for a greeting to finish.
+    arriveShown: undefined,
     wakeShown: undefined,
     doneShown: undefined,
     typingSrc: undefined,
@@ -112,9 +120,15 @@ function modeFor(inputs: GifInputs): string {
     dictationPhase: inputs.dictationPhase ?? 'idle',
     // A new branch above this one has to be named here, or the harness dies with
     // "dropShown is not defined" instead of reporting which mode won. It stays undefined because
-    // no release is in progress while the speaker is talking.
+    // no release is in progress while the speaker is talking. The fetch face is disarmed the same
+    // way: nothing is being fetched in these cases, and leaving it undefined is what proves this
+    // slot does not reach up past the speaking frame.
     dropShown: undefined,
     dropStep: 0,
+    webfetchSrc: undefined,
+    agentState: '',
+    agentTool: '',
+    WEB_FETCH_TOOL: 'web_fetch',
   }) as () => void
   syncGif()
   assert.notEqual(gif.dataset.mode, undefined, 'syncGif fell through every branch without painting')

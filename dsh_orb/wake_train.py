@@ -5,7 +5,7 @@ The architecture is copied from openWakeWord's `train.py` — `Flatten -> Linear
 `openwakeword.train` drags in `openwakeword.data`, which wants pronouncing, speechbrain,
 audiomentations and a tflite runtime. None of that is needed to fit a few thousand weights, and all of
 it is a chance for the environment to differ from the one the model ships into. What matters is that
-the shipped classifier's *interface* is reproduced exactly: `[1,16,96] -> [1,1]`, which is what
+the engine's *interface* is reproduced exactly: `[1,WINDOW_FRAMES,96] -> [1,1]`, which is what
 `hey_jarvis_v0.1.onnx` declares and what `assets/wake.js` feeds.
 
 Two decisions that carry the result:
@@ -41,6 +41,8 @@ from torch import nn, optim
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
+import wake_features  # noqa: E402  (the ring size the trained model must match)
+
 DATA = pathlib.Path(r"C:\Users\digua\wakeword\data")
 FEATURE_DIR = DATA / "features"
 
@@ -48,7 +50,7 @@ FEATURE_DIR = DATA / "features"
 # keyword as `<keyword>.onnx`, so pointing orb-wake.json at `dafeiyu` finds exactly this name.
 OUTPUT = FEATURE_DIR / "dafeiyu.onnx"
 
-INPUT_SHAPE = (16, 96)
+INPUT_SHAPE = (wake_features.WINDOW_FRAMES, wake_features.EMBEDDING_DIM)
 LAYER_DIM = 128
 N_BLOCKS = 1
 OPSET = 13                     # what openWakeWord itself exports with; onnxruntime-web here is 1.30
@@ -56,9 +58,14 @@ OPSET = 13                     # what openWakeWord itself exports with; onnxrunt
 BATCH = 256
 LR = 1e-4
 
-# A near-miss is worth this many ordinary sentences. Not tuned in the abstract: the adversarial set is
-# 15 phrases x 2 rates x 14 voices = 420 clips against 3150 filler, so without a weight the loss is
-# dominated by "do not fire on arbitrary Mandarin", which is the easy half of the problem.
+# A near-miss is worth this many ordinary sentences. Not tuned in the abstract: the filler is ordinary
+# Mandarin and the adversarial clips are speech too, so without a weight the loss is dominated by "do
+# not fire on arbitrary Mandarin", which is the easy half of the problem.
+#
+# The counts are deliberately not written down here. They were, and the number went stale: this comment
+# said "15 phrases x 2 rates x 14 voices = 420 clips" long after the negatives had been widened to
+# seven rates, so it described a balance that had not existed for two runs. `wake_dataset.py stats`
+# reads the disk instead.
 HARD_NEGATIVE_WEIGHT = 3.0
 
 # openWakeWord's own hard-example filter. Negatives already scoring near zero are suppressed and cost
@@ -111,7 +118,7 @@ class Split:
     that they agree.
     """
 
-    def __init__(self, side: str) -> None:
+    def __init__(self, side: str, hard: bool | None = None) -> None:
         self.side = side
         self.x = np.load(FEATURE_DIR / f"{side}.npy").astype(np.float32)
         self.clip_ids = np.load(FEATURE_DIR / f"{side}-clips.npy").astype(np.int64)
@@ -126,7 +133,16 @@ class Split:
         self.label = 1.0 if side == "positive" else 0.0
         # Adversarial clips are recognised by the filename wake_dataset.py gave them. This is the only
         # place the two kinds of negative are told apart again, and it decides their training weight.
-        self.hard_clip = np.array([name.startswith("adversarial-") for name in self.names], dtype=bool)
+        #
+        # `prefix` is the exception, and it is passed in explicitly rather than sniffed: those clips
+        # carry the *positive* filenames, because they are cut from the positive clips. They are hard by
+        # construction — the only difference from a positive is that the phrase has not finished — and a
+        # weight of 1.0 would let the easy filler sentences outvote the window that decides the edge.
+        if hard is not None:
+            self.hard_clip = np.full(len(self.names), hard, dtype=bool)
+        else:
+            self.hard_clip = np.array([name.startswith("adversarial-") for name in self.names],
+                                      dtype=bool)
         self.hard_window = self.hard_clip[self.clip_ids]
         assert self.hard_window.shape == self.clip_ids.shape
         self.folds: np.ndarray | None = None
@@ -154,8 +170,10 @@ class Split:
 def clip_scores(scores: np.ndarray, clips: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Collapse windows to one score per clip, by the maximum.
 
-    The engine fires on a single window above threshold, so the maximum is the honest summary: a clip
-    whose best window is 0.9 wakes the orb even when its other windows sit near zero.
+    The engine fires on a run of windows above the threshold, so the maximum is not the shipped
+    decision any more - it is an upper bound on it, and deliberately the conservative one for training:
+    a clip whose best window sits at 0.9 is flagged from the check that exists to catch hard negatives,
+    even when the shipped three-window rule would ignore it. `wake_rule_probe.py` scores the rule.
 
     Returns `(values, order, labels_are_irrelevant_here)` — the caller owns labels, because a clip's
     label is only known by looking it up, and doing it here would hide a mismatch.
@@ -251,20 +269,37 @@ def main() -> int:
     random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
-    if not (FEATURE_DIR / "positive.npy").exists() or not (FEATURE_DIR / "negative.npy").exists():
-        raise SystemExit(f"no features under {FEATURE_DIR}; run `wake_dataset.py features` first")
+    for required in ("positive", "negative", "prefix"):
+        if not (FEATURE_DIR / f"{required}.npy").exists():
+            raise SystemExit(f"no {required}.npy under {FEATURE_DIR}; run "
+                             f"`wake_dataset.py features` first")
 
     positive = Split("positive")
     negative = Split("negative")
+    # The positive clips' own prefix windows, labelled negative. See PREFIX_SLOTS in wake_dataset.py
+    # for the measurement this exists to fix; here it is one more block of negatives to train on.
+    prefix = Split("prefix", hard=True)
+    if prefix.n_clips != positive.n_clips:
+        raise SystemExit(f"prefix: {prefix.n_clips} clips against {positive.n_clips} positives. The "
+                         f"two must be in step or their folds cannot be copied across, and a prefix "
+                         f"window in training with its own phrase held out is a memorised score "
+                         f"reported as a generalisation score.")
     print(f"  positives: {positive.x.shape[0]} windows / {positive.n_clips} clips")
     print(f"  negatives: {negative.x.shape[0]} windows / {negative.n_clips} clips "
           f"({int(negative.hard_clip.sum())} adversarial)")
+    print(f"  prefix negatives: {prefix.x.shape[0]} windows, hard by construction")
 
     # One fold is held out for the whole run. Cross-validating all five would give a tighter estimate
     # and cost five times as much; the decision this number feeds is "is this shippable", not a
     # publishable error bar.
     fold = args.folds - 1
     positive.assign_folds(args.folds, rng)
+    # Same clips, same fence. The prefix windows are cut from the positive clips, so dealing them with
+    # the negative split's own RNG would put a clip's prefix in training and its phrase in the held-out
+    # fold — the held-out score would then be measured against audio the model had already been told to
+    # reject. Copying the table draws no random numbers, which also leaves the negative split's folds
+    # identical to every run made before this one.
+    prefix.folds = positive.folds
     negative.assign_folds(args.folds, rng)
     # Written out because the split is the one thing a later evaluation cannot reconstruct safely:
     # re-deriving it means re-running this RNG in this exact order, and any change to the number of
@@ -272,14 +307,18 @@ def main() -> int:
     # held-out score into a memorisation score with nothing to show for it.
     np.save(FEATURE_DIR / "folds-positive.npy", positive.folds)
     np.save(FEATURE_DIR / "folds-negative.npy", negative.folds)
+    np.save(FEATURE_DIR / "folds-prefix.npy", prefix.folds)
 
     train_positive = positive.windows(fold, held_out=False)
     train_negative = negative.windows(fold, held_out=False)
-    x = np.vstack([positive.x[train_positive], negative.x[train_negative]])
+    train_prefix = prefix.windows(fold, held_out=False)
+    x = np.vstack([positive.x[train_positive], negative.x[train_negative], prefix.x[train_prefix]])
     y = np.concatenate([np.full(int(train_positive.sum()), 1.0, dtype=np.float32),
-                        np.zeros(int(train_negative.sum()), dtype=np.float32)])
+                        np.zeros(int(train_negative.sum()), dtype=np.float32),
+                        np.zeros(int(train_prefix.sum()), dtype=np.float32)])
     weight = np.concatenate([np.ones(int(train_positive.sum()), dtype=np.float32),
-                             negative.hard_weight()[train_negative]])
+                             negative.hard_weight()[train_negative],
+                             prefix.hard_weight()[train_prefix]])
     print(f"  training on {x.shape[0]} windows, holding out fold {fold}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -293,7 +332,7 @@ def main() -> int:
         print(f"  loaded {args.load}; skipping training")
         info = export(model, args.out)
         print(json.dumps(info, indent=2))
-        return 0 if info["input_shape"] == [1, 16, 96] else 1
+        return 0 if info["input_shape"] == [1, *INPUT_SHAPE] else 1
 
     print(f"  device: {device}")
 
@@ -366,6 +405,18 @@ def main() -> int:
         print(f"  {row['threshold']:10.2f} {row['recall']:8.1%} {row['hard_fp']:13.1%} "
               f"{row['filler_fp']:10.1%}")
 
+    # The boundary fix, measured where it is supposed to show. These are held-out clips' *own* prefix
+    # windows — the phrase with its last syllable not yet said — and the number that is meant to move
+    # when they are labelled negative. Before this they scored where the phrase scores, which is why a
+    # truncated reading woke the orb; see PREFIX_SLOTS in wake_dataset.py. Reported on the held-out
+    # fold only, because on the training folds the model has been explicitly taught these.
+    held_out_prefix = prefix.x[prefix.windows(fold, held_out=True)]
+    if held_out_prefix.shape[0]:
+        prefix_values = predict(model, held_out_prefix)
+        print(f"  held-out prefix windows: mean {prefix_values.mean():.4f}  "
+              f"max {prefix_values.max():.4f}  "
+              f"{float((prefix_values >= 0.95).mean()):.1%} at or above 0.95")
+
     info = export(model, args.out)
     print()
     print(f"  exported {info['path']}")
@@ -373,8 +424,9 @@ def main() -> int:
     print(f"    output {info['output_name']} {info['output_shape']}")
     print(f"    size   {info['size_bytes']/1024:.0f} KiB")
     print(f"    PyTorch vs onnxruntime max difference: {info['max_abs_diff']:.2e}")
-    if info["input_shape"] != [1, 16, 96] or info["output_shape"] != [1, 1]:
-        print("    SHAPE MISMATCH — wake.js builds exactly [1,16,96] and reads data[0].")
+    if info["input_shape"] != [1, *INPUT_SHAPE] or info["output_shape"] != [1, 1]:
+        print(f"    SHAPE MISMATCH — wake.js builds [1,{wake_features.WINDOW_FRAMES},96] "
+              "from its ring and reads data[0].")
         return 1
     if info["max_abs_diff"] > 1e-4:
         print("    EXPORT MISMATCH — the graph does not reproduce the trained model.")

@@ -10,7 +10,7 @@
  * The transforms are the same load-bearing ones the `dsh-voice-dialog` voice plugin
  * uses and the ones its `assets/selftest.html` exercises: mel output rescaled with
  * `x / 10 + 2`, five 32-bin frames per audio frame, a 76-frame sliding window into the
- * embedding model, and a 16 x 96 embedding ring into the classifier. Changing any of
+ * embedding model, and a 16-or-28 x 96 embedding ring into the classifier. Changing any of
  * them degrades the score silently instead of failing loudly.
  *
  * Assets are fetched from the private `dsh-wake://assets/` scheme the helper serves,
@@ -25,8 +25,45 @@ const FRAME_SIZE = 1280
 const SAMPLE_RATE = 16000
 /** Mel frames one embedding inference consumes. */
 const MEL_WINDOW_FRAMES = 76
+/**
+ * Amplitude of the noise that stands in for a quiet room.
+ *
+ * Not digital zero. A real quiet room still has a floor, and the melspectrogram model takes a
+ * logarithm, so zeros are a different regime rather than a quieter version of the same one. Mirrors
+ * `SILENCE_LEVEL` in `dsh_orb/wake_features.py`, which the training warm-ups are built from.
+ */
+const SILENCE_LEVEL = 0.003
+/**
+ * Ring slots the classifier reads, per keyword.
+ *
+ * A slot is **128 ms of audio, not the 80 ms of one worklet frame**: five 32-bin mel frames come out
+ * of each 1280-sample frame at 16 ms each, and one embedding consumes eight of them. The count is
+ * fixed by the trained model — it is the leading dimension of the `[1, slots, 96]` tensor that gets
+ * fed — so a mismatch is not a tuning knob, it is a broken model.
+ *
+ * openWakeWord's own shipped classifiers read 16. The custom 大肥鱼 model needs 28, because its wake
+ * word is the phrase said **twice**: the ring has to hold the whole of it for the model to be able to
+ * tell "twice" from "once", and the doubled phrase measures up to 19.4 slots on the voices it was
+ * trained on (`dsh_orb/wake_span_probe.py` measures this). See `wake_features.WINDOW_FRAMES`, where
+ * the same number is derived for training; the two have to agree or the model will be fed the wrong
+ * shape and throw at load.
+ */
+const RING_SLOTS = Object.freeze({ hey_jarvis: 16 })
+const DEFAULT_RING_SLOTS = 28
 /** Suppression window after a detection, matching the voice plugin. */
 const COOLDOWN_MS = 2500
+/**
+ * Windows in a row above the threshold before the ball wakes.
+ *
+ * One was the original rule and it fires on any isolated spike; three leaves the held-out false-alarm
+ * rate at zero without costing a single held-out positive. See `runModels` for the measurement and
+ * `dsh_orb/wake_rule_probe.py` for how the two rules compare.
+ *
+ * Exported because the meter under the ball draws one dot per window this rule needs, and that count
+ * has to come from here: a meter with its own copy of the number would eventually be explaining a
+ * rule the engine no longer runs.
+ */
+export const CONSECUTIVE_WINDOWS = 3
 /** How long the ball shows "detected" before it returns to plain listening. */
 const DETECTED_HOLD_MS = 4000
 /** One utterance that never starts speaking is abandoned after this long. */
@@ -141,11 +178,15 @@ export class WakeEngine {
   /**
    * @param api - the preload bridge: `wakeConfig()`, `wakeReport(status)`.
    * @param options - `onStatus(status)` is called on every state change, for the page's
-   *   own rendering; the same snapshot is also handed to the helper.
+   *   own rendering; the same snapshot is also handed to the helper. `onScore(update)` is
+   *   called for every scored window, for the page's own live meter, and is deliberately
+   *   **not** part of the status: it arrives about eight times a second and must never
+   *   reach the helper over IPC.
    */
   constructor(api, options = {}) {
     this.api = api
     this.onStatus = typeof options.onStatus === 'function' ? options.onStatus : () => {}
+    this.onScore = typeof options.onScore === 'function' ? options.onScore : () => {}
     this.config = {
       keyword: 'hey_jarvis',
       threshold: 0.5,
@@ -162,11 +203,18 @@ export class WakeEngine {
     this.source = undefined
     this.melBuffer = []
     this.embeddingHistory = []
+    // Slots of `embeddingHistory` that hold audio from the current stream. See `runModels` for why
+    // the classifier must not be asked about a ring that is still part zeros.
+    this.ringFill = 0
+    // One embedding of a quiet room, computed once in `load()`. See `silenceEmbedding()`.
+    this.quietEmbedding = undefined
     this.vadState = { h: undefined, c: undefined }
     this.speechActive = false
     this.vadHangover = 0
     this.queue = Promise.resolve()
     this.coolingDown = false
+    // Windows in a row that have crossed the threshold. See `CONSECUTIVE_WINDOWS`.
+    this.hotStreak = 0
     this.cooldownTimer = undefined
     this.detectedTimer = undefined
     this.running = false
@@ -329,7 +377,49 @@ export class WakeEngine {
     const vad = await ort.InferenceSession.create(`${ORIGIN}silero_vad.onnx`, options)
     const kw = await ort.InferenceSession.create(`${ORIGIN}${this.keywordFile()}`, options)
     this.models = { mel, emb, vad, kw }
+    this.quietEmbedding = await this.silenceEmbedding()
     this.reset()
+  }
+
+  /**
+   * One embedding of a quiet room, for `reset()` to fill the ring with.
+   *
+   * The ring used to be filled with zeros, which is not a state any training clip or probe ever
+   * produced — every one of them warms the ring from audio first. The doubled classifier answers the
+   * zeros with 0.86, and with a single real embedding in front of them 0.98, on any audio at all, so
+   * the ball woke about 4.7 s after every start, mute and dictation end having heard nothing. Filling
+   * with a quiet-room embedding instead measures 0.0001, and unlike "do not score until the ring is
+   * full" it costs no deaf window: the ring is valid from the first frame, and a phrase arriving
+   * immediately is seen as phrase-over-quiet, which is exactly the shape the positives were trained
+   * with.
+   *
+   * Noise rather than digital zero, for the reason `SILENCE_LEVEL` gives: the melspectrogram model
+   * takes a logarithm. The generator is a small LCG so every launch warms the ring identically.
+   */
+  async silenceEmbedding() {
+    const frames = Math.ceil(MEL_WINDOW_FRAMES / 5) + 4
+    const mel = []
+    let state = 0x9e3779b9
+    for (let f = 0; f < frames; f += 1) {
+      const frame = new Float32Array(FRAME_SIZE)
+      for (let i = 0; i < FRAME_SIZE; i += 1) {
+        state = (state * 1664525 + 1013904223) >>> 0
+        frame[i] = ((state / 0x100000000) * 2 - 1) * SILENCE_LEVEL
+      }
+      const out = await this.models.mel.run({
+        [this.models.mel.inputNames[0]]: new this.ort.Tensor('float32', frame, [1, FRAME_SIZE]),
+      })
+      const raw = new Float32Array(out[this.models.mel.outputNames[0]].data)
+      for (let i = 0; i < raw.length; i += 1) raw[i] = raw[i] / 10 + 2
+      for (let m = 0; m < 5; m += 1) mel.push(raw.subarray(m * 32, (m + 1) * 32).slice())
+    }
+    const flat = new Float32Array(MEL_WINDOW_FRAMES * 32)
+    for (let m = 0; m < MEL_WINDOW_FRAMES; m += 1) flat.set(mel[m], m * 32)
+    const out = await this.models.emb.run({
+      [this.models.emb.inputNames[0]]:
+        new this.ort.Tensor('float32', flat, [1, MEL_WINDOW_FRAMES, 32, 1]),
+    })
+    return new Float32Array(out[this.models.emb.outputNames[0]].data)
   }
 
   /** Model file for the configured keyword; only `hey_jarvis` ships today. */
@@ -337,11 +427,24 @@ export class WakeEngine {
     return this.config.keyword === 'hey_jarvis' ? 'hey_jarvis_v0.1.onnx' : `${this.config.keyword}.onnx`
   }
 
+  /** Ring slots this keyword's classifier reads. See `RING_SLOTS` for why it is not one number. */
+  ringSlots() {
+    return RING_SLOTS[this.config.keyword] ?? DEFAULT_RING_SLOTS
+  }
+
   /** Clear every per-stream buffer, including the VAD recurrent state. */
   reset() {
     this.melBuffer = []
     this.embeddingHistory = []
-    for (let i = 0; i < 16; i += 1) this.embeddingHistory.push(new Float32Array(96).fill(0))
+    const slots = this.ringSlots()
+    // A quiet room, not zeros: see `silenceEmbedding()`. Until the models are loaded there is
+    // nothing to compute it from, and then zeros are the only option - which is why `ringFill` also
+    // gates scoring rather than this being the whole answer.
+    const quiet = this.quietEmbedding
+    for (let i = 0; i < slots; i += 1) {
+      this.embeddingHistory.push(quiet === undefined ? new Float32Array(96).fill(0) : quiet.slice())
+    }
+    this.ringFill = quiet === undefined ? 0 : slots
     const shape = [2, 1, 64]
     if (this.vadState.h === undefined) {
       this.vadState.h = new this.ort.Tensor('float32', new Float32Array(128).fill(0), shape)
@@ -352,8 +455,15 @@ export class WakeEngine {
     }
     this.speechActive = false
     this.vadHangover = 0
+    // A new stream has no history to be part-way through: two hot windows from before a mute must not
+    // count towards three after it.
+    this.hotStreak = 0
     this.frames = 0
     this.peak = 0
+    // The meter has nothing left to show: the ring it would have been scoring is gone. Without this
+    // the bar keeps the last reading of the stream that just ended, which reads as a live score for
+    // audio nobody is speaking.
+    this.emitScore(0, false, 0)
   }
 
   /**
@@ -382,7 +492,7 @@ export class WakeEngine {
     } catch {
       // The device refused 16 kHz; take its own rate and resample per frame below.
       audioContext = new AudioContext()
-      rateNote = `${audioContext.sampleRate} Hz`
+      rateNote = `采样率 ${audioContext.sampleRate} Hz`
     }
     // A context created without a preceding gesture stays suspended and produces no
     // audio callbacks at all: the feature would look healthy and never detect. Opening
@@ -428,7 +538,7 @@ export class WakeEngine {
     this.node = node
     // Both parts are notes for the status line, neither is a failure: a refused sample rate is
     // resampled per frame and a device without echo cancellation is covered by `mute()`.
-    return detail === '' ? '' : `${detail}${ecNote} 采样率 ${rateNote}`.trim()
+    return ecNote === '' && rateNote === '' ? '' : `${ecNote}${rateNote}`.trim()
   }
 
   /** Release the microphone and every audio object. */
@@ -536,7 +646,7 @@ export class WakeEngine {
    *
    * The buffers are dropped on the way in, for the same reason `finishDictation()` drops them
    * on its way out: the ring buffer would otherwise still hold the last frames of audio from
-   * before the mute, and the classifier scores a 16-frame window, so the wake word could fire
+   * before the mute, and the classifier scores the whole ring, so the wake word could fire
    * once more on audio recorded before anyone said anything.
    *
    * Counting rather than a flag, because the mute is edge-triggered from a cosmetic callback
@@ -671,6 +781,20 @@ export class WakeEngine {
       const embedding = new Float32Array(embOut[this.models.emb.outputNames[0]].data)
       this.embeddingHistory.shift()
       this.embeddingHistory.push(embedding)
+      // Never score a ring that does not exist yet. `reset()` normally fills it with a quiet-room
+      // embedding, so this is the pre-`load()` case - but the class of input it is guarding against
+      // is worth stating, because it silently woke the ball before: training and every probe warm
+      // the ring from audio before emitting a single window, so a partly-zero ring is outside
+      // everything the classifier was fitted to, and the doubled model answers the zeros-and-one
+      // variant with 0.98 on *any* audio at all. The shipped 16-slot model happened to answer 0.0001
+      // there, which is the only reason the hole stayed invisible until the ring was widened.
+      //
+      // Filling still happens every embedding: only the question is delayed, not the ring.
+      this.ringFill += 1
+      if (this.ringFill < this.embeddingHistory.length) {
+        this.melBuffer.splice(0, 8)
+        continue
+      }
       const flatEmb = new Float32Array(this.embeddingHistory.length * 96)
       for (let i = 0; i < this.embeddingHistory.length; i += 1) flatEmb.set(this.embeddingHistory[i], i * 96)
       const kwTensor = new ort.Tensor('float32', flatEmb, [1, this.embeddingHistory.length, 96])
@@ -678,7 +802,34 @@ export class WakeEngine {
       const score = kwOut[this.models.kw.outputNames[0]].data[0]
       if (score > this.peak) this.peak = score
 
-      if (score > this.config.threshold && speechActive && !this.coolingDown && this.running) {
+      // The score has to stay up for a few windows in a row, not just cross the line once.
+      //
+      // A window lands every 128 ms of speech, so an hour of talking is ~28k independent chances to
+      // cross the threshold, and one crossing was enough to fire. Held-out filler and near-miss clips
+      // measured 5.9 wake-ups per hour of speech that way, and the whole band between 0.95 and the
+      // 0.99 ceiling the helper clamps to moved that number by nothing at all - no negative clip ever
+      // scored in it. What does separate them is duration: the phrase holds the score up across a
+      // dozen overlapping windows, an isolated spike does not survive three in a row.
+      // `dsh_orb/wake_rule_probe.py` measures both rules on the same held-out clips: 5.9 -> 0 wake-ups
+      // per hour of speech, with recall unchanged at 100% (293/293 held-out positives still fire).
+      // Cost is two windows of latency, ~0.26 s on top of a detection that already takes 3.58 s of
+      // audio to fill the ring.
+      //
+      // `hot` folds in the VAD gate, the cooldown and the running flag, and the streak is rebuilt
+      // from zero on any window that is not hot - so a detection also clears the streak, and the next
+      // wake has to earn its three fresh windows instead of inheriting a run from before the alarm. A
+      // separate "reset after firing" would be a second way to say the same thing, and the two would
+      // eventually disagree.
+      const hot = score > this.config.threshold && speechActive && !this.coolingDown && this.running
+      this.hotStreak = hot ? this.hotStreak + 1 : 0
+      // Every window, not just the ones that fire: the meter's whole job is to show the score that
+      // did *not* wake the ball, which is the reading a user staring at a ball that ignored them is
+      // after. `above` is the bare threshold comparison while `hot` also folds in the VAD gate, the
+      // cooldown and the running flag - a bar that is above the line while the streak stays at zero
+      // is the difference, and it is worth being able to see.
+      this.emitScore(score, score > this.config.threshold, this.hotStreak)
+      if (this.hotStreak >= CONSECUTIVE_WINDOWS) {
+        this.hotStreak = 0
         this.coolingDown = true
         this.cooldownTimer = setTimeout(() => {
           this.cooldownTimer = undefined
@@ -757,6 +908,31 @@ export class WakeEngine {
       setTimeout(() => { void ctx.close().catch(() => {}) }, (total + 0.5) * 1000)
     } catch {
       /* a missing tone must never break the wake path */
+    }
+  }
+
+  /**
+   * Report one scored window to the page, for the live meter under the ball.
+   *
+   * Deliberately separate from `publish()`: that one crosses IPC to the helper, and this fires on
+   * every window - roughly eight times a second while the microphone is open, whether or not
+   * anything is happening. A status report per window would put the helper's menu on the hot path
+   * of the wake feature for the sake of a progress bar.
+   *
+   * `above` is the raw `score > threshold`; `streak` is how many windows in a row have counted
+   * towards a wake, which is the number the detection rule actually acts on. They differ whenever
+   * VAD is quiet, the cooldown is running or the engine is stopping, and a meter that showed only
+   * one of them would make "the score is over the line and it still did not wake" look like a bug.
+   *
+   * @param score - the classifier score, 0..1.
+   * @param above - whether that score crossed the configured threshold.
+   * @param streak - consecutive windows counted towards a wake, after this one.
+   */
+  emitScore(score, above, streak) {
+    try {
+      this.onScore({ score, above, streak, threshold: this.config.threshold })
+    } catch {
+      /* the ball's cosmetics must never break the engine */
     }
   }
 

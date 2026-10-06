@@ -7,10 +7,14 @@ against audio.
 
 The numbers are reported two ways, because they answer different questions:
 
-  * **Clip level** — "if the user says 大肥鱼, does the orb wake?" One window above threshold fires, so
-    a clip is scored by its best window.
+  * **Clip level** — "if the user says 大肥鱼, does the orb wake?" A clip is scored by its best window.
+    That is the optimistic reading of the shipped engine, which now wants `CONSECUTIVE_WINDOWS` (three)
+    windows in a row above the threshold, so a clip whose only spike is one window wide does not wake
+    the ball. `wake_rule_probe.py` is the evaluator that models the shipped rule; this file keeps the
+    window view, which is what the two are comparable through.
   * **Window level** — "how often does it fire while nobody is saying it?" A window is emitted roughly
-    every 128 ms of speech, so the filler window rate converts directly into false alarms per hour.
+    every 128 ms of speech, so the filler window rate converts directly into false alarms per hour —
+    an upper bound on the shipped rule's rate, for the same reason.
 
 The split comes from `folds-*.npy`, written by the trainer. Re-deriving it here would mean replaying
 the trainer's RNG in the same order, and getting that subtly wrong would report a training score as a
@@ -42,7 +46,13 @@ WINDOW_MS = 128.0
 
 # What the shipped classifier scores on the same negative material, for context on whether a trained
 # model is actually better than the one it replaces. It has never heard Chinese, so this is a floor.
-THRESHOLDS = (0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
+#
+# The grid used to stop at 0.95, and the selection rule is "highest threshold with recall >= 97%", so
+# the chosen value was simply the top of the grid rather than the model's own operating point. The
+# doubled phrase scores its true positives at 0.999+ (`positive clip scores: p05 0.999`), which means
+# the whole band above 0.95 is usable and was never looked at. The grid now reaches the top of it.
+THRESHOLDS = (0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
+              0.96, 0.97, 0.98, 0.985, 0.99, 0.995, 0.997, 0.999)
 
 
 def score_clips(session, extractor, files: list[pathlib.Path], rng, pool_audio: list[np.ndarray],
@@ -159,7 +169,7 @@ def main() -> int:
         rows.append({"threshold": threshold, "recall": recall, "near_miss_clip_fp": hard_fp,
                      "filler_clip_fp": filler_fp, "filler_window_fp": window_fp,
                      "false_alarms_per_hour_of_speech": per_hour})
-        print(f"  {threshold:10.2f} {recall:8.1%} {hard_fp:18.1%} {filler_fp:15.1%} "
+        print(f"  {threshold:10.3f} {recall:8.1%} {hard_fp:18.1%} {filler_fp:15.1%} "
               f"{window_fp:14.2%} {per_hour:9.1f}")
 
     pooled_positive = np.concatenate([np.ones(positive_best.size), np.zeros(adversarial_best.size),
@@ -194,7 +204,11 @@ def main() -> int:
     chosen = max(viable, key=lambda row: row["threshold"]) if viable else max(
         rows, key=lambda row: row["recall"])
     print()
-    print(f"  chosen threshold: {chosen['threshold']:.2f}  "
+    # Three decimals, trailing zeros trimmed. At two this line read `1.00` for a chosen 0.999, which
+    # is the one number a reader must not get wrong - it is the value that goes into the shipped
+    # config, and `1.00` is a threshold the classifier can never reach.
+    shown = f"{chosen['threshold']:.3f}".rstrip("0").rstrip(".")
+    print(f"  chosen threshold: {shown}  "
           f"(recall {chosen['recall']:.1%}, near-miss clip FP {chosen['near_miss_clip_fp']:.1%}, "
           f"filler clip FP {chosen['filler_clip_fp']:.1%}, "
           f"{chosen['false_alarms_per_hour_of_speech']:.1f} false alarms/hour of speech)")

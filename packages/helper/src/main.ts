@@ -24,6 +24,7 @@ import {
   WAKE_SCHEME,
   type WakeConfig,
 } from './wake.ts'
+import { spokenName } from './wake-names.ts'
 
 const socketAddress = process.env.DSH_ORB_SOCKET ?? ''
 const token = process.env.DSH_ORB_TOKEN ?? ''
@@ -95,6 +96,12 @@ let avatarToken = 0
 // Raw preferences as stored; `theme` resolves through nativeTheme, an absent
 // locale falls back to the system languages.
 let appearance: Appearance = readAppearanceEnv()
+/**
+ * The last balance the host reported, in CNY, or `null` when it could not be read. `undefined` means
+ * the host has said nothing yet — the page treats both as "not known" and keeps its ordinary resting
+ * loop, which is the only safe reading of a number nobody has.
+ */
+let balance: { cny: number | null; at?: number } | undefined
 
 process.title = 'dsh-orb-helper'
 
@@ -162,6 +169,9 @@ void app.whenReady().then(async () => {
     if (win && !win.isVisible()) win.showInactive()
     // The page may have loaded after the last appearance change.
     pushAppearance()
+    // Same for the balance: the host reads it on its own cadence, so the page that has just loaded
+    // can easily be older than the reading.
+    pushBalance()
     // A profile that already had wake on resumes listening as soon as the page is up.
     if (wakeWanted && wakeReady) void enableWake()
   })
@@ -576,6 +586,11 @@ ipcMain.handle('orb:meme-tool', (event) => {
   return picker().tool()
 })
 
+ipcMain.handle('orb:meme-webfetch', (event) => {
+  if (!fromBall(event)) return null
+  return picker().webfetch()
+})
+
 ipcMain.handle('orb:meme-sleep', (event) => {
   if (!fromBall(event)) return null
   return picker().sleep()
@@ -594,6 +609,16 @@ ipcMain.handle('orb:meme-yawn', (event) => {
 ipcMain.handle('orb:meme-click', (event) => {
   if (!fromBall(event)) return null
   return picker().click()
+})
+
+ipcMain.handle('orb:meme-arrive', (event) => {
+  if (!fromBall(event)) return null
+  return picker().arrive()
+})
+
+ipcMain.handle('orb:meme-poor', (event) => {
+  if (!fromBall(event)) return null
+  return picker().poor()
 })
 
 ipcMain.handle('orb:meme-done', (event) => {
@@ -840,6 +865,11 @@ function deliver(message: unknown): void {
   }
   if (record.type === 'avatar') {
     void loadAvatar(readAvatarChoice(record as Record<string, unknown>))
+    return
+  }
+  if (record.type === 'balance') {
+    balance = readBalanceMessage(record)
+    pushBalance()
     return
   }
   if (record.type === 'tcc') {
@@ -1139,6 +1169,25 @@ function pushAppearance(): void {
   overlays?.appearance(payload)
 }
 
+/**
+ * The balance message the host sends: `{ cny, at }`, with `cny: null` for "not known".
+ *
+ * Anything else is "not known" too, and that is the point: this decides which face the ball rests in,
+ * and an unreadable message must not be able to invent a number — least of all a zero, which is the
+ * one value that turns the sad face on.
+ */
+function readBalanceMessage(record: unknown): { cny: number | null; at?: number } {
+  const value = (typeof record === 'object' && record !== null ? record : {}) as { cny?: unknown; at?: unknown }
+  const cny = typeof value.cny === 'number' && Number.isFinite(value.cny) && value.cny >= 0 ? value.cny : null
+  return typeof value.at === 'number' && Number.isFinite(value.at) ? { cny, at: value.at } : { cny }
+}
+
+/** Hand the page the last balance it has not necessarily seen. */
+function pushBalance(): void {
+  if (balance === undefined) return
+  if (win && !win.isDestroyed()) win.webContents.send('orb:balance', balance)
+}
+
 function readChrome(value: unknown): ChromeState {
   const record = value as {
     overlay?: MenuSelection
@@ -1195,6 +1244,7 @@ async function showMenu(window: BrowserWindow): Promise<void> {
     millifractionEnabled: chrome.millifractionEnabled,
     wakeEnabled: wakeWanted && wakeReady,
     wakeAvailable: wakeReady,
+    wakeWord: spokenName(wake.keyword),
     // The recorder runs on the wake engine's microphone, so the row needs a live engine.
     dictationReady: wakeWanted && wakeReady && wake.dictation.enabled,
     openMain: chrome.openMain,

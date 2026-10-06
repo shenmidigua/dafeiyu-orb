@@ -126,14 +126,40 @@ describe('typing frame', () => {
     }
   })
 
-  it('resolves the drag face like the other named states', async () => {
+  it('resolves the carry as a loop plus an optional pickup', async () => {
+    // `drag` answers in the same shape `hover` does: the loop to wear, and the clip to play once
+    // when the ball is first picked up. `intro` is what separates the two, and an unnamed one is
+    // `null` rather than an empty string so the page has one thing to test.
     const root = await pack()
     try {
       const config = join(root, 'memes.json')
       await writeFile(config, JSON.stringify({ dir: root, drag: { file: 'fish.gif' } }))
-      assert.equal(await createMemePicker(config).drag(), 'data:image/gif;base64,R0lG')
+      assert.deepEqual(await createMemePicker(config).drag(), {
+        src: 'data:image/gif;base64,R0lG',
+        intro: null,
+      })
       await writeFile(config, JSON.stringify({ dir: root, drag: { file: 'PNGTuber 闲置.gif' } }))
-      assert.equal(await createMemePicker(config).drag(), 'data:image/gif;base64,R0lGOA==')
+      assert.deepEqual(await createMemePicker(config).drag(), {
+        src: 'data:image/gif;base64,R0lGOA==',
+        intro: null,
+      })
+      // A named pickup is resolved and timed like the loop is, so the page can schedule the
+      // hand-off without a second round trip.
+      await writeFile(config, JSON.stringify({
+        dir: root, drag: { file: 'fish.gif', intro: 'PNGTuber 闲置.gif' },
+      }))
+      const withIntro = await createMemePicker(config).drag()
+      assert.equal(withIntro?.intro?.src, 'data:image/gif;base64,R0lGOA==')
+      assert.equal(typeof withIntro?.intro?.ms, 'number')
+      // A pickup that does not resolve costs only the pickup; the carry still has its loop.
+      await writeFile(config, JSON.stringify({
+        dir: root, drag: { file: 'fish.gif', intro: 'gone.gif' },
+      }))
+      assert.deepEqual(await createMemePicker(config).drag(), {
+        src: 'data:image/gif;base64,R0lG',
+        intro: null,
+      })
+      // Neither file resolving is the only case that answers `null`.
       await writeFile(config, JSON.stringify({ dir: root, drag: { file: 'gone.gif' } }))
       assert.equal(await createMemePicker(config).drag(), null)
     } finally {
@@ -184,6 +210,83 @@ describe('typing frame', () => {
       assert.equal(await createMemePicker(config).click(), null)
       await writeFile(config, JSON.stringify({ dir: root, click: { enabled: false, file: 'in.gif' } }))
       assert.equal(await createMemePicker(config).click(), null)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves the arrival as the clips it plays, in order, one pass each', async () => {
+    // The greeting is one-shots like the click reaction, so each clip comes back carrying the
+    // length of its own animation: the page holds it for one pass, and the step counter is what
+    // restarts the next GIF from its first frame.
+    const root = await pack()
+    try {
+      const config = join(root, 'memes.json')
+      await writeFile(config, JSON.stringify({ dir: root, arrive: { files: ['in.gif', 'fish.gif'] } }))
+      assert.deepEqual(await createMemePicker(config).arrive(), [
+        { src: `data:image/gif;base64,${tinyGif().toString('base64')}`, ms: 500 },
+        { src: 'data:image/gif;base64,R0lG', ms: 1_200 },
+      ])
+      // A bare name is matched anywhere in the pack, the same way every other slot resolves — which
+      // is what lets a file one folder down from the configured `dir` be named at all.
+      await writeFile(config, JSON.stringify({ dir: root, arrive: { files: ['PNGTuber 闲置.gif'] } }))
+      assert.deepEqual(await createMemePicker(config).arrive(), [
+        { src: 'data:image/gif;base64,R0lGOA==', ms: 1_200 },
+      ])
+      // A name that resolves to nothing costs its own clip and no more: losing the wave file must
+      // not cost the arrival in front of it.
+      await writeFile(config, JSON.stringify({ dir: root, arrive: { files: ['in.gif', 'gone.gif'] } }))
+      assert.deepEqual(await createMemePicker(config).arrive(), [
+        { src: `data:image/gif;base64,${tinyGif().toString('base64')}`, ms: 500 },
+      ])
+      // Unnamed means no greeting: a profile written before this slot existed keeps the silent
+      // startup it always had, exactly like the click reaction and the finished-task frame.
+      await writeFile(config, JSON.stringify({ dir: root }))
+      assert.equal(await createMemePicker(config).arrive(), null)
+      await writeFile(config, JSON.stringify({ dir: root, arrive: { enabled: false, files: ['in.gif'] } }))
+      assert.equal(await createMemePicker(config).arrive(), null)
+      await writeFile(config, JSON.stringify({ dir: root, arrive: { files: ['gone.gif'] } }))
+      assert.equal(await createMemePicker(config).arrive(), null)
+      await writeFile(config, JSON.stringify({ dir: root, arrive: { files: [] } }))
+      assert.equal(await createMemePicker(config).arrive(), null)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves the poor face together with the balance line that turns it on', async () => {
+    // The pair travels as one answer: the page cannot decide anything with only half of it, so a slot
+    // that names a file but no usable line is refused rather than defaulted.
+    const root = await pack()
+    try {
+      const config = join(root, 'memes.json')
+      await writeFile(config, JSON.stringify({ dir: root, poor: { file: 'PNGTuber 闲置.gif', below: 5 } }))
+      assert.deepEqual(await createMemePicker(config).poor(), {
+        src: 'data:image/gif;base64,R0lGOA==',
+        below: 5,
+      })
+      // Cents are kept, and an absent line takes the shipped one.
+      await writeFile(config, JSON.stringify({ dir: root, poor: { file: 'fish.gif', below: 12.345 } }))
+      assert.deepEqual(await createMemePicker(config).poor(), { src: 'data:image/gif;base64,R0lG', below: 12.35 })
+      await writeFile(config, JSON.stringify({ dir: root, poor: { file: 'fish.gif' } }))
+      assert.deepEqual(await createMemePicker(config).poor(), { src: 'data:image/gif;base64,R0lG', below: 5 })
+      // `null` is how a hand-edited JSON says "left out", so it takes the shipped line with an absent
+      // one; a line that is *there* but unusable becomes zero, which no balance is below — a broken
+      // amount must not be the thing that turns a face on.
+      await writeFile(config, JSON.stringify({ dir: root, poor: { file: 'fish.gif', below: null } }))
+      assert.deepEqual(await createMemePicker(config).poor(), { src: 'data:image/gif;base64,R0lG', below: 5 })
+      for (const below of [-1, '5']) {
+        await writeFile(config, JSON.stringify({ dir: root, poor: { file: 'fish.gif', below } }))
+        assert.deepEqual(await createMemePicker(config).poor(), { src: 'data:image/gif;base64,R0lG', below: 0 },
+          JSON.stringify(below))
+      }
+      // Unnamed, disabled, or a file that resolves to nothing: no poor face at all.
+      await writeFile(config, JSON.stringify({ dir: root }))
+      assert.equal(await createMemePicker(config).poor(), null)
+      await writeFile(config, JSON.stringify({ dir: root, poor: { enabled: false, file: 'fish.gif' } }))
+      assert.equal(await createMemePicker(config).poor(), null)
+      await writeFile(config, JSON.stringify({ dir: root, poor: { file: 'gone.gif' } }))
+      assert.equal(await createMemePicker(config).poor(), null)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -258,6 +361,28 @@ describe('typing frame', () => {
       assert.equal(await off.reply(), null)
       assert.equal(await off.thinking(), null)
       assert.equal(await off.tool(), null)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves the fetch face as a loop, and leaves it off when unnamed', async () => {
+    // Its own test because it is the one named state that must NOT fall back to `tool`: a pack
+    // that says nothing about fetching has to leave the shared tool face in charge of a fetch,
+    // which is only true if the picker answers `null` rather than `tool()`'s file.
+    const root = await pack()
+    try {
+      const config = join(root, 'memes.json')
+      await writeFile(config, JSON.stringify({ dir: root, webfetch: { file: 'PNGTuber 闲置.gif' } }))
+      assert.equal(await createMemePicker(config).webfetch(), 'data:image/gif;base64,R0lGOA==')
+
+      const bare = join(root, 'bare.json')
+      await writeFile(bare, JSON.stringify({ dir: root, tool: { file: 'fish.gif' } }))
+      assert.equal(await createMemePicker(bare).webfetch(), null)
+
+      const off = join(root, 'off.json')
+      await writeFile(off, JSON.stringify({ dir: root, webfetch: { enabled: false, file: 'fish.gif' } }))
+      assert.equal(await createMemePicker(off).webfetch(), null)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

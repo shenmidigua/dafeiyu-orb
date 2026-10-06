@@ -41,7 +41,7 @@ import onnxruntime as ort
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from wake_dataset import pool_from, pool_slice  # noqa: E402
+from wake_dataset import pool_from, pool_slice, prepare_positive  # noqa: E402
 from wake_features import (  # noqa: E402
     SILENCE_LEVEL, OrbFeatures, pcm16_from_wav, warmup_audio, warmup_length,
 )
@@ -51,9 +51,9 @@ FILLER_DIR = pathlib.Path(r"C:\Users\digua\wakeword\data\negatives")
 POSITIVE_DIR = pathlib.Path(r"C:\Users\digua\wakeword\data\positives")
 OUT = pathlib.Path(__file__).parent / "noise-probe.json"
 
-# Matches `wake_dataset.POSITIVE_MIN_RING_FRAMES`: a positive has to have the phrase substantially
-# inside the ring before it counts as one.
-POSITIVE_MIN_RING_FRAMES = 8
+# How much of the ring a positive must hold is now a property of the clip, not a constant: a
+# window only counts once it contains the whole phrase, and where that point falls depends
+# on how long the reading is. `prepare_positive` measures it, the same way the dataset does.
 
 
 # --------------------------------------------------------------------------------------------------
@@ -219,7 +219,13 @@ def main() -> int:
                 peak = max(peak, score)
                 fired += int(score >= args.threshold)
         for path in positives:
-            speech = pcm16_from_wav(path).astype(np.float32)
+            # Trimmed exactly as training trims it, then noised — so this measures the clip the model
+            # was actually fitted on rather than the raw endpoint output around it.
+            prepared = prepare_positive(pcm16_from_wav(path))
+            if prepared is None:
+                continue
+            speech, require = prepared
+            speech = speech.astype(np.float32)
             noise, snr_db = noise_for(condition, len(speech))
             samples = speech if noise is None else mix_at(speech, noise, snr_db)
             warm_noise, warm_snr = noise_for(condition, warmup_length())
@@ -228,7 +234,7 @@ def main() -> int:
                 else (nprng.standard_normal(warmup_length()) * SILENCE_LEVEL).astype(np.float32)
             if warm_noise is not None:
                 warm = mix_at(warm, warm_noise, warm_snr)
-            score = scorer.peak(samples, warm, POSITIVE_MIN_RING_FRAMES)
+            score = scorer.peak(samples, warm, require)
             if not np.isnan(score):
                 counted += 1
                 hits += int(score >= args.threshold)

@@ -117,6 +117,40 @@ export function readWakeDirectory(directory: string, keyword: string = WAKE_DEFA
   return root
 }
 
+/** What {@link resolveWakeAssets} needs from the profile, so this module stays free of it. */
+export interface WakeAssetPreference {
+  /** Absolute directory the user configured, or `''` to let discovery find one. */
+  readonly assetDirectory: string
+  /** The configured keyword, whose model file is part of the required set. */
+  readonly keyword: string
+}
+
+/**
+ * The asset directory to hand the helper: the configured one when it is usable, otherwise
+ * whatever discovery finds.
+ *
+ * The configured path is validated rather than trusted, and this is the whole point of the
+ * function. A configured directory is a string in a JSON file that nothing keeps in sync with
+ * the disk: the checkout can move, a model can be deleted, a drive can be absent. Taking it at
+ * face value means the helper is launched pointing at nothing, every request for a model 404s,
+ * and the ball can only say "wake word unavailable" — with the actual cause one layer down in a
+ * log the user has no reason to find. Validating here turns all of those into a discovery
+ * attempt, and a discovered directory is known good because `readWakeDirectory` already said so.
+ *
+ * @param preference - the profile's wake settings.
+ * @returns the absolute asset directory, or undefined when nothing usable exists.
+ */
+export function resolveWakeAssets(preference: WakeAssetPreference): string | undefined {
+  if (preference.assetDirectory !== '') {
+    const configured = readWakeDirectory(preference.assetDirectory, preference.keyword)
+    // A configured directory that no longer holds the models falls through to discovery rather
+    // than failing outright: the checkout may have moved, and the caller is better served by the
+    // copy that is actually there than by nothing.
+    if (configured !== undefined) return configured
+  }
+  return discoverWakeAssets(preference.keyword)
+}
+
 /**
  * Resolve one request path against the asset root.
  *

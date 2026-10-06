@@ -99,6 +99,21 @@
       <img id="ball-gif" src="deepseek-avatar-square.gif" alt="" draggable="false">
     </button>
     <p id="wake-badge" hidden></p>
+    <!-- The live wake meter, under the ball: how close the current window's score is to the
+         threshold, and how many windows in a row have counted. It is up only while the engine is
+         actually listening — a score for a microphone that is off is a number about nothing — and
+         the dots are built by shell.js from CONSECUTIVE_WINDOWS, so the meter cannot disagree with
+         the rule it is explaining. -->
+    <div id="wake-meter" hidden>
+      <div id="wake-meter-track">
+        <div id="wake-meter-fill"></div>
+        <span id="wake-meter-line"></span>
+      </div>
+      <div id="wake-meter-row">
+        <span id="wake-meter-score">0.000</span>
+        <span id="wake-meter-streak" aria-hidden="true"></span>
+      </div>
+    </div>
     <button id="dock-tab" type="button" hidden aria-hidden="true"></button>
     <button id="stop" type="button" hidden></button>
     <script type="module" src="shell.js"></script>

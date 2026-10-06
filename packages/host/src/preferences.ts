@@ -265,9 +265,19 @@ export class ProfileStore {
     return this.wakeValue
   }
 
-  /** The ball's menu flips only this flag; every other field stays as configured. */
+  /**
+   * The ball's menu flips only this flag; every other field stays as configured.
+   *
+   * The file is re-read first, because it is not this process's alone. The user edits
+   * `orb-wake.json` by hand (the dictation fields have no UI at all), a settings page can hold
+   * its own copy, and the whole file is rewritten on every save — so writing the snapshot taken
+   * at construction would quietly revert whatever landed on disk in the meantime. Only `enabled`
+   * is this call's to change; everything else comes from the file as it stands, revalidated by
+   * the same `readWake` that produced the original, so a hand-edited out-of-range value is
+   * clamped rather than trusted.
+   */
   setWakeEnabled(enabled: boolean): void {
-    this.wakeValue = { ...this.wakeValue, enabled }
+    this.wakeValue = { ...readWake(this.dir), enabled }
     writeWake(this.dir, this.wakeValue)
   }
 

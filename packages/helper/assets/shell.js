@@ -6,7 +6,7 @@ import {
   usageLabels, tokenUsageTotal, formatTokenCount,
 } from './transcript-model.js'
 import { upgradeCodeBlocks } from './highlight.js'
-import { WakeEngine, WAVE_BARS } from './wake.js'
+import { WakeEngine, WAVE_BARS, CONSECUTIVE_WINDOWS } from './wake.js'
 import { Speaker } from './speech.js'
 import {
   icon, THINK, CHEVRON_DOWN, CHEVRON_UP, SEARCH, GLOBE, BROWSE, EDIT, CODE, API, SPARKLE, COPY, CHECK, SPEAKER, STOP, stateSpinner,
@@ -23,11 +23,33 @@ const TYPING_HOLD_MS = 3000
 /** Grace after the wake chime before the recorder starts taking frames. */
 const DICTATION_DELAY_MS = 350
 /**
- * Shortest visible hold for a one-shot reaction — the click pat and the finished-task bell.
- * The shipped pat GIF is only 360 ms, and a shorter cue than this reads as a glitch rather
- * than as an answer to what just happened.
+ * Shortest visible hold for a cue whose clip ends on its own last frame, milliseconds.
+ *
+ * Such a clip can be parked on that final pose for as long as the ball likes, which is what
+ * keeps a short one from reading as a glitch rather than as an answer to what just happened.
+ * A clip that restarts on its own cannot be held this way — holding it past its own length
+ * only means watching it again — so it gets one pass instead; `oneShotHoldMs` has the rule.
  */
 const ONE_SHOT_MIN_MS = 900
+/**
+ * The lead a clip that loops on its own is given when its hand-off has to be moved, in
+ * milliseconds.
+ *
+ * A GIF decoder starts the animation over the moment it reaches the last frame, so a hand-off
+ * that lands on a multiple of the clip's own length is a race: whichever runs first that
+ * millisecond decides whether the first frame shows for an instant. This is the margin used
+ * when the hold has to be nudged off such a boundary, and the floor of the proportional share
+ * applied to longer clips.
+ */
+const ONE_SHOT_CUT_MS = 70
+/**
+ * The one tool call that gets a face of its own.
+ *
+ * `web_search` is deliberately not on this list: a search returns snippets the agent already has,
+ * while `web_fetch` is the call where it is waiting on a page it has not seen yet — that wait is
+ * the one the user can see the length of, and the one worth showing something during.
+ */
+const WEB_FETCH_TOOL = 'web_fetch'
 /** How long to wait for the host's transcript before telling the user it went missing. */
 const DICTATION_TIMEOUT_MS = 90000
 /**
@@ -36,6 +58,18 @@ const DICTATION_TIMEOUT_MS = 90000
  * so the waveform scrolls at the rate the levels actually arrive instead of at this rate.
  */
 const WAVE_STEP_MS = 50
+/**
+ * How long the meter keeps showing the reading that woke the ball.
+ *
+ * A detection is decided on three consecutive windows and the ball chimes on the third, so the
+ * whole run is about 380 ms of audio and the engine is already into its cooldown - streak cleared,
+ * dots dark - by the time the chime is heard. A user who looks up at the sound therefore has
+ * nothing left to read, which is exactly the question the meter was asked to answer ("the bar never
+ * got there and it fired anyway"). A held reading is not a live score and is not drawn as one: it
+ * is the record of one run, and it expires on its own. Long enough to read a number, short enough
+ * that the next thing the ball does is not explained by a stale one.
+ */
+const WAKE_HOLD_MS = 2600
 const DOCK_DRAG_OFF_PX = 24
 const COMPOSER_MIN_PX = 72
 const COMPOSER_LINE_PX = 20
@@ -133,7 +167,7 @@ const zh = {
   tccFooter: '打开开关后，请完全退出 {name} 再打开。只关主窗口无效。插件不能替你重启官方应用。',
   tccLater: '稍后',
   tccDismiss: '关闭',
-  wakeListening: '语音唤醒已开启 — 说「Hey Jarvis」',
+  wakeListening: '语音唤醒已开启 — 说「{word}」',
   wakeDetected: '已听到唤醒词',
   wakeRecording: '正在听你说…',
   wakeTranscribing: '正在识别…',
@@ -201,7 +235,7 @@ const en = {
   tccFooter: 'After the switches are on, quit {name} completely and open it again. Closing the main window does not quit. This plugin cannot restart the official app.',
   tccLater: 'Later',
   tccDismiss: 'Dismiss',
-  wakeListening: 'Wake word on — say “Hey Jarvis”',
+  wakeListening: 'Wake word on — say “{word}”',
   wakeDetected: 'Wake word heard',
   wakeRecording: 'Listening to you…',
   wakeTranscribing: 'Transcribing…',
@@ -335,6 +369,10 @@ function main() {
   const ball = document.querySelector('#ball')
   const dockTab = document.querySelector('#dock-tab')
   const panel = document.querySelector('#panel')
+  const wakeMeter = document.querySelector('#wake-meter')
+  const wakeMeterFill = document.querySelector('#wake-meter-fill')
+  const wakeMeterScore = document.querySelector('#wake-meter-score')
+  const wakeMeterStreak = document.querySelector('#wake-meter-streak')
   const transcript = document.querySelector('#transcript')
   const questionRoot = document.querySelector('#question')
   const questionEyebrow = document.querySelector('#question-eyebrow')
@@ -405,9 +443,18 @@ function main() {
   let avatarSrc = 'deepseek-avatar-square.gif'
   // The named frames the helper hands over, plus the meme bursts.
   let idleSrc
+  // The resting loop's other face: worn instead of `idleSrc` while the account is nearly out of
+  // money. `balanceCny` is what the host last read — `null` while nobody has said, which is not the
+  // same as zero and does not turn this face on.
+  let poorSrc
+  let poorBelow = 0
+  let balanceCny = null
   let hoverSrc
   let hoverIntroSrc
   let hoverIntroMs = 0
+  // Whether the peek's intro file restarts on its own. It decides how the hand-off to the loop
+  // is scheduled, so it travels with the frame rather than being re-read at the switch.
+  let hoverIntroLoops = false
   let introUntil = 0
   // The dictation pose: worn for exactly as long as the ball is taking the user's voice, and
   // dropped the moment it is not. Unlike the one-shots above it is a loop, because the length
@@ -427,11 +474,26 @@ function main() {
   let replySrc
   let thinkingSrc
   let toolSrc
+  // The fetch face: a `data:` URL worn while a web page is being fetched. Separate from `toolSrc`
+  // because a pack that names one has said something specific about that one call, and every other
+  // tool still shares `tool`. `undefined` when the pack names no such file, which is what leaves
+  // `tool` in charge of a fetch as well.
+  let webfetchSrc
+  let webfetchPending = false
+  // The poor frame's read, kept from racing the sweep with itself: two passes over `refreshFrames()`
+  // can overlap, and the frame is a whole GIF.
+  let poorPending = false
   // The click reaction: one pass of a GIF whenever the ball itself is clicked.
   let clickFrame
   let clickShown
   let clickTimer
   let clickStep = 0
+  // The arrival: the clips the ball turns up with, played once each the moment this page opens,
+  // before anything has been asked of it. It is the only cosmetic here that is not a reaction to
+  // anything — see `wearArriveFrame` — and the flag keeps the sequence to one run per page.
+  let arriveShown
+  let arriveStep = 0
+  let arrivePlayed = false
   // The finished-task frame: one pass of a GIF whenever a turn ends by itself.
   let doneFrame
   let doneShown
@@ -443,8 +505,16 @@ function main() {
   let wakeShown
   let wakeTimer
   let wakeStep = 0
-  // The drag face: worn for as long as the ball is being carried.
+  // The carry face: the pickup plays once, then this loop is worn for as long as the ball is
+  // held. Same shape as the peek above, so picking the ball up reads as a gesture.
   let dragSrc
+  let dragIntroSrc
+  let dragIntroMs = 0
+  // Whether the pickup file restarts on its own; see `hoverIntroLoops`.
+  let dragIntroLoops = false
+  let dragIntroHold = 0
+  let dragIntroUntil = 0
+  let dragIntroTimer
   // The release face: one pass of a GIF the moment the pointer lets go. It is an event, not a
   // state — the carry wears `drag`, and what follows the carry is this, so it is kept apart from
   // `dragSrc` rather than being a second loop the carry could fall back to.
@@ -453,6 +523,9 @@ function main() {
   let dropTimer
   let dropStep = 0
   let agentState = ''
+  // The name of the tool call the agent is waiting on, `''` when none is. Kept beside the phase
+  // rather than inside it so `restingNow` and the other phase readers stay a plain string test.
+  let agentTool = ''
   // The nap timeline: how long the ball has been untouched, and which frame it reached.
   let sleepInfo
   const sleepFrames = []
@@ -482,6 +555,34 @@ function main() {
   // reason text an error state shows.
   let wakeState = 'disabled'
   let wakeDetail = ''
+  // The live meter's last reading. Held as numbers rather than read back out of the DOM, so that a
+  // repaint — the panel opening, the meter being unhidden — redraws from the engine's report instead
+  // of from whatever the page last wrote.
+  let wakeScore = 0
+  let wakeAbove = false
+  let wakeStreak = 0
+  let wakeThreshold = 0.95
+  // The reading a completed run fired at, held on screen for `WAKE_HOLD_MS` after it fired. See
+  // `holdWake` for why the live reading cannot be the whole answer, and `paintWakeMeter` for how the
+  // two are drawn apart.
+  let wakeHeld
+  // The length the fill was last drawn at. The bar has to be able to cross the line in the same
+  // frame the engine counts the window, so the direction of the change decides whether the sheet
+  // animates it; without a remembered length there is no direction to compare against.
+  let wakeDrawn = 0
+  /**
+   * What to call the wake word in the status line.
+   *
+   * The engine reports the keyword it was configured with, and that name is a file stem, not
+   * something to read aloud: a self-trained keyword is `dafeiyu`, and telling the user to say
+   * "dafeiyu" would be worse than useless. Anything without a known spoken form falls back to the
+   * raw name rather than to the shipped one — a wrong word is worse than an odd one.
+   */
+  // The wake word is the phrase said TWICE, so the hint has to say it twice too: a user told to say
+  // 「大肥鱼」 once is being sent at a word the model was trained to ignore. Kept in step with
+  // `WAKE_SPOKEN_NAMES` in `src/wake.ts` by `tests/wake-names.test.ts`.
+  const KEYWORD_NAMES = { hey_jarvis: 'Hey Jarvis', dafeiyu: '大肥鱼大肥鱼' }
+  let wakeKeyword = ''
   // One dictation at a time: the recorder lives on the engine's microphone.
   let dictationBusy = false
   let dictationTimer
@@ -498,7 +599,12 @@ function main() {
   let wavePainted = -Infinity
   // The engine reports every state change through `onStatus`, so this page never has
   // to guess what the engine is doing.
-  const wake = new WakeEngine(api, { onStatus: (status) => { applyWakeStatus(status) } })
+  const wake = new WakeEngine(api, {
+    onStatus: (status) => { applyWakeStatus(status) },
+    // The score deliberately never reaches the helper: it arrives about eight times a second while
+    // the microphone is open, and only this page's meter reads it.
+    onScore: (update) => { applyWakeScore(update) },
+  })
   let historyItems = []
   const blocks = new Map()
   // Last message per block key: the locale refresh re-renders from it.
@@ -684,19 +790,42 @@ function main() {
     const detected = recording || (!transcribing && wakeState === 'detected')
     document.body.classList.toggle('wake-listening', listening)
     document.body.classList.toggle('wake-detected', detected)
-    // Recording is the one phase with a live meter, so the row that holds it is sized and
-    // shown from this one class rather than from the phase being read twice.
+    // Recording is the one phase with a live *level* row in the panel, so that row is sized and
+    // shown from this single class rather than from the phase being read twice. The wake meter is a
+    // different question and answers it below.
     document.body.classList.toggle('wake-recording', recording)
     document.body.classList.toggle('wake-loading', wakeState === 'loading')
     document.body.classList.toggle('wake-error', wakeState === 'error')
     document.body.classList.toggle('wake-transcribing', transcribing)
+    // The meter is up exactly while the wake engine is the one holding the microphone *and scoring
+    // it*: listening, the detection hold, and the wait for a transcript. The engine keeps scoring
+    // through all three — only the recorder stops it — so hiding the bar for any of them hides a
+    // live score, and a wake that lands in the hidden one is a chime with no reading beside it.
+    //
+    // `recording` is the opposite case and the reason this is not simply "listening or detected":
+    // the recorder has the microphone and nothing is being scored, so the bar would be frozen at the
+    // last reading of a finished stream and read as a live one. A held reading is the one thing that
+    // stays up through it, because a hold is a record of what fired rather than a live score.
+    const scoring = !recording && (listening || wakeState === 'detected' || transcribing)
+    const meterVisible = scoring || heldWake() !== undefined
+    if (wakeMeter !== null) {
+      wakeMeter.hidden = !meterVisible
+      // Re-drawn on the way in, so the first frame after the microphone opens shows the engine's
+      // standing score rather than whatever the last stream left behind.
+      if (meterVisible) paintWakeMeter()
+    }
     const badge = document.querySelector('#wake-badge')
     if (badge === null) return
     let text = ''
     if (recording) text = messages.wakeRecording
     else if (transcribing) text = messages.wakeTranscribing
     else if (wakeState === 'loading') text = messages.wakeLoading
-    else if (listening) text = messages.wakeListening
+    else if (listening) {
+      // Filled in from the engine's own report, so a profile that trains its own word does not
+      // get told to say the shipped one.
+      text = messages.wakeListening.replace('{word}',
+        KEYWORD_NAMES[wakeKeyword] ?? wakeKeyword)
+    }
     else if (detected) text = messages.wakeDetected
     else if (wakeState === 'error') {
       text = wakeDetail === ''
@@ -718,8 +847,14 @@ function main() {
     if (status === null || typeof status !== 'object') return
     wakeState = typeof status.state === 'string' ? status.state : wakeState
     wakeDetail = typeof status.detail === 'string' ? status.detail : ''
+    if (typeof status.keyword === 'string' && status.keyword !== '') wakeKeyword = status.keyword
     syncWake()
     if (wakeState !== 'detected') return
+    // Before anything else, so the reading that fired is on the meter in the same frame as the
+    // chime. Everything after this point makes the meter stop being able to explain the wake: the
+    // engine's next window clears the streak and the dots with it, and the recording that follows
+    // stops the scoring altogether.
+    holdWake(wakeScoreIn(status.detail))
     // The acknowledgement comes first: it has to be on screen before the panel opens and
     // before the recorder takes over, because it is the only sign that the ball heard its
     // name rather than merely the sound of someone talking to it.
@@ -728,6 +863,139 @@ function main() {
     // the badge and puts the composer in reach, which is where the next step starts.
     if (wake.autoExpand() && !expanded && !pinned && !running && !asking()) void setExpanded(true)
     void startDictation()
+  }
+
+  /**
+   * Build the meter's streak dots, one per window the detection rule needs in a row.
+   *
+   * Built from `CONSECUTIVE_WINDOWS` rather than written into the markup because the dots are the
+   * rule drawn as a picture: three dots next to a rule that fires on two windows would teach the
+   * user something false, and the two places would drift the first time the constant changed.
+   */
+  function buildWakeMeter() {
+    if (wakeMeterStreak === null) return
+    wakeMeterStreak.replaceChildren()
+    for (let i = 0; i < CONSECUTIVE_WINDOWS; i += 1) {
+      const dot = document.createElement('i')
+      dot.className = 'wake-meter-dot'
+      wakeMeterStreak.append(dot)
+    }
+  }
+
+  /**
+   * Apply one scored window: the classifier's own report, once per window while listening.
+   *
+   * Nothing here is judgement — the engine has already decided what counts. `above` is the raw
+   * threshold comparison and `streak` is the run the detection rule acts on, so a bar past the line
+   * with no dot lit is the cooldown or a quiet VAD, not a bug, and it has to stay visible as that.
+   */
+  function applyWakeScore(update) {
+    if (update === null || typeof update !== 'object') return
+    if (typeof update.score === 'number' && Number.isFinite(update.score)) wakeScore = update.score
+    if (typeof update.threshold === 'number' && Number.isFinite(update.threshold)) wakeThreshold = update.threshold
+    wakeAbove = update.above === true
+    wakeStreak = typeof update.streak === 'number' ? update.streak : 0
+    paintWakeMeter()
+  }
+
+  /**
+   * The score a detection fired at, out of the detail the engine reports with it.
+   *
+   * `detected()` publishes `score 0.987`. Read from the status rather than from the last window on
+   * the score channel on purpose: the two arrive on different channels, and the status is the one
+   * that means "this is a detection, not a coincidence". A detail that does not parse leaves the
+   * hold to fall back to the live reading, which is the same window anyway.
+   */
+  function wakeScoreIn(detail) {
+    const match = /score ([0-9.]+)/.exec(typeof detail === 'string' ? detail : '')
+    const value = match === null ? Number.NaN : Number(match[1])
+    return Number.isFinite(value) ? value : undefined
+  }
+
+  /**
+   * Hold the reading that just fired, so the meter still answers "why" after the chime.
+   *
+   * A detection is three consecutive windows and the ball chimes on the third, so the whole run is
+   * about 380 ms and the engine has already cleared the streak by the time the sound arrives. On top
+   * of that the bar is animated, the recording that follows stops the scoring, and the end of that
+   * recording resets the reading to zero — between them, a user who looks up at the chime has
+   * nothing left to read, and reports the ball as having woken for no reason. The hold is what makes
+   * the reading survive long enough to be read, and it is drawn as a record rather than as a live
+   * score (`held`).
+   *
+   * @param score - the score the engine reported with the detection, or undefined.
+   */
+  function holdWake(score) {
+    const held = score === undefined ? wakeScore : score
+    if (wakeHeld !== undefined) clearTimeout(wakeHeld.timer)
+    const expiresAt = Date.now() + WAKE_HOLD_MS
+    const timer = setTimeout(() => {
+      // The check is not a duplicate of the clear below it: this timer belongs to one particular
+      // hold, and a newer hold taken in the meantime must not be cancelled by the older one's
+      // expiry. The `clearTimeout` above is not enough on its own — a callback that has already
+      // been queued still runs.
+      if (wakeHeld === undefined || wakeHeld.expiresAt > Date.now()) return
+      wakeHeld = undefined
+      // The hold is also what can be keeping the meter on screen, and it is the only state that
+      // ends by itself: without this the bar would stay up over a microphone nothing is scoring.
+      syncWake()
+    }, WAKE_HOLD_MS + 30)
+    wakeHeld = { score: held, expiresAt, timer }
+    // The two edges of a hold are handled the same way on purpose. A hold is one of the two things
+    // that can keep the bar on screen - `syncWake`'s rule reads it directly - so taking one changes
+    // the answer to a question this function does not own, and the expiry already re-decides for the
+    // same reason. Drawing without re-deciding touches only the half that cannot bring the bar back:
+    // the reading would be there, and not shown. `syncWake` paints whenever it shows the bar, so it
+    // covers both.
+    syncWake()
+  }
+
+  /**
+   * The held reading while its hold lasts, or undefined.
+   *
+   * This comparison — not the timer — is what decides. `holdWake` fires its timer 30 ms *after* the
+   * hold ends, and a timer that is late is a timer doing its job, so the reading has to be able to
+   * let go on its own. What the timer does instead is the one thing a comparison cannot: make the
+   * page re-decide, at the moment the hold ends, whether the bar still belongs on screen.
+   */
+  function heldWake() {
+    return wakeHeld !== undefined && Date.now() < wakeHeld.expiresAt ? wakeHeld : undefined
+  }
+
+  /**
+   * Draw the engine's last reading.
+   *
+   * The two lengths go out as CSS variables instead of as pixel widths: the track's length is the
+   * layout's business (`--ball`), and the score is a fraction of it, so neither number has to be
+   * known here. Clamped because a variable is a promise the rest of the sheet reads, and a score
+   * outside 0..1 would paint the fill past the track's edge.
+   *
+   * A held reading outranks the live one for its hold: it is drawn at the score that fired, carries
+   * the whole rule as lit dots, and wears the crossed colour, because a run that fired is by
+   * definition all three of those things. Everything else is the live report, unchanged.
+   */
+  function paintWakeMeter() {
+    if (wakeMeter === null) return
+    const held = heldWake()
+    const score = held === undefined ? wakeScore : held.score
+    const above = held === undefined ? wakeAbove : true
+    const streak = held === undefined ? wakeStreak : CONSECUTIVE_WINDOWS
+    wakeMeter.style.setProperty('--wake-score', String(Math.min(1, Math.max(0, score))))
+    wakeMeter.style.setProperty('--wake-threshold', String(Math.min(1, Math.max(0, wakeThreshold))))
+    wakeMeter.classList.toggle('hot', above)
+    wakeMeter.classList.toggle('held', held !== undefined)
+    if (wakeMeterScore !== null) wakeMeterScore.textContent = score.toFixed(3)
+    // A crossing has to be drawn in the frame the engine counts it: the ball chimes two windows
+    // after the first one over the line, so a bar that eases upwards is still on its way there when
+    // the wake is heard. Only a falling reading is animated — that is the direction where the
+    // 128 ms steps would otherwise read as flicker, and the one where arriving late costs nothing.
+    if (wakeMeterFill !== null) wakeMeterFill.classList.toggle('falling', score <= wakeDrawn)
+    wakeDrawn = score
+    if (wakeMeterStreak === null) return
+    const dots = wakeMeterStreak.children
+    for (let i = 0; i < dots.length; i += 1) {
+      dots[i].classList.toggle('on', i < streak)
+    }
   }
 
   /** Base64 for a binary buffer, chunked so a long utterance cannot blow the call stack. */
@@ -899,15 +1167,75 @@ function main() {
     return pending !== undefined
   }
 
+  /**
+   * Whether a frame's own file starts over by itself, read from the bytes the helper sent.
+   *
+   * The page is handed every image as a `data:` URL, so the same repeat block the decoder
+   * reads is already in hand. A repeat count of zero means the file restarts the instant it
+   * reaches its last frame; no block at all means it plays once and stops there, holding that
+   * frame. Reading it beats inferring it from the length: a file's length says nothing about
+   * whether its last frame is the end of the clip or a boundary it is about to cross again.
+   */
+  function loopsForever(src) {
+    if (typeof src !== 'string') return false
+    const comma = src.indexOf(',')
+    if (comma < 0 || !src.startsWith('data:') || !src.slice(0, comma).includes(';base64')) return false
+    let raw
+    try {
+      raw = atob(src.slice(comma + 1))
+    } catch {
+      return false
+    }
+    // Application extension: name(11) + sub-block size(1) + sub-block id(1) + count(2).
+    const at = raw.indexOf('NETSCAPE2.0')
+    return at >= 0 && raw.charCodeAt(at + 13) === 0 && raw.charCodeAt(at + 14) === 0
+  }
+
+  /**
+   * How long a cue — a reaction the ball shows on its own account — stays up before the ball
+   * goes back to what it was doing.
+   *
+   * A file that restarts on its own is given one pass and a little less. The hand-off has to
+   * land before the frame the decoder restarts from, because landing on it is a coin flip: the
+   * next pass has already begun, so one frame of the opening pose leaks out before the pose
+   * that follows takes over. The margin is a share of the clip's own length, so a long cue
+   * earns a long lead, with {@link ONE_SHOT_CUT_MS} as the floor. One pass is all such a file
+   * gets — holding it longer would only mean watching it play again.
+   *
+   * A file that stops on its own last frame is given its whole length and then some, which is
+   * what lets {@link ONE_SHOT_MIN_MS} do its job: a short cue that ends on a settle is held
+   * there long enough to read as an answer rather than a blink, at no risk of a restart.
+   */
+  function oneShotHoldMs(ms, loops) {
+    if (loops !== true) return Math.max(ms, ONE_SHOT_MIN_MS)
+    return Math.max(ms - Math.max(ONE_SHOT_CUT_MS, Math.round(ms * 0.15)), 120)
+  }
+
+  /**
+   * How long a transition — a clip that ends by handing over to another animation — is given.
+   *
+   * A transition is the opposite of a cue: the loop it leads into should start the moment the
+   * clip has finished, not after the clip has held a pose. A file that plays once already ends
+   * there, so it is given its own length exactly, which is what makes the seam invisible. One
+   * that starts over on its own has to give up its last frames instead, since landing the
+   * hand-off before the restart is the only way to keep the opening pose from showing twice.
+   */
+  function transitionHoldMs(ms, loops) {
+    if (loops !== true) return ms
+    return Math.max(ms - Math.max(ONE_SHOT_CUT_MS, Math.round(ms * 0.15)), 120)
+  }
+
   function syncGif() {
     if (pageClosed()) return
     syncSleep()
     const gif = document.querySelector('#ball-gif')
     // Being carried around the desktop outranks every pose, including the click reaction.
     if (dragging && dragSrc !== undefined) {
-      if (gif.dataset.mode !== 'drag') {
-        gif.dataset.mode = 'drag'
-        gif.src = dragSrc
+      const intro = dragIntroSrc !== undefined && Date.now() < dragIntroUntil
+      const mode = intro ? 'drag-intro' : 'drag'
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = intro ? dragIntroSrc : dragSrc
       }
       return
     }
@@ -953,6 +1281,22 @@ function main() {
       }
       return
     }
+    // The arrival: the greeting the ball turns up with, up only in the first seconds of a page's
+    // life. It sits below every event cue above and above every state pose below, which is the
+    // whole of its rule: the user's own hand and the agent's own events are never swallowed by a
+    // greeting, and nothing that is merely a *state* — a stream, a fetch, a resting loop — ever
+    // gets to be the first thing seen when the orb comes up. It is not a state itself: the page
+    // owns both ends of it, so a cue that outranks it here delays that one clip by its own length
+    // and the sequence carries on where it left off. The step is per clip, which is what makes the
+    // second one start from its own first frame instead of inheriting the pose of the first.
+    if (arriveShown !== undefined) {
+      const mode = `arrive-${arriveShown.step}`
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = arriveShown.src
+      }
+      return
+    }
     // Typing in the ball's own composer outranks every other cosmetic state.
     if (typingSrc !== undefined && Date.now() - typingAt < TYPING_HOLD_MS) {
       if (gif.dataset.mode !== 'typing') {
@@ -969,13 +1313,25 @@ function main() {
       }
       return
     }
-    // A tool call is running.
-    if (toolSrc !== undefined && agentState === 'tooling') {
-      if (gif.dataset.mode !== 'tool') {
-        gif.dataset.mode = 'tool'
-        gif.src = toolSrc
+    // A tool call is running. A fetch wears its own face when the pack names one, because it is the
+    // call the user watches rather than waits for; everything else — and a fetch in a pack that
+    // names no such file — keeps the shared one.
+    //
+    // The two get different `dataset.mode` values on purpose, and not for tidiness. `mode` is the
+    // only thing this function compares before touching `src`, so sharing one mode between two
+    // different images means the swap from a fetch to the next tool call in the same turn repaints
+    // nothing and leaves the fetch face frozen on the ball.
+    if (agentState === 'tooling') {
+      const web = agentTool === WEB_FETCH_TOOL && webfetchSrc !== undefined
+      const mode = web ? 'webfetch' : 'tool'
+      const src = web ? webfetchSrc : toolSrc
+      if (src !== undefined) {
+        if (gif.dataset.mode !== mode) {
+          gif.dataset.mode = mode
+          gif.src = src
+        }
+        return
       }
-      return
     }
     // The agent is reasoning about the request.
     if (thinkingSrc !== undefined && agentState === 'thinking') {
@@ -1020,9 +1376,11 @@ function main() {
     // not doing anything in particular just because the panel happens to be showing, and a pack
     // that names an `idle` has already said what the ball looks like when it is not doing
     // anything. Without a loop to fall back on the avatar still applies, so a profile with no
-    // memes behaves exactly as before.
+    // memes behaves exactly as before. The poor face counts as a resting loop here for the obvious
+    // reason: it is the same state under a condition, and a pack that names only that one has still
+    // said what the ball looks like at rest.
     const play = running || asking() || tccGateVisible || attachedSelection !== ''
-      || (expanded && idleSrc === undefined)
+      || (expanded && idleSrc === undefined && !brokeNow())
     if (play) {
       if (gif.dataset.mode !== 'play') {
         gif.dataset.mode = 'play'
@@ -1051,11 +1409,17 @@ function main() {
       }
       return
     }
-    // While the ball rests, a configured loop keeps it moving instead of a frozen frame.
-    if (idleSrc !== undefined) {
-      if (gif.dataset.mode !== 'idle') {
-        gif.dataset.mode = 'idle'
-        gif.src = idleSrc
+    // While the ball rests, a configured loop keeps it moving instead of a frozen frame. A pack that
+    // names a `poor` frame says the resting loop is not one face but two: the ordinary one, and the
+    // one for an account that is nearly out of money. Which of them is worn is a decision rather than
+    // a state, so it is made here, on every repaint — a balance that falls below the line changes the
+    // face the ball is already wearing, and topping up changes it back.
+    const broke = brokeNow()
+    if (broke || idleSrc !== undefined) {
+      const mode = broke ? 'poor' : 'idle'
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = broke ? poorSrc : idleSrc
       }
       return
     }
@@ -1063,6 +1427,19 @@ function main() {
     gif.dataset.mode = 'still'
     gif.src = avatarSrc
     freezeGif(gif)
+  }
+
+  /**
+   * Whether the ball should be wearing the poor face instead of its ordinary resting loop.
+   *
+   * Three things have to hold, and the third is the one worth stating: the balance has to be *known*.
+   * The host pushes `null` when nobody is signed in, when the Platform cannot be reached or when the
+   * build carries no client version, and a failed lookup is not a zero — reading it as one would put
+   * the sad face on every machine that never signed in, which is the opposite of the joke.
+   */
+  function brokeNow() {
+    if (poorSrc === undefined || balanceCny === null) return false
+    return balanceCny < poorBelow
   }
 
   /**
@@ -1215,25 +1592,47 @@ function main() {
   /**
    * What the agent is doing right now: streaming an answer, reasoning about the request,
    * or neither. A running block decides it; a streaming answer outranks reasoning.
+   *
+   * The running tool's name comes back alongside the phase rather than being folded into it,
+   * because the phase alone cannot tell a fetch from any other call: two tools in a row are both
+   * `tooling`, and a face that only watches the phase would never notice the swap.
    */
   function agentPhase() {
     let thinking = false
     let tooling = false
+    let tool = ''
     for (const block of blockData.values()) {
       if (block.running !== true) continue
-      if (block.kind === 'assistant') return 'replying'
-      if (block.kind === 'tool') tooling = true
+      if (block.kind === 'assistant') return { state: 'replying', tool: '' }
+      if (block.kind === 'tool') {
+        tooling = true
+        // `blockData` iterates in the order the calls arrived, so letting the name be overwritten
+        // leaves the most recently started call still running — the one the agent is waiting on.
+        tool = block.text
+      }
       if (block.kind === 'reasoning') thinking = true
     }
-    if (tooling) return 'tooling'
-    return thinking ? 'thinking' : ''
+    if (tooling) return { state: 'tooling', tool }
+    return { state: thinking ? 'thinking' : '', tool: '' }
   }
 
-  /** Repaint only when the phase flips, not on every token. */
+  /** Repaint only when the phase or the running tool flips, not on every token. */
   function syncAgent() {
     const next = agentPhase()
-    if (next === agentState) return
-    agentState = next
+    if (next.state === agentState && next.tool === agentTool) return
+    const wasTooling = agentState === 'tooling'
+    agentState = next.state
+    agentTool = next.tool
+    // A fetch that starts before the frame sweep has made its round would otherwise wear the
+    // generic tool face for the whole call, which is the one call worth having a face for.
+    if (next.state === 'tooling' && next.tool === WEB_FETCH_TOOL && webfetchSrc === undefined) {
+      void loadWebfetchFrame()
+    } else if (wasTooling) {
+      // The call that was being fetched has finished, so the frame it was reading is dead weight.
+      // Dropping it lets the next fetch ask again, which is what makes editing `memes.json` take
+      // effect without a restart.
+      webfetchSrc = undefined
+    }
     syncGif()
   }
 
@@ -1258,15 +1657,48 @@ function main() {
   /** The pointer arrived: play the peek intro once, then the loop takes over. */
   function startHoverIntro() {
     if (hoverIntroSrc === undefined) return
-    introUntil = Date.now() + hoverIntroMs
+    // A wave is short next to a hover that can last seconds, and the hand-off is what the user
+    // sees, so the 30 ms of slack that keeps the decoder from painting the switch is worth
+    // keeping — but only while the file stops on its own. One that loops has to be handed over
+    // before its restart instead, which costs it the tail of the wave.
+    const hold = hoverIntroLoops
+      ? transitionHoldMs(hoverIntroMs, true)
+      : hoverIntroMs + 30
+    introUntil = Date.now() + hold
     clearTimeout(introTimer)
-    introTimer = setTimeout(() => { syncGif() }, hoverIntroMs + 30)
+    introTimer = setTimeout(() => { syncGif() }, hold)
   }
 
   function stopHoverIntro() {
     introUntil = 0
     clearTimeout(introTimer)
     introTimer = undefined
+  }
+
+  /**
+   * The ball was picked up: play the lift once, then the hang loop takes over for the rest
+   * of the carry. Deliberately not tied to the drop — a carry that ends early just cuts the
+   * pickup short, which is what actually happened.
+   *
+   * This is a transition, not a cue: the lift ends by handing the ball to the hang loop, so it
+   * is given its own length and no more. The shipped pickup plays once and stops on its last
+   * frame, which is the lifted pose the hang loop opens on, so the two meet without a jump.
+   * Were the file to loop instead, the hand-off would land on the frame it restarts from and
+   * one frame of the lift's opening pose would show before the hang loop took over — the
+   * pickup appeared to stutter. {@link transitionHoldMs} cuts such a file short to avoid it.
+   */
+  function startDragIntro() {
+    if (dragIntroSrc === undefined) return
+    dragIntroHold = transitionHoldMs(dragIntroMs, dragIntroLoops)
+    dragIntroUntil = Date.now() + dragIntroHold
+    clearTimeout(dragIntroTimer)
+    dragIntroTimer = setTimeout(() => { syncGif() }, dragIntroHold)
+  }
+
+  function stopDragIntro() {
+    dragIntroUntil = 0
+    clearTimeout(dragIntroTimer)
+    dragIntroTimer = undefined
   }
 
   /**
@@ -1383,6 +1815,7 @@ function main() {
         syncGif()
       }
     }
+    if (poorSrc === undefined) await loadPoorFrame()
     if (typingSrc === undefined) {
       const src = await fetchFrame(() => api.memeTyping())
       if (src !== undefined) typingSrc = src
@@ -1408,6 +1841,7 @@ function main() {
         syncGif()
       }
     }
+    if (webfetchSrc === undefined) await loadWebfetchFrame()
     if (sleepInfo === undefined || sleepInfo === null) {
       const plan = await fetchSleep()
       if (plan !== null) {
@@ -1443,8 +1877,15 @@ function main() {
     if (voiceSrc === undefined) await loadVoiceFrame()
     if (speakSrc === undefined) await loadSpeakFrame()
     if (dragSrc === undefined) {
-      const src = await fetchFrame(() => api.memeDrag())
-      if (src !== undefined) dragSrc = src
+      const frames = await fetchDrag()
+      if (frames !== null) {
+        dragSrc = frames.src
+        if (frames.intro !== null) {
+          dragIntroSrc = frames.intro.src
+          dragIntroMs = frames.intro.ms
+          dragIntroLoops = frames.intro.loops
+        }
+      }
     }
     if (hoverSrc === undefined) {
       const frames = await fetchHover()
@@ -1453,6 +1894,7 @@ function main() {
         if (frames.intro !== null) {
           hoverIntroSrc = frames.intro.src
           hoverIntroMs = frames.intro.ms
+          hoverIntroLoops = frames.intro.loops
         }
         if (hovering) startHoverIntro()
         syncGif()
@@ -1506,6 +1948,31 @@ function main() {
     return timedFrameOf(frame)
   }
 
+  /**
+   * The carry state: the hang loop plus the optional one-pass pickup, or `null` while it
+   * is off or unreadable. Reads the same shape the helper's `drag()` answers with, which
+   * is why this is `fetchHover` with a different endpoint.
+   */
+  async function fetchDrag() {
+    if (typeof api.memeDrag !== 'function') return null
+    let frames
+    try {
+      frames = await api.memeDrag()
+    } catch {
+      return null
+    }
+    if (frames === null || typeof frames !== 'object') return null
+    if (typeof frames.src !== 'string' || frames.src === '') return null
+    const intro = frames.intro
+    const usable = typeof intro === 'object' && intro !== null
+      && typeof intro.src === 'string' && intro.src !== ''
+      && typeof intro.ms === 'number' && Number.isFinite(intro.ms) && intro.ms > 0
+    return {
+      src: frames.src,
+      intro: usable ? { src: intro.src, ms: intro.ms, loops: loopsForever(intro.src) } : null,
+    }
+  }
+
   /** The release frame, or `null` while it is off or unreadable. */
   async function fetchDrop() {
     if (typeof api.memeDrop !== 'function') return null
@@ -1546,7 +2013,7 @@ function main() {
     dropTimer = setTimeout(() => {
       dropShown = undefined
       syncGif()
-    }, Math.max(dropFrame.ms, ONE_SHOT_MIN_MS))
+    }, oneShotHoldMs(dropFrame.ms, dropFrame.loops))
     syncGif()
   }
 
@@ -1558,12 +2025,89 @@ function main() {
     if (clickFrame === undefined || clickFrame === null) return
     clickStep += 1
     clickShown = { src: clickFrame.src, step: clickStep }
-    const hold = Math.max(clickFrame.ms, ONE_SHOT_MIN_MS)
+    const hold = oneShotHoldMs(clickFrame.ms, clickFrame.loops)
     clearTimeout(clickTimer)
     clickTimer = setTimeout(() => {
       clickShown = undefined
       syncGif()
     }, hold)
+    syncGif()
+  }
+
+  /** The arrival frames, in the order the pack names them, or `null` while it is off. */
+  async function fetchArrive() {
+    if (typeof api.memeArrive !== 'function') return null
+    let frames
+    try {
+      frames = await api.memeArrive()
+    } catch {
+      return null
+    }
+    if (!Array.isArray(frames)) return null
+    const usable = frames.map((frame) => timedFrameOf(frame)).filter((frame) => frame !== null)
+    return usable.length === 0 ? null : usable
+  }
+
+  /**
+   * Resolve once this page is on screen, or at once if it already is.
+   *
+   * The helper builds its window with `show: false` and shows it on `ready-to-show`, so this page
+   * runs for a while with nobody able to see it: it connects, is handed its frames, and paints them
+   * behind a hidden window. A greeting started there is spent before the ball appears — measured on
+   * this machine, the window came up a little over a second after the page had loaded, by which
+   * point the arrival's own animation was already past its halfway mark and the user got the last
+   * frames of it and no more. Waiting for visibility is what makes the greeting the thing the user
+   * sees first, which is the whole of what this slot promises.
+   */
+  function whenVisible() {
+    if (document.visibilityState === 'visible') return Promise.resolve()
+    return new Promise((resolve) => {
+      // Not `{ once: true }`: a change that reports the page still hidden would use up the only
+      // listener there is, and the greeting would then never play at all.
+      const check = () => {
+        if (document.visibilityState !== 'visible') return
+        document.removeEventListener('visibilitychange', check)
+        resolve()
+      }
+      document.addEventListener('visibilitychange', check)
+    })
+  }
+
+  /**
+   * Wear the greeting once, as this page opens: every clip the pack names, in order, one pass each.
+   *
+   * Every other cue in this file answers something: a click, a wake word, a turn that ended. This
+   * one answers nothing — it is the ball announcing itself, first by turning up and then by saying
+   * hello, which is why the slot is a list rather than a file. It is due in the page's first seconds
+   * on screen, before the pointer has been anywhere near it. The helper starts this page when the
+   * orb is switched on, and shows the ball as soon as that page is ready, so a launch of DSH opens
+   * with the greeting exactly like a later enable does.
+   *
+   * It is read here rather than in the `refreshFrames()` sweep for the same reason: that sweep walks
+   * a dozen files one after another, and the greeting would arrive behind the resting loop that the
+   * user is not waiting for. It is played at most once per page load — the sweep keeps running for
+   * the life of the page, and a greeting that replays every poll is a resting loop wearing a
+   * greeting's file — and a pack that names no arrival keeps the silent startup it had before this
+   * slot existed. Each clip carries a new step, like the click reaction: a new mode is what makes
+   * the image element reload the GIF from its first frame.
+   */
+  async function wearArriveFrame() {
+    if (arrivePlayed) return
+    arrivePlayed = true
+    // Both at once: the read starts while the page is still hidden, so the frames are already in
+    // hand when the window appears, and the greeting starts at that same moment rather than at page
+    // load. The wait between two clips is the same hold a one-shot cue gets, so a file that restarts
+    // on its own hands over just before it would have, and one that ends on its own last frame is
+    // held there for as long as it earned.
+    const [frames] = await Promise.all([fetchArrive(), whenVisible()])
+    if (frames === null) return
+    for (const frame of frames) {
+      arriveStep += 1
+      arriveShown = { src: frame.src, step: arriveStep }
+      syncGif()
+      await wait(oneShotHoldMs(frame.ms, frame.loops))
+    }
+    arriveShown = undefined
     syncGif()
   }
 
@@ -1605,7 +2149,7 @@ function main() {
     wakeTimer = setTimeout(() => {
       wakeShown = undefined
       syncGif()
-    }, Math.max(wakeFrame.ms, ONE_SHOT_MIN_MS))
+    }, oneShotHoldMs(wakeFrame.ms, wakeFrame.loops))
     syncGif()
   }
 
@@ -1635,7 +2179,7 @@ function main() {
     doneTimer = setTimeout(() => {
       doneShown = undefined
       syncGif()
-    }, Math.max(doneFrame.ms, ONE_SHOT_MIN_MS))
+    }, oneShotHoldMs(doneFrame.ms, doneFrame.loops))
     syncGif()
   }
 
@@ -1657,12 +2201,17 @@ function main() {
     return { gapMs: plan.gapMs, times: plan.times, file, interject: timedFrameOf(plan.interject) }
   }
 
-  /** A `{ src, ms }` frame from the helper, or `null` when it is missing or malformed. */
+  /**
+   * A `{ src, ms, loops }` frame from the helper, or `null` when it is missing or malformed.
+   *
+   * `loops` is read here rather than left to the caller so that every one-shot in the page
+   * agrees on it, and so the base64 is walked once per fetch instead of once per hold.
+   */
   function timedFrameOf(value) {
     if (value === null || typeof value !== 'object') return null
     if (typeof value.src !== 'string' || value.src === '') return null
     if (typeof value.ms !== 'number' || !Number.isFinite(value.ms) || value.ms <= 0) return null
-    return { src: value.src, ms: value.ms }
+    return { src: value.src, ms: value.ms, loops: loopsForever(value.src) }
   }
 
   /** The peek frames: `{ src, intro }` where the intro is optional, or `null` when unnamed. */
@@ -1710,6 +2259,91 @@ function main() {
     }
   }
 
+  /**
+   * Fetch the fetch face once, then repaint.
+   *
+   * Two callers: the startup sweep, and `syncAgent` on the edge where a `web_fetch` starts. The
+   * second one matters because the first fetch of a session routinely beats the sweep, and a face
+   * that arrives after the call is over is a face nobody ever sees. `webfetchPending` keeps the
+   * two from racing over a frame that is a whole GIF.
+   *
+   * It is safe to call while a fetch is not running: the frame is only worn while one is, and
+   * `syncGif` on arrival is a no-op in every other state. So the frame is also dropped again when
+   * the call that wanted it ends, which is what lets an edited `memes.json` apply to the next
+   * fetch rather than to the next restart.
+   */
+  async function loadWebfetchFrame() {
+    if (webfetchSrc !== undefined || webfetchPending) return
+    webfetchPending = true
+    try {
+      const src = await fetchFrame(() => api.memeWebfetch())
+      if (src !== undefined) {
+        webfetchSrc = src
+        syncGif()
+      }
+    } finally {
+      webfetchPending = false
+    }
+  }
+
+  /**
+   * The poor frame and its line, or `null` while it is off, unreadable, or carries no line.
+   *
+   * A missing or unusable `below` is refused rather than defaulted here: the helper has already
+   * turned a broken amount into zero, and zero means "no balance is ever below this", so the frame
+   * is simply not worn. Refusing it also keeps the sweep asking, which is what makes an edited
+   * `memes.json` show up without a restart.
+   */
+  async function fetchPoor() {
+    if (typeof api.memePoor !== 'function') return null
+    let plan
+    try {
+      plan = await api.memePoor()
+    } catch {
+      return null
+    }
+    if (plan === null || typeof plan !== 'object') return null
+    if (typeof plan.src !== 'string' || plan.src === '') return null
+    if (typeof plan.below !== 'number' || !Number.isFinite(plan.below) || plan.below <= 0) return null
+    return { src: plan.src, below: plan.below }
+  }
+
+  /**
+   * Fetch the poor frame once, then repaint.
+   *
+   * Read in the sweep with the other named loops rather than on a cue, because it *is* the resting
+   * loop under a condition: it is wanted the moment the ball has nothing else to do. The frame and
+   * its line are kept together, so the pair cannot disagree about which account is a poor one.
+   */
+  async function loadPoorFrame() {
+    if (poorSrc !== undefined || poorPending) return
+    poorPending = true
+    try {
+      const plan = await fetchPoor()
+      if (plan !== null) {
+        poorSrc = plan.src
+        poorBelow = plan.below
+        syncGif()
+      }
+    } finally {
+      poorPending = false
+    }
+  }
+
+  /**
+   * The account's spendable balance in CNY as the host last read it, or `null` for "not known".
+   *
+   * Anything the host did not send as a non-negative finite number is "not known", including a
+   * message with no `cny` at all: the number here decides a face, and only a reading the account
+   * actually produced may do that.
+   */
+  function readBalance(payload) {
+    if (payload === null || typeof payload !== 'object') return null
+    const cny = payload.cny
+    if (typeof cny !== 'number' || !Number.isFinite(cny) || cny < 0) return null
+    return cny
+  }
+
   async function fetchHover() {
     if (typeof api.memeHover !== 'function') return null
     let frames
@@ -1724,7 +2358,10 @@ function main() {
     const usable = typeof intro === 'object' && intro !== null
       && typeof intro.src === 'string' && intro.src !== ''
       && typeof intro.ms === 'number' && Number.isFinite(intro.ms) && intro.ms > 0
-    return { src: frames.src, intro: usable ? { src: intro.src, ms: intro.ms } : null }
+    return {
+      src: frames.src,
+      intro: usable ? { src: intro.src, ms: intro.ms, loops: loopsForever(intro.src) } : null,
+    }
   }
 
   async function fetchFrame(call) {
@@ -1757,9 +2394,16 @@ function main() {
     memeInfo = valid ? schedule : undefined
   }
 
-  /** Start the named frames and the burst timer chain. Nothing configured leaves the ball as it was. */
+  /**
+   * Start the named frames and the burst timer chain. Nothing configured leaves the ball as it was.
+   *
+   * The greeting is asked for first and not awaited, so its read is on its way before the sweep
+   * below reads a dozen files for the resting poses — see `wearArriveFrame` for why the order is
+   * the whole point on the one occasion the user is watching the ball appear.
+   */
   async function startMemes() {
     if (typeof api.memeSchedule !== 'function') return
+    void wearArriveFrame()
     await refreshFrames()
     await refreshMemes()
     scheduleMemeBurst()
@@ -3486,6 +4130,10 @@ function main() {
     if (!dragging) {
       if (Math.hypot(event.screenX - pointer.startX, event.screenY - pointer.startY) <= 4) return
       dragging = true
+      // The lift plays once, then the hang loop takes over for the rest of the carry.
+      // Started here rather than on pointerdown because a press that never moves is a click,
+      // not a pickup — the ball is not carried and must not wear the carry face.
+      startDragIntro()
       // The drag face is state, not a one-shot: it leaves when the pointer does.
       syncGif()
       if (running || asking()) {
@@ -3508,6 +4156,9 @@ function main() {
       skipClick = true
       dragging = false
       collapsing = false
+      // The carry is over, so the pickup must not outlive it: a release partway through the
+      // lift would otherwise leave its timer running and re-sync the page while the ball rests.
+      stopDragIntro()
       const origin = pointer === undefined
         ? lastOrigin
         : { x: event.screenX - pointer.dx, y: event.screenY - pointer.dy }
@@ -3819,6 +4470,15 @@ function main() {
       }
     })
   }
+  if (typeof api.onBalance === 'function') {
+    // The host reads the account on its own slow cadence, so this arrives whenever it does — a
+    // balance that falls below the line has to change the face the ball is already wearing, and a
+    // top-up has to change it back, both without a reload.
+    api.onBalance((payload) => {
+      balanceCny = readBalance(payload)
+      syncGif()
+    })
+  }
   if (typeof api.onSpeech === 'function') {
     api.onSpeech((settings) => {
       if (settings === null || typeof settings !== 'object') return
@@ -3863,6 +4523,7 @@ function main() {
     })
   }
   buildWaveform()
+  buildWakeMeter()
   void wake.syncFromHelper()
 }
 

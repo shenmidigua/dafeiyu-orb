@@ -75,11 +75,12 @@ interface GifInputs {
 function modeFor(inputs: GifInputs): string {
   const gif = { dataset: {} as { mode?: string; src?: string } }
   const factory = new Function('deps', `
-    const { document, pageClosed, syncSleep, dragging, dragSrc, dropShown, clickShown, wakeShown,
-            doneShown, typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive, voiceSrc,
-            dictationPhase, idleSrc, hoverSrc, introTimer, napShown, skitInfo, running, asking,
-            tccGateVisible, attachedSelection, expanded, avatarSrc, freezeGif, Date,
-            sleepFrameAt, skitFrame, hoverIntroSrc, introUntil, hovering } = deps
+    const { document, pageClosed, syncSleep, dragging, dragSrc, dropShown, clickShown, arriveShown,
+            wakeShown, doneShown, typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive,
+            voiceSrc, dictationPhase, idleSrc, hoverSrc, introTimer, napShown, skitInfo, running,
+            asking, tccGateVisible, attachedSelection, expanded, avatarSrc, freezeGif, Date,
+            sleepFrameAt, skitFrame, hoverIntroSrc, introUntil, hovering, webfetchSrc, agentState,
+            agentTool, WEB_FETCH_TOOL, brokeNow, dragIntroSrc, dragIntroUntil } = deps
     ${pageFunction(shell, 'syncGif')}
     return syncGif
   `)
@@ -87,10 +88,23 @@ function modeFor(inputs: GifInputs): string {
     document: { querySelector: () => gif },
     pageClosed: () => false,
     syncSleep: () => {},
+    // The poor face is off here: whether the account is nearly empty is a question about the
+    // resting loop, and every case in this file is about the release. The real predicate is walked
+    // in `dsh_orb/walk_poor_sequence.mjs`, against the installed page.
+    brokeNow: () => false,
     dragging: inputs.dragging ?? false,
     dragSrc: inputs.dragSrc ?? (inputs.dragging ? DRAG : undefined),
+    // The carry is painted in two halves once a pickup clip is configured: the intro while its
+    // hold lasts, then the hang loop. These cases are about the release, which requires the carry
+    // to still be the thing on screen — so no pickup is in flight and `dragSrc` decides.
+    dragIntroSrc: undefined,
+    dragIntroUntil: 0,
     dropShown: inputs.dropShown,
     clickShown: inputs.clickShown,
+    // Named because a branch above the release now reads it, and disarmed because no greeting is
+    // in progress in these cases. Leaving it out is a `ReferenceError` in the harness, not a
+    // failed expectation — which reads as a broken test file rather than as the change it caught.
+    arriveShown: undefined,
     wakeShown: inputs.wakeShown,
     doneShown: inputs.doneShown,
     typingSrc: undefined,
@@ -119,6 +133,12 @@ function modeFor(inputs: GifInputs): string {
     avatarSrc: 'data:image/gif;base64,AVATAR',
     freezeGif: () => {},
     Date,
+    // No tool is running in any of these cases, so the fetch face stays disarmed — which is also
+    // what shows it sits below the release rather than above it.
+    webfetchSrc: undefined,
+    agentState: '',
+    agentTool: '',
+    WEB_FETCH_TOOL: 'web_fetch',
   }) as () => void
   syncGif()
   assert.notEqual(gif.dataset.mode, undefined, 'syncGif fell through every branch without painting')
@@ -163,12 +183,19 @@ describe('the release face in syncGif', () => {
  * them — that is also what lets `dropStep` survive across two gestures in one harness, which is
  * the whole point of the step test below. The frame is supplied already resolved, so what is under
  * test is the one-shot bookkeeping rather than the read.
+ *
+ * `loops` is the flag `timedFrameOf` reads off the frame's own bytes, and it decides how the hold
+ * is scheduled: a clip that stops on its last frame can be parked there, one that restarts on its
+ * own cannot.
  */
-function dropHarness(holdMs: number): { modes: string[]; play: () => void; fire: () => void } {
+function dropHarness(
+  holdMs: number,
+  loops = false,
+): { modes: string[]; play: () => void; fire: () => void } {
   const gif = { dataset: {} as { mode?: string; src?: string } }
   const factory = new Function('deps', `
     const { gif, fetchDrop, ONE_SHOT_MIN_MS } = deps
-    let dropFrame = { src: deps.DROP, ms: deps.HOLD }
+    let dropFrame = { src: deps.DROP, ms: deps.HOLD, loops: deps.LOOPS }
     let dropShown
     let dropTimer
     let dropStep = 0
@@ -180,6 +207,7 @@ function dropHarness(holdMs: number): { modes: string[]; play: () => void; fire:
       }
       gif.dataset.mode = 'idle'
     }
+    ${pageFunction(shell, 'oneShotHoldMs')}
     ${pageFunction(shell, 'playDropFrame')}
     return { play: playDropFrame }
   `)
@@ -191,6 +219,7 @@ function dropHarness(holdMs: number): { modes: string[]; play: () => void; fire:
     ONE_SHOT_MIN_MS: 900,
     DROP,
     HOLD: holdMs,
+    LOOPS: loops,
   }) as { play: () => void }
   const timer = { cb: undefined as (() => void) | undefined }
 
@@ -246,7 +275,8 @@ describe('playing the release frame', () => {
 
   it('holds for at least the one-shot floor, however short the GIF claims to be', () => {
     // A mis-measured GIF reporting 40ms would otherwise flash for a single frame and look like
-    // nothing happened at all. The floor is the same one `click` and `wake` use.
+    // nothing happened at all. The floor is the same one `click` and `wake` use — and it applies
+    // to a clip that stops on its own, which can be parked on that last frame indefinitely.
     const played = dropHarness(40)
     let heldMs = 0
     const savedSet = globalThis.setTimeout
@@ -254,11 +284,12 @@ describe('playing the release frame', () => {
     try {
       const factory = new Function('deps', `
         const { gif, fetchDrop, ONE_SHOT_MIN_MS } = deps
-        let dropFrame = { src: deps.DROP, ms: deps.HOLD }
+        let dropFrame = { src: deps.DROP, ms: deps.HOLD, loops: false }
         let dropShown
         let dropTimer
         let dropStep = 0
         const syncGif = () => {}
+        ${pageFunction(shell, 'oneShotHoldMs')}
         ${pageFunction(shell, 'playDropFrame')}
         return playDropFrame
       `)
@@ -271,6 +302,38 @@ describe('playing the release frame', () => {
       globalThis.setTimeout = savedSet
     }
     assert.equal(heldMs, 900, 'a 40ms GIF was trusted over the one-shot floor')
+  })
+
+  it('gives a clip that restarts on its own one pass and no floor', () => {
+    // The floor exists so a short *cue* can be read. A clip that loops cannot be held that way:
+    // holding a 480ms bell for 900ms means watching it ring twice, and the hand-off would land
+    // somewhere inside the second pass rather than before the first restart.
+    const played = dropHarness(480, true)
+    let heldMs = 0
+    const savedSet = globalThis.setTimeout
+    globalThis.setTimeout = ((cb: () => void, ms: number) => { heldMs = ms; void cb; return 1 }) as never
+    try {
+      const factory = new Function('deps', `
+        const { gif, fetchDrop, ONE_SHOT_MIN_MS, ONE_SHOT_CUT_MS } = deps
+        let dropFrame = { src: deps.DROP, ms: deps.HOLD, loops: true }
+        let dropShown
+        let dropTimer
+        let dropStep = 0
+        const syncGif = () => {}
+        ${pageFunction(shell, 'oneShotHoldMs')}
+        ${pageFunction(shell, 'playDropFrame')}
+        return playDropFrame
+      `)
+      const gif = { dataset: {} as { mode?: string } }
+      const play = factory({
+        gif, fetchDrop: async () => null, ONE_SHOT_MIN_MS: 900, ONE_SHOT_CUT_MS: 70, DROP, HOLD: 480,
+      }) as () => void
+      play()
+    } finally {
+      globalThis.setTimeout = savedSet
+    }
+    assert.equal(heldMs, 408, 'a looping clip was held past its own pass')
+    assert.ok(heldMs < 480, 'the hold landed on the restart the clip makes at its own length')
   })
 })
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import pathlib
 import random
 import sys
@@ -39,6 +40,33 @@ from wake_features import OrbFeatures, pcm16_from_wav  # noqa: E402
 MODEL = pathlib.Path(r"C:\Users\digua\wakeword\data\features\dafeiyu.onnx")
 FILLER_DIR = pathlib.Path(r"C:\Users\digua\wakeword\data\negatives")
 
+# The orb's own settings, so this probe can say whether the file it just measured is the file the orb
+# is loading. It did not, and the gap is not hypothetical: the model `wake_train.py` exported was left
+# in the output directory while `orb-wake.json` went on pointing at an older one, so a whole round of
+# phrase work was verified against a file nobody was running. Nothing failed — that is the problem
+# with a measurement that never asks where the model came from.
+SETTINGS = pathlib.Path.home() / ".dsh" / "profiles" / "desktop" / "orb-wake.json"
+
+
+def deployed_model() -> pathlib.Path | None:
+    try:
+        settings = json.loads(SETTINGS.read_text(encoding="utf8"))
+        return pathlib.Path(settings["assetDirectory"]) / f"{settings.get('keyword', '')}.onnx"
+    except Exception:
+        return None
+
+
+def digest(path: pathlib.Path) -> str:
+    """Content, not path. The deployed copy is meant to be a different *file*, and comparing locations
+    would go on warning about a deployment that is perfectly correct."""
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+# Preceding conversations each clip is scored behind. The training set now varies this dimension too
+# (`wake_dataset.WARM_VARIANTS`), so a probe that fixed it at one would be measuring something the
+# model was never asked to be robust to.
+WARM_TRIES = 3
+
 # Split by *why* they are hard, so the result can be read rather than just counted. A phrase's tone
 # pattern is written out because that is the whole argument for whether a miss here is acceptable.
 TONE_ONLY = [
@@ -53,8 +81,34 @@ DIFFERENT_SOUNDS = [
     ("带鱼", "dài yú — two syllables, different first syllable"),
     ("打飞机", "dǎ fēi jī — different second and third syllables"),
 ]
+# The phrase said **once**. This is the group the whole change exists for: the previous model was
+# trained on the single word, so it fired on every one of these by construction. If the new model
+# still does, nothing has been fixed, whatever the aggregate numbers say.
+SINGLE_WORD_NOTES = {
+    "大肥鱼": "said once, alone — the commonest accidental trigger",
+    "喂，大肥鱼": "said once, with a prefix",
+}
+SINGLE_WORD = [(phrase, SINGLE_WORD_NOTES.get(phrase, "said once, inside a sentence"))
+               for phrase in wake_phrases.DOUBLED_MISREADS]
+
+# The rest of the single-word family — the interjections, the unpunctuated readings, the trailing
+# particles, the ones buried in a sentence. Reported as one group rather than line by line because the
+# question it answers is "does the rule hold across the family", which is the question training was
+# changed to answer; which individual phrasing is worst is `wake_candidate_probe.py`'s job.
+SHAPES = [(phrase, "") for phrase in wake_phrases.SINGLE_WORD_SHAPES]
+
 ADVERSARIAL_REST = [phrase for phrase in wake_phrases.ADVERSARIAL
-                    if phrase not in {text for text, _ in TONE_ONLY + DIFFERENT_SOUNDS}]
+                    if phrase not in {text for text, _ in TONE_ONLY + DIFFERENT_SOUNDS}
+                    and phrase not in set(wake_phrases.DOUBLED_MISREADS)
+                    and phrase not in set(wake_phrases.SINGLE_WORD_SHAPES)
+                    and phrase not in set(wake_phrases.TRUNCATED_DOUBLES)]
+
+# Truncations of the doubled phrase itself — a syllable missing from one half or from both. Its own
+# group, because the two groups above attack the phrase said **once** and a truncation is still said
+# twice. Added after the user reported 大肥大肥 and 大肥鱼大肥 both waking the orb, when neither group
+# covered them: `wake_phrases.TRUNCATED_DOUBLES` carries the measurement that came first.
+TRUNCATED = [(phrase, "a syllable missing from the doubled phrase")
+             for phrase in wake_phrases.TRUNCATED_DOUBLES]
 
 
 async def record(voices: list[str]):
@@ -67,9 +121,12 @@ async def record(voices: list[str]):
                 clips.append((voice, text, await link.say(voice, text)))
             for text in ADVERSARIAL_REST:
                 clips.append((voice, text, await link.say(voice, text)))
-            # A true positive in every voice, so a low score on the negatives can be told apart from
-            # a model that simply does not work on this voice.
-            clips.append((voice, "大肥鱼", await link.say(voice, "大肥鱼")))
+            for text, _ in SINGLE_WORD + SHAPES + TRUNCATED:
+                clips.append((voice, text, await link.say(voice, text)))
+            # The true positives, in every carrier and every voice, so a low score on the negatives
+            # can be told apart from a model that simply does not work on this voice.
+            for text in wake_phrases.POSITIVE_CARRIERS:
+                clips.append((voice, text, await link.say(voice, text)))
     finally:
         await link.close()
     return clips
@@ -87,6 +144,16 @@ def main() -> int:
     voices = wake_tts.VOICES[:args.voices]
     print(f"  voices: {', '.join(voices)}")
     print(f"  threshold: {args.threshold}")
+    print(f"  model: {MODEL}")
+    live = deployed_model()
+    if live is None:
+        print("  deployed: unknown — the orb's settings could not be read")
+    elif live.exists() and digest(live) == digest(MODEL):
+        print("  deployed: the same bytes — the orb is loading what is being measured")
+    else:
+        print(f"  deployed: {live}")
+        print("  *** that is a DIFFERENT model — the numbers below describe a file nobody is running.")
+        print("      Copy the measured file into the asset directory before believing any of it. ***")
     print()
 
     clips = asyncio.run(record(voices))
@@ -100,15 +167,28 @@ def main() -> int:
     pool_audio = [pcm16_from_wav(path) for path in pool]
     warm_rng = random.Random(0)
 
-    def best_score(samples: np.ndarray) -> float:
-        windows = warm_windows(extractor, samples, pool_audio, warm_rng,
-                               np.random.default_rng(len(samples)))
-        if windows.shape[0] == 0:
-            return 0.0
-        return float(max(session.run(None, {feed: window[None, :, :]})[0].ravel()[0]
-                         for window in windows))
+    def best_score(samples: np.ndarray) -> tuple[float, float]:
+        """Worst case and best case over several preceding conversations.
 
-    scores: dict[str, list[float]] = {}
+        One warm-up is not a measurement here. The same phrase in the same voice was scored at 0.001
+        behind one filler slice and at 0.999 behind another (`_rate_probe.py`), and in deployment the
+        context is whatever happened to be said at the time — so the number that matters is the
+        highest score across contexts, and the low is carried beside it to show how wide the spread
+        is. A phrase whose spread straddles the threshold is not "almost classified"; it is
+        unclassified, and averaging it away would hide exactly the defect this probe exists to find.
+        """
+        peaks: list[float] = []
+        for _ in range(WARM_TRIES):
+            windows = warm_windows(extractor, samples, pool_audio, warm_rng,
+                                   np.random.default_rng(len(samples)))
+            if windows.shape[0] == 0:
+                peaks.append(0.0)
+                continue
+            peaks.append(float(max(session.run(None, {feed: window[None, :, :]})[0].ravel()[0]
+                                    for window in windows)))
+        return max(peaks), min(peaks)
+
+    scores: dict[str, list[tuple[float, float]]] = {}
     for voice, text, samples in clips:
         scores.setdefault(text, []).append(best_score(samples))
 
@@ -119,11 +199,13 @@ def main() -> int:
             values = scores.get(text, [])
             if not values:
                 continue
-            peak = max(values)
-            hits = sum(1 for value in values if value >= args.threshold)
+            peak = max(high for high, _ in values)
+            low = min(low for _, low in values)
+            hits = sum(1 for high, _ in values if high >= args.threshold)
             fired += hits
             verdict = "FIRES" if hits else "quiet"
-            print(f"    {text:6} {note:52} peak {peak:6.3f}  {hits}/{len(values)} {verdict}")
+            print(f"    {text:6} {note:42} peak {peak:6.3f}  low {low:6.3f}  "
+                  f"{hits}/{len(values)} {verdict}")
         print(f"    -> {fired} clip(s) at or above {args.threshold} across {len(entries)*len(voices)}")
         print()
         return fired, len(entries) * len(voices)
@@ -134,28 +216,57 @@ def main() -> int:
                                             DIFFERENT_SOUNDS)
     rest_fired, rest_total = report("the rest of the adversarial list",
                                     [(text, "") for text in ADVERSARIAL_REST])
+    once_fired, once_total = report("THE PHRASE SAID ONCE (what this model must not hear)",
+                                    SINGLE_WORD)
+    shapes_fired, shapes_total = report("THE SINGLE-WORD FAMILY (interjections, particles, buried)",
+                                        SHAPES)
+    trunc_fired, trunc_total = report("TRUNCATIONS OF THE DOUBLED PHRASE (a syllable missing)",
+                                      TRUNCATED)
 
-    control = scores.get("大肥鱼", [])
-    print("  == true positives (the wake word itself) ==")
-    print(f"    大肥鱼 peak {max(control):.3f}  "
-          f"{sum(1 for value in control if value >= args.threshold)}/{len(control)} fire")
+    per_carrier = {carrier: scores.get(carrier, []) for carrier in wake_phrases.POSITIVE_CARRIERS}
+    control = [high for values in per_carrier.values() for high, _ in values]
+    silent = [carrier for carrier, values in per_carrier.items()
+              if not values or max(high for high, _ in values) < args.threshold]
+    print("  == true positives (the phrase said twice) ==")
+    for carrier, values in per_carrier.items():
+        if not values:
+            continue
+        print(f"    {carrier:16} peak {max(high for high, _ in values):6.3f}  "
+              f"low {min(low for _, low in values):6.3f}  "
+              f"{sum(1 for high, _ in values if high >= args.threshold)}/{len(values)} fire")
     print()
 
     print("  ---- summary ----")
-    print(f"    wake word            {sum(1 for v in control if v >= args.threshold)}/{len(control)}")
-    print(f"    tone-only neighbours {tone_fired}/{tone_total}")
-    print(f"    different sounds     {distinct_fired}/{distinct_total}")
-    print(f"    other adversarial    {rest_fired}/{rest_total}")
+    print(f"    phrase x2   must fire    {sum(1 for v in control if v >= args.threshold)}/{len(control)}")
+    print(f"    phrase x1   must not     {once_fired}/{once_total}")
+    print(f"    x1 family   must not     {shapes_fired}/{shapes_total}")
+    print(f"    truncations must not     {trunc_fired}/{trunc_total}")
+    print(f"    tone-only neighbours     {tone_fired}/{tone_total}")
+    print(f"    different sounds         {distinct_fired}/{distinct_total}")
+    print(f"    other adversarial        {rest_fired}/{rest_total}")
     print()
-    if distinct_fired == 0 and control and min(control) >= args.threshold:
-        print("  The confusions are confined to tone-only pairs, which is the closest this")
-        print("  architecture can be expected to get. Ship it and test with a real voice.")
-    elif distinct_fired:
-        print("  Real defects above: phrases that do not sound like the wake word are firing. More")
-        print("  negatives drawn from those exact sounds is the fix; raise the threshold meanwhile.")
+    if not control:
+        print("  No true positives were scored at all — the probe is the problem, not the model.")
+    elif silent:
+        print(f"  Recall is incomplete: {silent} do not always reach {args.threshold}. A wake word that")
+        print("  misses is worse than one that hears too much, so fix this before reading the")
+        print("  negatives — either lower the threshold or retrain.")
+    elif once_fired == 0 and shapes_fired == 0 and trunc_fired == 0:
+        print("  Every reading of the phrase fires, and nothing that shares its syllables does — not in")
+        print(f"  any of the {len(SHAPES)} shapes the single-word family carries, and not in any of the")
+        print(f"  {len(TRUNCATED)} ways a syllable can go missing from the doubled phrase. That is the")
+        print("  rule, learned rather than memorised; what is left is real speech, which only the orb")
+        print("  can measure.")
     else:
-        print("  Check the true-positive control above first — a quiet control means the probe, not")
-        print("  the model, is the problem.")
+        print(f"  {once_fired} reading(s) of the phrase said once, {shapes_fired} of its family, and")
+        print(f"  {trunc_fired} truncation(s) of the doubled phrase still fire — exactly the accidental")
+        print("  trigger the change was meant to remove. Note")
+        print("  that raising the threshold cannot fix a family member whose run is long: measure the")
+        print("  run first (`wake_candidate_probe.py`), because a long one means the model is wrong,")
+        print("  not the rule.")
+    print()
+    print("  Read the tone-only line last: firing there is a limit of a non-tonal embedding model,")
+    print("  not a defect in this phrase.")
     return 0
 
 

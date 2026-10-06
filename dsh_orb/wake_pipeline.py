@@ -3,7 +3,7 @@
 There are six steps and they have to happen in order, each depending on the last one's artefacts:
 
     1. synth     Edge TTS -> data/positives, data/negatives        (~4 min)
-    2. features  audio -> (16, 96) windows in the renderer's format (~13 min)
+    2. features  audio -> (28, 96) windows in the renderer's format (~13 min)
     3. train     features -> dafeiyu.onnx + dafeiyu.pt             (~3 min)
     4. eval      held-out thresholds, false-alarm rate             (~2 min)
     5. probe     which near-miss phrases fire, by name              (~1 min)
@@ -51,10 +51,12 @@ KEYWORD = "dafeiyu"
 #
 # The owner asked for silence over recall on 2026-10-04, so the rule is the same one `wake_eval.py`
 # applies when it reports a `chosen` threshold: take the highest threshold whose held-out recall
-# stays at or above 97%. On the model trained that day that rule landed on 0.95, and the honest way
-# to keep this number current is to read it back out of the eval report rather than to keep editing
-# it here after every training run — `wake_eval.py` writes `chosen.threshold` into
-# `features/dafeiyu-eval.json`.
+# stays at or above 97%.
+#
+# The number below is a default, not the answer. The wake word is now the phrase said twice, and the
+# threshold that suits it is a property of the model that comes out of training — so the honest way to
+# set it is to read `chosen.threshold` back out of `features/dafeiyu-eval.json`, which `wake_eval.py`
+# writes, and pass it to the install stage. Editing this constant by hand is how it goes stale.
 THRESHOLD = 0.95
 
 STAGES = ["synth", "features", "train", "eval", "probe", "install"]
@@ -134,7 +136,10 @@ def main() -> int:
     parser.add_argument("--to", dest="last", choices=STAGES, default="probe",
                         help="last stage to run (default: probe; 'install' must be asked for)")
     parser.add_argument("--only", choices=STAGES, help="run exactly one stage")
-    parser.add_argument("--epochs", type=int, default=40)
+    # 60 rather than 40: the task is now to tell a phrase said twice from the same phrase said once,
+    # which is a finer distinction than "is this word present", and the earlier single-word model only
+    # settled after 60. The cost is seconds and the difference shows up as recall, so err long.
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--threshold", type=float, default=THRESHOLD)
     parser.add_argument("--yes", action="store_true",
                         help="actually perform the install stage; it stops and restarts DSH")

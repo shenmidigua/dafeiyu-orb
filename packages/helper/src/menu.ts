@@ -11,6 +11,8 @@ export interface ContextMenuState {
   readonly wakeEnabled: boolean
   /** False when no `dsh-voice-dialog` asset directory was found, so the row is disabled. */
   readonly wakeAvailable: boolean
+  /** The configured wake word as a person says it, so the row names what will actually fire. */
+  readonly wakeWord: string
   /** Whether one utterance can be recorded and transcribed right now. */
   readonly dictationReady: boolean
   readonly openMain: boolean
@@ -33,7 +35,7 @@ export function contextMenuTemplate(state: ContextMenuState, zh: boolean, action
   const labels = {
     empty: zh ? '没有可用的模型。' : 'No models available.',
     defaultEffort: zh ? '默认' : 'Default',
-    wake: zh ? '语音唤醒（Hey Jarvis）' : 'Voice wake word (Hey Jarvis)',
+    wake: zh ? `语音唤醒（${state.wakeWord}）` : `Voice wake word (${state.wakeWord})`,
     wakeMissing: zh ? '语音唤醒（未找到本地模型）' : 'Voice wake word (no local models)',
     dictate: zh ? '语音输入（现在说一句）' : 'Voice input (speak one sentence)',
     dictateMissing: zh ? '语音输入（需先开启语音唤醒）' : 'Voice input (turn the wake word on first)',

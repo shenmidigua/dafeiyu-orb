@@ -49,6 +49,37 @@ function assertLevel(actual: number, expected: number) {
   assert.ok(Math.abs(actual - expected) < 1e-6, `${actual} is not ${expected}`)
 }
 
+describe('the classifier ring', () => {
+  it('is as long as the installed model reads, and 大肥鱼 needs more than 16', () => {
+    // The ring is the leading dimension of the [1, slots, 96] tensor handed to the classifier, so
+    // this number is part of the model's interface: train it at 28 and run it at 16 and the runtime
+    // throws. Pinned per keyword because the two shipped classifiers disagree, and a change to
+    // `wake_features.WINDOW_FRAMES` has to come through here.
+    const jarvis = engine()
+    assert.equal(jarvis.ringSlots(), 16, 'the shipped openWakeWord classifiers read 16 slots')
+
+    const orb = engine()
+    orb.configure({ keyword: 'dafeiyu' } as never)
+    assert.equal(orb.ringSlots(), 28,
+      'the doubled 大肥鱼 does not fit 16 slots — 大肥鱼大肥鱼 measures up to 19.4')
+    orb.reset()
+    assert.equal(orb.embeddingHistory.length, 28)
+    assert.ok(orb.embeddingHistory.every((row) => row.length === 96),
+      'every slot is one 96-wide embedding')
+  })
+
+  it('leaves the ring long enough to hold the wake word after a mute', async () => {
+    const wake = engine()
+    wake.configure({ keyword: 'dafeiyu' } as never)
+    wake.reset()
+    wake.embeddingHistory.forEach((row, index) => { row.fill(index + 1) })
+    wake.mute()
+    assert.equal(wake.embeddingHistory.length, 28, 'muting must not shorten the ring')
+    assert.ok(wake.embeddingHistory.every((row) => row.every((value) => value === 0)),
+      'the ring is silent, not short')
+  })
+})
+
 describe('wake level history', () => {
   it('starts as a full window of silence', () => {
     const wake = engine()
@@ -114,7 +145,8 @@ describe('wake scoring buffers', () => {
     wake.finishDictation({ announce: false })
     assert.equal(await utterance, undefined)
     assert.deepEqual(wake.melBuffer, [])
-    assert.equal(wake.embeddingHistory.length, 16, 'the ring is rebuilt at its full length')
+    assert.equal(wake.embeddingHistory.length, wake.ringSlots(),
+      'the ring is rebuilt at its full length')
     for (const embedding of wake.embeddingHistory) {
       assert.ok(embedding.every((value) => value === 0), 'no embedding of the wake word survives')
     }

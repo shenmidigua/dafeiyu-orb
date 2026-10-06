@@ -36,6 +36,9 @@ export const WAKE_MODELS: Readonly<Record<string, string>> = Object.freeze({
 /** Keyword the shipped assets carry. */
 export const WAKE_DEFAULT_KEYWORD = 'hey_jarvis'
 
+// The spoken name of a keyword lives in `wake-names.ts`, next to no imports, so that it can be tested
+// without loading `electron`. Import it from there rather than from this module.
+
 /**
  * Model file for one keyword.
  *

@@ -73,17 +73,22 @@ describe('the wake word while the ball is speaking', () => {
   })
 
   it('drops the mel buffer on mute, so pre-mute audio cannot fire a late detection', async () => {
-    // The classifier scores a 16-frame window, and `reset()` is what clears it. Without the reset
-    // the frames recorded before the mute are still in the ring when playback ends, which is the
-    // tail of a reply the model is then asked about as if it were live speech.
+    // The classifier scores a whole ring, sized per keyword - 28 slots for 大肥鱼, 16 for the shipped
+    // `hey_jarvis` - and `reset()` is what clears it. Without the reset the frames recorded before
+    // the mute are still in the ring when playback ends, which is the tail of a reply the model is
+    // then asked about as if it were live speech.
     //
     // The buffers are seeded directly rather than accumulated through `runModels`, because that
     // method needs a loaded ONNX runtime and this is the one test that only cares about what
     // `mute()` clears. Note the asymmetry the real `reset()` has: the mel queue is emptied while
-    // the embedding ring is refilled with zeros, so the ring is never short — it is silent.
+    // the embedding ring is refilled in full, so the ring is never short - it holds a quiet room.
+    // This engine has no models loaded, so there is nothing to compute that from and the refill
+    // falls back to zeros; `wake-ring.test.ts` is where the quiet room itself is asserted.
     const { wake } = engine()
     wake.melBuffer.push(new Float32Array(32).fill(1))
-    for (let i = 0; i < 16; i += 1) wake.embeddingHistory[i] = new Float32Array(96).fill(1)
+    for (let i = 0; i < wake.embeddingHistory.length; i += 1) {
+      wake.embeddingHistory[i] = new Float32Array(96).fill(1)
+    }
 
     wake.mute()
     assert.equal(wake.melBuffer.length, 0, 'the mel queue survived the mute')
