@@ -175,7 +175,12 @@ async function ensure(dir) {
   if (made.has(dir)) return made.get(dir);
   const children = [...dirs.get(dir).values()];
   for (const c of children) if (c.type === 'tree') c.sha = await ensure(dir ? `${dir}/${c.path}` : c.path);
-  for (let round = 0; round < 40; round++) {
+  // A tree answers 422 naming exactly ONE unresolvable sha, so a directory with N new files needs
+  // at least N rounds — and a first publish of dsh_orb/ had more new files than the old fixed
+  // budget of 40, which failed the whole run after uploading most of them. The bound is derived
+  // from the child count with room for the blobs the children's own subtrees still need to report.
+  const rounds = 40 + children.length * 2;
+  for (let round = 0; round < rounds; round++) {
     const r = await api('/git/trees', { method: 'POST', body: JSON.stringify({ tree: children }) });
     if (r.status === 201) { made.set(dir, r.json.sha); return r.json.sha; }
     const body = JSON.stringify(r.json);
@@ -190,7 +195,20 @@ async function ensure(dir) {
       return sha;
     }
     const m = MISSING_RE.exec(body);
-    if (!m) { console.error('tree failed:', dir || '<root>', r.status, body.slice(0, 400)); process.exit(1); }
+    if (!m) {
+      // A 5xx or a timeout is GitHub failing to rebuild the subtree, not a bad request: the same
+      // body succeeds on a later attempt often enough to be worth waiting out. Only a 4xx that is
+      // not the missing-sha 422 means the request itself is wrong.
+      const transient = r.status >= 500 || r.status === 429 || /timed out|try again/i.test(body);
+      if (transient && round < rounds - 1) {
+        const wait = Math.min(2000 + round * 500, 15000);
+        console.log(`  ${dir || '<root>'}: ${r.status} on tree, retrying in ${wait}ms`);
+        await sleep(wait);
+        continue;
+      }
+      console.error('tree failed:', dir || '<root>', r.status, body.slice(0, 400));
+      process.exit(1);
+    }
     console.log(`  missing blob ${m[1].slice(0, 10)}  ${bySha.get(m[1])?.path ?? '(unknown)'}`);
     if (!(await uploadBlob(m[1]))) { console.error('upload failed', m[1]); process.exit(1); }
   }
