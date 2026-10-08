@@ -63,6 +63,14 @@ interface GifInputs {
   wakeShown?: { src: string; step: number }
   doneShown?: { src: string; step: number }
   idleSrc?: string
+  /**
+   * Whether the carry being walked was pulled out of the dock, which is the one carry with no face.
+   *
+   * It exists so the two carries can be told apart at the release: a ball press wears the drag face,
+   * a dock pull does not, and the case below has to be able to name both. Left `false` it is the
+   * ordinary ball carry, which is what every other case here is about.
+   */
+  carriedFromDock?: boolean
 }
 
 /**
@@ -75,12 +83,12 @@ interface GifInputs {
 function modeFor(inputs: GifInputs): string {
   const gif = { dataset: {} as { mode?: string; src?: string } }
   const factory = new Function('deps', `
-    const { document, pageClosed, syncSleep, dragging, dragSrc, dropShown, clickShown, arriveShown,
-            wakeShown, doneShown, typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive,
+    const { document, pageClosed, syncSleep, dragging, dragSrc, dropShown, dockArriveShown, clickShown, arriveShown,
+            wakeShown, doneShown, failShown, askShown, typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive,
             voiceSrc, dictationPhase, idleSrc, hoverSrc, introTimer, napShown, skitInfo, running,
             asking, tccGateVisible, attachedSelection, expanded, avatarSrc, freezeGif, Date,
-            sleepFrameAt, skitFrame, hoverIntroSrc, introUntil, hovering, webfetchSrc, agentState,
-            agentTool, WEB_FETCH_TOOL, brokeNow, dragIntroSrc, dragIntroUntil } = deps
+            sleepFrameAt, skitFrame, hoverIntroSrc, introUntil, hovering, agentState,
+            agentTool, brokeNow, dragIntroSrc, dragIntroUntil, carriedFromDock, docked } = deps
     ${pageFunction(shell, 'syncGif')}
     return syncGif
   `)
@@ -99,7 +107,17 @@ function modeFor(inputs: GifInputs): string {
     // to still be the thing on screen — so no pickup is in flight and `dragSrc` decides.
     dragIntroSrc: undefined,
     dragIntroUntil: 0,
+    // The two carries this file has to keep apart. A press on the ball is the one that wears a face
+    // of its own, and it is the default here; a pull out of the dock is the one that does not, and
+    // the release is what it wears instead. See {@link GifInputs.carriedFromDock}.
+    carriedFromDock: inputs.carriedFromDock ?? false,
     dropShown: inputs.dropShown,
+    // The docked arrival is disarmed here the way it is at rest: nothing is docked in a case that is
+    // about another face, so the branch above every one of them has to be reachable and inert.
+    dockArriveShown: undefined,
+    // And nothing is docked, which is what lets the resting loop be reached at all: a docked ball
+    // wears the strip's faces, never the idle loop.
+    docked: undefined,
     clickShown: inputs.clickShown,
     // Named because a branch above the release now reads it, and disarmed because no greeting is
     // in progress in these cases. Leaving it out is a `ReferenceError` in the harness, not a
@@ -107,6 +125,13 @@ function modeFor(inputs: GifInputs): string {
     arriveShown: undefined,
     wakeShown: inputs.wakeShown,
     doneShown: inputs.doneShown,
+    // Same rule again: the failure face is read above the finished-task frame this walk is about, so
+    // it is named here and disarmed — no run is ending in these cases.
+    failShown: undefined,
+    // Named because the question face sits above the release's neighbours and this harness would
+    // die with "askShown is not defined" instead of reporting which mode won. Disarmed: no agent
+    // is waiting on an answer in these cases.
+    askShown: undefined,
     typingSrc: undefined,
     replySrc: undefined,
     toolSrc: undefined,
@@ -135,10 +160,8 @@ function modeFor(inputs: GifInputs): string {
     Date,
     // No tool is running in any of these cases, so the fetch face stays disarmed — which is also
     // what shows it sits below the release rather than above it.
-    webfetchSrc: undefined,
     agentState: '',
     agentTool: '',
-    WEB_FETCH_TOOL: 'web_fetch',
   }) as () => void
   syncGif()
   assert.notEqual(gif.dataset.mode, undefined, 'syncGif fell through every branch without painting')
@@ -170,8 +193,27 @@ describe('the release face in syncGif', () => {
     assert.equal(modeFor({ dragging: true, dragSrc: DRAG, dropShown: { src: DROP, step: 1 } }), 'drag')
   })
 
+  it('keeps wearing the drop for a carry that has no face of its own', () => {
+    // The same collision, on the one carry that does not outrank the drop: a ball pulled out of the
+    // dock. There is nothing for it to wear — see `carriedFromDock` in the page — so the branch above
+    // this one is skipped and the drop is what shows. Without that, the pull-out would fall through
+    // to the resting loop the instant it left the strip, which is the "the ball arrives idle and only
+    // animates when I let go" reading this whole change exists to remove.
+    assert.equal(
+      modeFor({ dragging: true, dragSrc: DRAG, carriedFromDock: true, dropShown: { src: DROP, step: 1 } }),
+      'drop-1',
+    )
+  })
+
   it('goes back to the resting loop once the release is over', () => {
     assert.equal(modeFor({ dropShown: undefined }), 'idle')
+  })
+
+  it('goes back to the resting loop once a faceless carry outlives its drop', () => {
+    // And the flip side of the case above: the drop is a one-shot with a hold, not a new resting
+    // state. Once it expires a carry with no face of its own is simply an empty ball, which is the
+    // face it wears for the rest of the carry — there is nothing else to put there.
+    assert.equal(modeFor({ dragging: true, dragSrc: DRAG, carriedFromDock: true }), 'idle')
   })
 })
 

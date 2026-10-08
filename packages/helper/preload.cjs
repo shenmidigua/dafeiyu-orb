@@ -11,6 +11,31 @@ contextBridge.exposeInMainWorld('dshOrb', {
     return ipcRenderer.invoke('orb:unsnap')
   },
   /**
+   * Pull the ball back out of the dock as a leg of the drag rather than as a finished gesture.
+   *
+   * Same landing point as {@link unsnap}, but the main process *animates* the ball out instead of
+   * snapping it to the slot, and abandons that animation the instant a move arrives. The page calls
+   * this at the hand-off because the pull is still in progress: the ball should be seen travelling
+   * out from the edge, not appearing at the cursor.
+   */
+  unsnapSmooth() {
+    return ipcRenderer.invoke('orb:unsnap-smooth')
+  },
+  /**
+   * Show the docked ball half out of its own edge, and put it back, for the strip's hover.
+   *
+   * Deliberately not {@link unsnapSmooth}: that one *gives up the dock*, which is the user taking
+   * the ball back. This is the ball showing itself to a pointer that only rested on the strip, so
+   * the dock has to survive it — the strip is still what the user drags to get the ball out, and it
+   * has to still be there afterwards.
+   */
+  peekDock() {
+    return ipcRenderer.invoke('orb:dock-peek')
+  },
+  unpeekDock() {
+    return ipcRenderer.invoke('orb:dock-unpeek')
+  },
+  /**
    * Report the screen rectangles that should capture the mouse, so the main process can keep the
    * window click-through everywhere else. A `send`, not an `invoke`: it rides along with layout
    * changes and there is no reply worth waiting for.
@@ -133,8 +158,14 @@ contextBridge.exposeInMainWorld('dshOrb', {
   memeTool() {
     return ipcRenderer.invoke('orb:meme-tool')
   },
-  memeWebfetch() {
-    return ipcRenderer.invoke('orb:meme-webfetch')
+  /**
+   * The face for one named tool, or `null` when the pack draws that call the same as every other.
+   *
+   * The name is the one in the transcript's tool card — `pwsh`, `edit`, `read` — because that is the only
+   * thing either side knows a call by. `null` is the ordinary answer and means "wear the shared tool face".
+   */
+  memeToolNamed(name) {
+    return ipcRenderer.invoke('orb:meme-tool-named', name)
   },
   memeSleep() {
     return ipcRenderer.invoke('orb:meme-sleep')
@@ -154,11 +185,36 @@ contextBridge.exposeInMainWorld('dshOrb', {
   memeArrive() {
     return ipcRenderer.invoke('orb:meme-arrive')
   },
+  memeDockArrive() {
+    return ipcRenderer.invoke('orb:meme-dock-arrive')
+  },
   memePoor() {
     return ipcRenderer.invoke('orb:meme-poor')
   },
   memeDone() {
     return ipcRenderer.invoke('orb:meme-done')
+  },
+  /** The acknowledgement face, shown once when the user has just sent the agent something. */
+  memeNod() {
+    return ipcRenderer.invoke('orb:meme-nod')
+  },
+  /** The interrupted face, shown once when a run ends that way. */
+  memeInterrupted() {
+    return ipcRenderer.invoke('orb:meme-interrupted')
+  },
+  /** The approval face, shown once when a run ends that way. */
+  memeApproval() {
+    return ipcRenderer.invoke('orb:meme-approval')
+  },
+  /** The maxtokens face, shown once when a run ends that way. */
+  memeMaxtokens() {
+    return ipcRenderer.invoke('orb:meme-maxtokens')
+  },
+  memeFail() {
+    return ipcRenderer.invoke('orb:meme-fail')
+  },
+  memeAsk() {
+    return ipcRenderer.invoke('orb:meme-ask')
   },
   memeWake() {
     return ipcRenderer.invoke('orb:meme-wake')
@@ -186,6 +242,24 @@ contextBridge.exposeInMainWorld('dshOrb', {
   },
   onTurn(callback) {
     ipcRenderer.on('orb:turn', (_event, turn) => callback(turn))
+  },
+  /**
+   * News about a turn in a conversation that is not this ball's own.
+   *
+   * A channel of its own rather than a `turn` message, because the two mean different things on this page:
+   * `orb:turn` moves the turn state and rings the bell when a turn ends well, while this only says that
+   * something is happening in the chat the user is looking at — and must leave this page's own turn, and its
+   * transcript, exactly as they were.
+   *
+   * The payload is `{ outcome, sessionId?, tool? }`. `outcome` is `'typing'`, `'thinking'` or `'tool'` while
+   * that conversation is doing it, and `'streamed'` once the attempt writing it has ended — so the face comes off
+   * with the words rather than with the grace window that is only there as a fallback. `tool` rides along with
+   * `'tool'` and names the tool being called, which is the only way a pack that draws a face per tool can be
+   * obeyed from the window the user is typing in: the ball's own transcript is not that conversation, so this
+   * page has no tool card to read the name from.
+   */
+  onSessionTurn(callback) {
+    ipcRenderer.on('orb:session-turn', (_event, payload) => callback(payload))
   },
   onStatus(callback) {
     ipcRenderer.on('orb:status', (_event, text) => callback(text))

@@ -42,10 +42,11 @@ export const PANEL_WINDOW_SIZE = {
 export const BELOW_CENTER = 0.08
 /**
  * How far the ball has to hang past a display edge before a release docks it.
- * Half the ball: a fifth (the old value) docked on ordinary drags near the edge, which
- * looks exactly like "the ball did not stay where I let go of it".
+ * A third of the ball. It used to be a half, which made docking feel out of reach; a fifth
+ * (the oldest value) docked on ordinary drags near the edge, which looks exactly like
+ * "the ball did not stay where I let go of it".
  */
-export const DOCK_OVERLAP = Math.round(BALL_SIZE / 2)
+export const DOCK_OVERLAP = Math.round(BALL_SIZE / 3)
 export const DOCK_DRAG_OFF = Math.round(BALL_SIZE / 3)
 export const DOCK_TAB_WIDTH = 6
 export const DOCK_GLOW = 8
@@ -56,6 +57,16 @@ export const DOCK_OFF_GAP = 2
 export const DOCK_IN_PAD = 5
 export const DOCK_SLIDE_OFF_MS = 250
 export const DOCK_SLIDE_IN_MS = 300
+/**
+ * How long the ball takes to slide back out of the dock, in the pull's own gesture.
+ *
+ * The same 300ms as {@link DOCK_SLIDE_IN_MS}, and the same `easeOutCubic`: docking in and pulling
+ * out are the same journey in opposite directions, and a pull that took a different time read as a
+ * different mechanism. What differs is only who is driving — this one is abandoned the instant the
+ * hand moves again, so its length is a floor on how long the ball travels rather than a delay the
+ * user has to sit through.
+ */
+export const DOCK_SLIDE_OUT_MS = 300
 
 export interface Rect {
   x: number
@@ -125,7 +136,7 @@ function restingWindowBounds(ball: { readonly x: number; readonly y: number }): 
 }
 
 /**
- * Which outer display edge the ball already overlaps by about one fifth of its width.
+ * Which outer display edge the ball already overlaps by about a third of its width.
  * An edge that touches another display is a seam, not a place to dock.
  */
 export function dockSideForBallOrigin(
@@ -286,6 +297,26 @@ function insideBallOrigin(
   }
 }
 
+/**
+ * Where a peeked ball stands: exactly half of it still past the edge it is docked to.
+ *
+ * Deliberately not {@link insideBallOrigin}, which is the same position with the ball wholly on
+ * screen. A peek is a hint that the strip has something behind it, and a whole ball arriving to say
+ * so is an offer rather than a hint — the hand is resting on a 6px bar, not reaching for anything.
+ * Half a ball reads as "there is more of this behind the edge", which is what the hover is for.
+ *
+ * The row is `clampBallY`'s, the same one `dockedTabBounds` clamps to, so the ball comes out level
+ * with the strip it came from — including on a dock a hair's width from the taskbar, where the
+ * display's own bounds and the work area disagree.
+ */
+function peekBallOrigin(side: DockSide, ballY: number, bounds: Rect): { x: number; y: number } {
+  const half = Math.round(BALL_SIZE / 2)
+  return {
+    x: side === 'left' ? bounds.x - half : bounds.x + bounds.width - half,
+    y: clampBallY(ballY, bounds),
+  }
+}
+
 function staysDocked(side: DockSide, cursorX: number, bounds: Rect): boolean {
   if (side === 'right') return cursorX >= bounds.x + bounds.width - DOCK_DRAG_OFF
   return cursorX <= bounds.x + DOCK_DRAG_OFF
@@ -325,6 +356,19 @@ export function initialWindowBounds(workArea: Rect): Rect {
 export class FloatingPlacement {
   private direction: Direction = { horizontal: 'left', vertical: 'up' }
   private docked: { side: DockSide; y: number } | undefined
+  /**
+   * Whether the docked ball is currently showing itself at the edge, put there by a hover on the
+   * strip rather than by a hand.
+   *
+   * A flag of its own rather than "docked, with the window somewhere else", because the pull out of
+   * the dock has to be able to tell the difference. {@link unsnap} and {@link unsnapSmooth} both
+   * begin by parking the window off the edge and sliding it in; a ball that a hover has already
+   * brought half way out would jump backwards off the screen and slide in from nowhere, which is
+   * the one motion the peek exists *not* to have. So they ask this and start from where the peek
+   * left the ball instead. {@link applyTab} is the way back to the strip, and it clears this on the
+   * way.
+   */
+  private peeking = false
   private anim = 0
   /**
    * Whether the panel card is currently shown beside the ball.
@@ -373,6 +417,7 @@ export class FloatingPlacement {
     const display = this.displayAt(center(bounds))
     if (expanded) {
       this.docked = undefined
+      this.peeking = false
       this.expanded = true
       return { expanded: true, ...this.direction, docked: undefined }
     }
@@ -404,6 +449,9 @@ export class FloatingPlacement {
   move(x: number, y: number, canDock = true): DockState {
     const origin = { x: Math.round(x), y: Math.round(y) }
     this.origin = origin
+    // A hand placing the ball is not the strip showing it. Whatever a peek had on screen, the hand
+    // is now the thing deciding where the ball is, and the two states cannot both be true.
+    this.peeking = false
     const display = this.displayAt(origin)
     if (this.expanded) {
       this.window.setBounds(overlayBoundsFromBall(origin))
@@ -456,8 +504,15 @@ export class FloatingPlacement {
   async unsnap(): Promise<DockState> {
     if (!this.docked) return { docked: undefined }
     const display = this.displayAt(center(this.window.getBounds()))
-    const start = offScreenBallOrigin(this.docked.side, this.docked.y, display.bounds)
-    const end = insideBallOrigin(this.docked.side, this.docked.y, display)
+    const side = this.docked.side
+    // Out of a peek the ball is already half way out, so that is where the slide starts from —
+    // parking it off the edge first would be the one frame of the gesture where the ball is
+    // *further* out than the hover left it. See {@link peeking}.
+    const start = this.peeking
+      ? peekBallOrigin(side, this.docked.y, display.bounds)
+      : offScreenBallOrigin(side, this.docked.y, display.bounds)
+    const end = insideBallOrigin(side, this.docked.y, display)
+    this.peeking = false
     this.docked = undefined
     this.expanded = false
     this.origin = end
@@ -467,15 +522,97 @@ export class FloatingPlacement {
     return { docked: undefined }
   }
 
+  /**
+   * Slide the ball back on screen from the dock, the way {@link unsnap} does, but as a leg of the
+   * pull that is still going on rather than as a whole gesture of its own.
+   *
+   * Docking slides the ball *off* the edge over 250ms, and for a long time the way back out was the
+   * opposite of that in name only: the ball reappeared at the pointer, one frame, a whole ball's
+   * width clear of the edge it had just left. The motion the user had been shown going in was simply
+   * missing coming out, and the hand holding the strip never saw the ball travel — it was somewhere
+   * behind the edge, and then it was at the cursor.
+   *
+   * So this is `unsnap`'s animation with the pull's own ending. It is *abandoned* the moment the
+   * hand asks for anything: `this.origin` is overwritten by the very next {@link move}, and `move`
+   * also bumps `this.anim`, which is the counter {@link animate} checks before every frame. The ball
+   * therefore travels for as long as the hand is still — and the instant it is not, the next move
+   * takes the window over from wherever the slide had reached. No frame is waited on and no move is
+   * swallowed: a hand that yanks the strip sideways gets a ball that follows it immediately, and a
+   * hand that nudges the strip 25px and stops gets to watch the ball come the rest of the way out.
+   *
+   * The landing point is {@link insideBallOrigin}, the same slot {@link unsnap} uses and the same
+   * one the page computes for itself in `handDockDragToBall` — the two have to agree, since the page
+   * takes over the gesture on the next move and writes its own copy of the slot as the ball's
+   * position.
+   */
+  async unsnapSmooth(): Promise<DockState> {
+    if (!this.docked) return { docked: undefined }
+    const display = this.displayAt(center(this.window.getBounds()))
+    const side = this.docked.side
+    // The same start `unsnap` takes, and for the same reason: a pull that begins on a peeked ball
+    // continues the motion the hover started, out of the place the ball is already standing.
+    const start = this.peeking
+      ? peekBallOrigin(side, this.docked.y, display.bounds)
+      : offScreenBallOrigin(side, this.docked.y, display.bounds)
+    const end = insideBallOrigin(side, this.docked.y, display)
+    this.peeking = false
+    this.docked = undefined
+    this.expanded = false
+    this.origin = end
+    this.direction = expandDirection(end, display.workArea)
+    this.window.setBounds(overlayBoundsFromBall(start))
+    await this.animate(overlayBoundsFromBall(end), DOCK_SLIDE_OUT_MS, easeOutCubic)
+    return { docked: undefined }
+  }
+
+  /**
+   * Show the docked ball half out of the edge it is docked to, without giving up the dock.
+   *
+   * The strip is something the user *hovers*, and a hover is not a gesture. So the ball comes out
+   * to {@link peekBallOrigin} — half of it on screen, the other half still past the display edge —
+   * and it stays docked: the strip is still behind it, and the ball is still not the user's to
+   * move. A hint rather than an offer, which is the whole of why it is half a ball and not a whole
+   * one.
+   *
+   * Nothing is animated, on purpose. The peek is the ball's *showing*, and whatever clip it is
+   * wearing is the whole of what the hover plays — sliding the window out underneath it as well
+   * would be a second arrival competing with the one the user asked to watch.
+   *
+   * The window still has to grow for it: the ball is drawn at {@link BALL_COLUMN} inside the
+   * window, and a 34px tab rect has no such column to draw it in. The page pins the strip against
+   * the display edge for the same reason — see `body.docked.docked-peek #dock-tab` in
+   * `floating.css`.
+   */
+  async peek(): Promise<DockState> {
+    if (!this.docked) return { docked: undefined }
+    const display = this.displayAt(center(this.window.getBounds()))
+    const end = peekBallOrigin(this.docked.side, this.docked.y, display.bounds)
+    this.peeking = true
+    this.anim += 1
+    this.window.setBounds(overlayBoundsFromBall(end))
+    return { docked: this.docked.side }
+  }
+
+  /** Put a peeked ball back behind its strip. The dock itself is untouched by either one. */
+  async unpeek(): Promise<DockState> {
+    if (!this.docked) return { docked: undefined }
+    const display = this.displayAt(center(this.window.getBounds()))
+    this.applyTab(this.docked.side, this.docked.y, display.bounds)
+    return { docked: this.docked.side }
+  }
+
   /** The ball's own top-left: its docked slot while docked, otherwise the last position asked for. */
-  private ballOrigin(): { x: number; y: number } {
-    if (this.docked) return insideBallOrigin(this.docked.side, this.docked.y, this.displayAt(center(this.window.getBounds())))
+  private ballOrigin(): { x: number; y: number } {    if (this.docked) return insideBallOrigin(this.docked.side, this.docked.y, this.displayAt(center(this.window.getBounds())))
     return this.origin
   }
 
   private applyTab(side: DockSide, ballY: number, bounds: Rect): void {
     const y = clampBallY(ballY, bounds)
     this.docked = { side, y }
+    // Back to the strip: whatever was showing at the edge goes back behind it. This is the only
+    // place that ends a peek, so every path that puts the window on its tab rect — a re-clamp, a
+    // collapse, {@link unpeek} — ends it too, without any of them having to remember to.
+    this.peeking = false
     this.anim += 1
     this.window.setBounds(dockedTabBounds(side, y, bounds))
   }
@@ -483,6 +620,7 @@ export class FloatingPlacement {
   private async snap(side: DockSide, ballY: number, bounds: Rect): Promise<DockState> {
     const y = clampBallY(ballY, bounds)
     this.docked = { side, y }
+    this.peeking = false
     // Slide to the overlay rect rather than a ball-sized one, keeping the direction the page is
     // already wearing: the ball then holds its offset inside the window for every frame of the
     // slide, which is what makes it travel instead of jumping. The window still ends on the small

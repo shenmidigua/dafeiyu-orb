@@ -8,10 +8,12 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname, resolve } from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type { Appearance, ThemePreference } from './appearance.ts'
 import { avatarPresetSrc } from './avatar-presets.ts'
 import { accountClientMetadata, readBalance, type AccountService, type BalanceReport } from './balance.ts'
+import { readTurnEnding } from './failure.ts'
 import { normalizeCatalog } from './catalog.ts'
 import { resolveElectronBinary } from './electron-runtime.ts'
 import { helperMain } from './helper-path.ts'
@@ -49,6 +51,15 @@ import { createForegroundMemory } from './windows-foreground.ts'
  * a session long enough to cross the line mid-way is the case that waits.
  */
 const BALANCE_POLL_MS = 60 * 60_000
+/**
+ * The shortest gap between two "words are arriving somewhere else" messages.
+ *
+ * The page holds the reply face for a couple of seconds past the last one, so a message a second keeps it up
+ * while an answer streams; anything faster is an IPC message per token for no visible gain.
+ */
+const ORB_STREAM_CUE_MS = 1000
+/** How often the stream from another conversation is summarised in the log while it lasts. */
+const ORB_STREAM_LOG_MS = 15_000
 
 /** Host services the plugin injects. Shapes match the official 0.1.7-rc.2 controllers. */
 export interface OrbContext {
@@ -247,6 +258,17 @@ export class OrbRuntime {
   private readonly stepBlocks = new Map<string, string[]>()
   private liveStep: string | undefined
   private orphanFrameLogged = false
+  /** When each kind of "the model is doing something elsewhere" last went out. See {@link announceOtherStream}. */
+  private readonly otherStreamAt = new Map<StreamKind, number>()
+  /** Frames seen from other conversations, and when that was last logged: the experiment's readout. */
+  private otherStreamSeen = 0
+  private otherStreamLoggedAt = 0
+  /** Every kind of chunk another conversation's stream has carried. See {@link noteChunkKind}. */
+  private readonly seenChunkKinds = new Set<string>()
+  /** The last tool name announced for another conversation, so a change in it is never throttled away. */
+  private otherStreamTool: string | undefined
+  /** Whether this plugin has ever seen a session event through the global subscription. Logged once. */
+  private userMessageSeenLogged = false
   /** Keys of the newest settled assistant message: the turn's final answer so far. */
   private responseKeys: string[] = []
   private helperPid: number | undefined
@@ -305,13 +327,105 @@ export class OrbRuntime {
     }, options.startMonitor)
     ctx.provide('computerUseOverlayGuard', this.overlay)
     this.listenAssistantStream()
+    this.listenUserMessages()
   }
 
   /**
    * Follow the loop's process-local assistant stream so text, thinking, and tool
    * calls reach the ball while the model is still producing them. The durable
    * log only records the settled message, which is what the 400 ms poll sees.
+   *
+   * The same feed carries every other conversation's stream too, which is the one thing the ball can use
+   * from a chat it is not in: see {@link announceOtherStream}.
    */
+  /**
+   * Follow the user's messages so the ball can acknowledge one, whichever window it was typed in.
+   *
+   * A message sent from the ball's own composer is already reported by `onPrompt`; this is for the DSH window,
+   * where nothing does. It listens defensively and records what it hears: whether a global subscription really
+   * delivers other sessions' events was an open question here, and a listener that never fires looks precisely
+   * like a page that never repaints.
+   */
+  private listenUserMessages(): void {
+    try {
+      // `session/event` is not in the generated scoped-event table this package's `ctx.on` is typed from, so the
+      // call is cast — not because the event is unknown, but because it is not *scoped*: 48 packages in this
+      // build listen to it, and they all take `(session, event)` rather than a payload object. Registering it
+      // defensively and writing down what arrives is the point: a listener that never fires and a page that
+      // never repaints look exactly alike from here.
+      const on = this.ctx.on as unknown as (
+        name: string,
+        listener: (...args: unknown[]) => void,
+        options?: { global?: boolean },
+      ) => unknown
+      on('session/event', (session, event) => this.onAnySessionEvent(session, event), { global: true })
+      this.noteOtherStream('listening for user messages from any session')
+    } catch (error) {
+      this.noteOtherStream(`session/event unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
+   * One event from any session: the user's own words are the only kind the ball has a cue for.
+   *
+   * The listener's arguments are `(session, event)`, which is the shape every other consumer in this build uses.
+   * The session is matched by identity rather than by reading an id out of it, because that is what the request
+   * says and a session object's internals are not this plugin's to assume.
+   */
+  private onAnySessionEvent(session: unknown, event: unknown): void {
+    const record = asRecord(event)
+    if (record === undefined) return
+    const type = typeof record.type === 'string' ? record.type : ''
+    if (!this.userMessageSeenLogged) {
+      this.userMessageSeenLogged = true
+      this.noteOtherStream(`any session event reaches this plugin (first kind: ${type === '' ? 'none' : type})`)
+    }
+    const own = this.ctx.sessions.get(this.sessionId ?? '')
+    // The ball's own session is the panel's business: its transcript already carries every one of these, and
+    // `syncGif` reads them off its own blocks. Sending them as well would play each face twice for the ball's own
+    // turns — the same reason `user/message` is not echoed for its own session.
+    const mine = own !== undefined && session === own
+    // Every event that is about a turn, with the one decision that can swallow it. This is the line that answers
+    // "did the event arrive and get dropped, or did it never arrive": `session/event` has only ever been observed
+    // delivering three kinds here, and a kind it does not carry is indistinguishable from a kind that was read
+    // wrongly — which is exactly the mistake that made the first version of this classifier do nothing.
+    if (type === 'turn/end' || type === 'tool/call' || type === 'approval/asked') {
+      const name = toolName(record.data)
+      this.noteToolCall(`event ${type}${name === '' ? '' : ` name=${name}`} own=${this.sessionId === undefined ? 'no-session' : own === undefined ? 'unknown-session' : mine ? 'yes' : 'no'}`)
+    }
+    if (type === 'user/message') {
+      if (mine) return
+      this.noteOtherStream('the user sent a message in another session')
+      // Only the signal, never the words: the page reads the face from the pack and plays it exactly as it plays
+      // the cue for a message sent from its own composer.
+      this.broadcast({ type: 'session-turn', outcome: 'user' })
+      return
+    }
+    if (mine) return
+    // A turn ended, and the *reason* is what says which of the four endings it was. `turn/end` is the authority
+    // here: the assistant stream's `end` frame says a stream stopped, not why it stopped.
+    if (type === 'turn/end') {
+      const category = endingCategory(record)
+      if (category === null) return
+      this.noteToolCall(`turn ended: ${category}`)
+      // `session-turn`, not a type of its own: the helper's `deliver()` dispatches by type and silently drops
+      // anything it does not have a branch for, so a new type never reaches the page at all.
+      this.broadcast({ type: 'session-turn', outcome: 'ended', category })
+      return
+    }
+    // Waiting on a tool approval: a turn that ends while parked reports `blocked`, and this is the request itself,
+    // which arrives whether or not the turn ends here. Per DSH's own `SessionEventMap`.
+    if (type === 'approval/asked') {
+      this.broadcast({ type: 'session-turn', outcome: 'ended', category: 'approval' })
+      return
+    }
+    // The agent stopping to ask a question. A `tool/call`, not a turn ending — the turn is parked, not over.
+    // `tool/call` carries its own payload under `data` too, which is where the tool's name is.
+    if (type === 'tool/call' && toolName(record.data) === 'ask_user_question') {
+      this.broadcast({ type: 'session-turn', outcome: 'ended', category: 'ask' })
+    }
+  }
+
   private listenAssistantStream(): void {
     try {
       this.ctx.on('agent/assistant-stream', (payload) => this.onAssistantStream(payload), { global: true })
@@ -320,15 +434,150 @@ export class OrbRuntime {
     }
   }
 
+  /**
+   * Tell the ball that words are being written in a conversation it is not in.
+   *
+   * The feed is global, so this is the same event the ball's own transcript is built from, one window over —
+   * and the one thing that travels back the other way is *that* it is arriving, never the words. The page
+   * wears the reply face for a couple of seconds after the last one, so this only has to arrive often enough
+   * to keep that window open: an answer produces a frame per token, and a message per token would be a fine
+   * way to make the ball the busiest thing on the machine for no visible gain.
+   *
+   * That the global subscription really does deliver other sessions' frames was settled on 2026-10-08 by the
+   * first two lines this writes — see the note in `dsh_orb/README.md`. It was worth proving rather than
+   * assuming: the same code had been written twice on the strength of the type signatures alone, and a
+   * failure here looks exactly like a page that never repaints.
+   */
+  private announceOtherStream(kind: NonNullable<StreamKind>, sessionId: string, tool?: string): void {
+    const now = Date.now()
+    if (this.otherStreamSeen === 0) {
+      this.noteOtherStream(`assistant stream reaches another session (${sessionId}) — the feed is global`)
+    }
+    this.otherStreamSeen += 1
+    if (now - this.otherStreamLoggedAt > ORB_STREAM_LOG_MS) {
+      this.otherStreamLoggedAt = now
+      this.noteOtherStream(`${kind}${tool === undefined ? '' : ` (${tool})`} arriving in ${sessionId} (${this.otherStreamSeen} frames so far)`)
+    }
+    // A *changed* tool name always goes out, throttle or not. The throttle exists to keep a stream of tokens
+    // from becoming a stream of messages, and a name that changed is the opposite of that: it is the one frame
+    // in the run that says a different tool is running, and dropping it leaves the ball wearing `grep`'s face
+    // for the whole of a `pwsh` call. A turn names a handful of tools, so this cannot flood anything.
+    const changed = tool !== undefined && tool !== this.otherStreamTool
+    if (changed) this.otherStreamTool = tool
+    if (!changed && now - (this.otherStreamAt.get(kind) ?? 0) < ORB_STREAM_CUE_MS) {
+      // A dropped frame is worth a line: "the ball did not change" and "the host never sent anything" look the
+      // same on screen, and this is the only place that can tell them apart.
+      this.noteToolCall(`suppressed kind=${kind}${tool === undefined ? '' : ` tool=${tool}`} (within the cue interval)`)
+      return
+    }
+    this.otherStreamAt.set(kind, now)
+    this.noteToolCall(`sent kind=${kind}${tool === undefined ? '' : ` tool=${tool}`} sockets=${this.sockets.size}`)
+    this.broadcast({ type: 'session-turn', outcome: kind, sessionId, ...(tool === undefined ? {} : { tool }) })
+  }
+
+  /**
+   * Tell the ball that the answer being written elsewhere is written.
+   *
+   * The page holds the reply face for a fixed window past the last word it heard, because from that side one
+   * message looks like any other and there is nothing to count down. This is the other end of that: the
+   * stream reports its own end, so the face comes off when the words stop rather than a couple of seconds
+   * later — the pause that read as the ball typing on after the answer was finished.
+   *
+   * Only the transition is sent. Attempts end one after another while a turn works through tool calls, and a
+   * message per ending would be traffic that changes nothing; the page clears a window it no longer has.
+   */
+  private announceOtherStreamEnded(): void {
+    if (this.otherStreamAt.size === 0) return
+    this.otherStreamAt.clear()
+    // The name goes with the window: the next attempt's first call has to announce itself even if it is the
+    // same tool, because by then the ball has stopped wearing that face and a suppressed message would leave
+    // it on the shared one.
+    this.otherStreamTool = undefined
+    this.broadcast({ type: 'session-turn', outcome: 'streamed' })
+  }
+
+  /**
+   * Note every kind of chunk another conversation's stream carries, once each.
+   *
+   * The classifier above is a guess about which frames carry which activity, and a wrong guess is invisible:
+   * the ball simply does not move, which is also what a page that never repaints looks like. This makes the
+   * vocabulary observable — one line per kind ever seen — and it is how the tool call was found to arrive as a
+   * block rather than as deltas. Bounded by construction: a stream has a handful of kinds, not thousands.
+   */
+  private noteChunkKind(frame: Record<string, unknown>): void {
+    if (frame.type !== 'chunk') return
+    const chunk = asRecord(frame.chunk)
+    const kind = typeof chunk?.type === 'string' ? chunk.type : ''
+    if (kind === '' || this.seenChunkKinds.has(kind)) return
+    this.seenChunkKinds.add(kind)
+    const block = asRecord(chunk?.block)
+    const carries = typeof block?.type === 'string' ? ` (block ${block.type})` : ''
+    this.noteOtherStream(`chunk kind seen from another conversation: ${kind}${carries}`)
+  }
+
+  /**
+   * Write the readout where a human can read it.
+   *
+   * The plugin's own `console.error` goes to DSH's stderr, which nobody can see from outside the app — so a
+   * question like "is the ball being told about other conversations at all" would be unobservable exactly
+   * when the answer is no. This appends one line to a file beside the orb's other runtime files: the first
+   * frame seen from another session, then a summary every so often. It is what settled the global-subscription
+   * question, and it is what will settle it again if a DSH upgrade changes the answer.
+   */
+  private noteOtherStream(line: string): void {
+    console.error(`dsh-orb: ${line}`)
+    try {
+      appendFileSync(dshHomePath('dsh-orb', 'stream.log'), `${new Date().toISOString()} ${line}\n`)
+    } catch {
+      // A readout that cannot be written is not a reason to stop the ball from working.
+    }
+  }
+
+  /**
+   * Record one tool call, its name and its id, in a log of its own.
+   *
+   * A per-tool face is only as good as the name that reaches the page, and the two ways that fails — a frame that
+   * carries no name, and a result that never matches the call — both look identical from outside: the ball keeps
+   * the shared face and nothing is printed. This is the file that says which of them happened, and it is kept in
+   * `tools.log` beside the config rather than in `stream.log`, whose lines are summaries that a short conversation
+   * can end before they are written.
+   */
+  private noteToolCall(line: string): void {
+    try {
+      appendFileSync(dshHomePath('dsh-orb', 'tools.log'), `${new Date().toISOString()} ${line}\n`)
+    } catch {
+      // As above: a readout that cannot be written must not change what the ball does.
+    }
+  }
+
   private onAssistantStream(payload: unknown): void {
     if (this.sessionId === undefined) return
     const record = asRecord(payload)
     const agent = asRecord(record?.agent)
     const session = asRecord(agent?.session)
-    if (session?.id !== this.sessionId) return
     const frame = asRecord(record?.frame)
     if (!frame) return
     const attemptId = typeof frame.attemptId === 'string' ? frame.attemptId : ''
+    // The end of an attempt is the one frame that means something for both halves, so it is handled before
+    // the session decides which half this is: this page's transcript wants it for its own session, and the
+    // ball wants it for any other — it is the difference between "words are arriving" and "the answer is
+    // written", and a face held for a fixed window past the last word goes on typing after the words stop.
+    if (frame.type === 'end') {
+      if (session?.id === this.sessionId) this.attemptPositions.delete(attemptId)
+      else this.announceOtherStreamEnded()
+      return
+    }
+    if (session?.id !== this.sessionId) {
+      // Somebody else's conversation, and its frames do not belong in this ball's transcript. What they do
+      // carry is news the ball can wear — and which news it is depends on the kind of frame, because a turn
+      // that is thinking is not a turn that is writing. See {@link streamKind}.
+      this.noteChunkKind(frame)
+      const news = streamNews(frame)
+      if (news !== null) {
+        this.announceOtherStream(news.kind, typeof session?.id === 'string' ? session.id : '', news.tool)
+      }
+      return
+    }
     if (frame.type === 'start') {
       if (attemptId === '') return
       const turn = numberOf(frame.turn)
@@ -338,10 +587,6 @@ export class OrbRuntime {
       const previous = this.lastAttemptByStep.get(stepKey)
       this.lastAttemptByStep.set(stepKey, attemptId)
       if (previous !== undefined && previous !== attemptId) this.rewindLiveStep(turn, step)
-      return
-    }
-    if (frame.type === 'end') {
-      this.attemptPositions.delete(attemptId)
       return
     }
     if (frame.type !== 'chunk') return
@@ -776,9 +1021,19 @@ export class OrbRuntime {
       const name = toolName(data)
       if (!name) return
       const id = callId(data)
+      // Recorded before anything else: which tools are called, and with what name, is what a per-tool face depends
+      // on, and a name that never arrives leaves the ball on the shared face with nothing on screen to say why.
+      // The id comes along because the result is matched to it, and a mismatch there is invisible from outside.
+      this.noteToolCall(`call name=${name} id=${id === '' ? 'none' : id} pending=${this.runningTool(name) ?? 'none'}`)
       const existing = id ? undefined : this.runningTool(name)
       const key = id ? `tool:${id}` : existing ?? `tool:${seq}`
-      this.block(key, 'tool', name, false, 'set', {
+      // Running until the result arrives, which is what the call *is*. This was `false`, and the reason is
+      // worth keeping: a call that arrived whole rather than as streamed arguments was written as already
+      // finished, so the ball saw no work in progress at all. `agentPhase` reads a tool as running work, and
+      // the only other thing that ever set the flag was a `tool-call-delta` — so a call whose arguments came
+      // in one piece left the ball on its resting loop for the whole of the execution, which is exactly what
+      // "it goes back to the idle fallback while a command runs" looked like from outside.
+      this.block(key, 'tool', name, true, 'set', {
         args: clip(toolArguments(data), 4000),
       })
       return
@@ -787,7 +1042,7 @@ export class OrbRuntime {
       this.onToolResult(data)
       return
     }
-    if (type === 'turn/end') this.finishTurn()
+    if (type === 'turn/end') this.finishTurn(data)
   }
 
   /** Join a settled result to its call by id, carrying error state and meta. */
@@ -959,7 +1214,18 @@ export class OrbRuntime {
     return undefined
   }
 
-  private finishTurn(): void {
+  /**
+   * End the turn being watched and tell the ball why.
+   *
+   * The reason travels with the end because it is the only moment the ball can act on it: a run that
+   * threw has to wear the failure face, a run the user cancelled — or one a crash left open and the
+   * next read closed — has to do nothing at all, and only a turn that ran to its own end is a finished
+   * task. Until now `interrupted` was known only from the assistant message, so a stop that arrived as
+   * `turn/end: aborted` still rang the bell; the reason is what settles it, and it is read here as well.
+   */
+  private finishTurn(data?: unknown): void {
+    const ending = readTurnEnding(asRecord(data)?.reason, this.turnInterrupted)
+    this.turnInterrupted = ending.end.interrupted
     this.turnRunning = false
     this.idleWarned = false
     this.selection.setSessionRunning(false)
@@ -975,7 +1241,12 @@ export class OrbRuntime {
       if (item) this.block(key, item.kind, item.text, false, 'set')
     }
     this.responseKeys = []
-    this.broadcast({ type: 'turn', running: false, ...(this.turnInterrupted ? { interrupted: true } : {}) })
+    // The reason is summarised for the ball and kept whole for the log: the page only has to know
+    // *that* the run failed, while the code and the message are what a human reads afterwards.
+    this.broadcast({ type: 'turn', ...ending.message })
+    if (ending.end.failure !== null && !ending.end.interrupted) {
+      console.error(`dsh-orb: turn failed ${clip(ending.end.failure.code, 120)}: ${clip(ending.end.failure.message, 600)}`)
+    }
     this.turnInterrupted = false
     this.stopWatch()
     const reply = [...this.blockOrder].reverse().map((key) => this.blocks.get(key)).find((item) => item?.kind === 'assistant')
@@ -1637,6 +1908,8 @@ export class OrbRuntime {
     this.blockOrder.length = 0
     this.watermark = 0
     this.turnRunning = false
+    // A stop that belonged to the session being left must not suppress the next session's bell.
+    this.turnInterrupted = false
     this.attemptPositions.clear()
     this.lastAttemptByStep.clear()
     this.stepBlocks.clear()
@@ -1950,6 +2223,75 @@ function questionError(message: string, code: string): Error {
   const error = new Error(message)
   error.name = 'UserQuestionError'
   return Object.assign(error, { code })
+}
+
+/**
+ * What a stream frame says the model is doing right now, in the words the ball already uses for its own turn.
+ *
+ * A turn is not one activity: it reasons, then writes, then runs a tool, then reasons again — and only one of
+ * those three is words arriving. Reporting "the model is busy" for all of them is why the ball went on typing
+ * while the answer was being thought about rather than written. `null` for a frame that says nothing about
+ * what the ball should wear.
+ *
+ * A tool call arrives two ways, and both have to be recognised. Arguments the model streams arrive as
+ * `tool-call-delta` chunks; arguments it produces in one piece arrive as a whole block, opened by `block-start`
+ * and confirmed by `block-end`. Watching only the deltas — which is what this did at first — leaves the second
+ * kind invisible: measured on this machine, a ten-second call produced *no frames at all*, so the ball sat
+ * still for the whole of it while the tool ran.
+ */
+type StreamKind = 'typing' | 'thinking' | 'tool' | null
+
+/** What a foreign frame says the model is doing, and — for a call — which tool it is doing it with. */
+interface StreamNews {
+  kind: Exclude<StreamKind, null>
+  /**
+   * The tool being called, when the frame carries one.
+   *
+   * Without it the ball can only say "a call is running", so every per-tool face a pack draws — the mapping in
+   * `tool.tools` — was unreachable from the window the user actually types in, while working in the ball's own
+   * panel. The name is on the frame already; it just was not being passed on.
+   */
+  tool?: string
+}
+
+/**
+ * Which of the six endings a `turn/end` describes, in the words the ball's config uses.
+ *
+ * The mapping is `@mzzsfy/dsh-turn-notify`'s, kept identical on purpose: two plugins reading the same feed should
+ * not disagree about what happened. `null` for a kind this build does not know — a plugin may add reasons, and an
+ * unknown one is not a face.
+ */
+function endingCategory(event: Record<string, unknown>): string | null {
+  // The payload is under `data` — the same shape DSH writes to its own log, where a `turn/end` is
+  // `{ type, seq, data: { turn, reason: { kind } } }`. Accepting a bare `reason` too costs nothing and keeps this
+  // working if the two ever diverge.
+  const reason = asRecord(asRecord(event.data)?.reason) ?? asRecord(event.reason)
+  const kind = typeof reason?.kind === 'string' ? reason.kind : ''
+  if (kind === 'completed') return 'done'
+  if (kind === 'error' || kind === 'aborted') return 'fail'
+  if (kind === 'interrupted') return 'interrupted'
+  if (kind === 'blocked') return 'approval'
+  if (kind === 'max-tokens') return 'maxtokens'
+  return null
+}
+
+function streamNews(frame: Record<string, unknown>): StreamNews | null {
+  if (frame.type !== 'chunk') return null
+  const chunk = asRecord(frame.chunk)
+  if (chunk === undefined) return null
+  if (chunk.type === 'text-delta') return { kind: 'typing' }
+  if (chunk.type === 'reasoning-delta') return { kind: 'thinking' }
+  if (chunk.type === 'tool-call-delta') {
+    const name = typeof chunk.name === 'string' ? chunk.name : ''
+    return name === '' ? { kind: 'tool' } : { kind: 'tool', tool: name }
+  }
+  if (chunk.type === 'block-start' || chunk.type === 'block-end') {
+    const block = asRecord(chunk.block)
+    if (block?.type !== 'tool-call') return null
+    const name = typeof block.name === 'string' ? block.name : ''
+    return name === '' ? { kind: 'tool' } : { kind: 'tool', tool: name }
+  }
+  return null
 }
 
 function clip(text: string, max: number): string {

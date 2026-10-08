@@ -56,7 +56,7 @@ function pageFunction(name) {
 
 const build = new Function('deps', `
   const { document, pageClosed, syncSleep, dragging, dragSrc, dragIntroSrc, dragIntroUntil,
-          clickShown, arriveShown, wakeShown, doneShown, typingSrc, replySrc, toolSrc, thinkingSrc,
+          clickShown, arriveShown, wakeShown, doneShown, failShown, askShown, typingSrc, replySrc, toolSrc, thinkingSrc,
           speakSrc, speakActive, voiceSrc, dictationPhase, dropShown, webfetchSrc, agentState,
           agentTool, idleSrc, poorSrc, balanceCny, poorBelow, hoverSrc, hoverIntroSrc, introUntil,
           hovering, napShown, sleepFrameAt, skitInfo, skitFrame, running, asking, tccGateVisible,
@@ -75,6 +75,7 @@ function show(options = {}) {
     pageClosed: () => false, syncSleep: () => {},
     dragging: false, dragSrc: 'DRAG', dragIntroSrc: undefined, dragIntroUntil: 0,
     clickShown: options.clickShown, arriveShown: undefined, wakeShown: undefined, doneShown: undefined,
+    failShown: undefined, askShown: undefined,
     typingSrc: undefined, replySrc: undefined, toolSrc: 'TOOL', thinkingSrc: undefined,
     speakSrc: undefined, speakActive: false, voiceSrc: undefined, dictationPhase: 'idle',
     dropShown: undefined, webfetchSrc: undefined, agentState: '', agentTool: '',

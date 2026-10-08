@@ -1034,7 +1034,7 @@ describe('ball page module', () => {
     // rather than two that can disagree about the same point.
     const handler = /api\.onPointer\(\(point\) => \{[\s\S]*?\n  \}\)/.exec(shell)?.[0] ?? ''
     assert.notEqual(handler, '', 'the page listens for it')
-    assert.match(handler, /pointerOnBallOrPanel\(\)/, 'and decides with the same test the events use')
+    assert.match(handler, /pointerOnUi\(point\)/, 'and decides with the same test the events use')
     assert.match(handler, /enterUi\(\)[\s\S]*?else leaveUi\(\)/, 'opening and closing on the same terms')
     assert.match(handler, /point === null[\s\S]*?leaveUi\(\)/, 'leaving is unconditional, since a null point is never on the ball')
   })
@@ -1076,22 +1076,29 @@ describe('ball page module', () => {
     // when the resting window was the ball and its insets. Now the body is 742x544, so that test
     // would open the panel from anywhere in the rectangle — which sits over the user's desktop.
     const move = shell.slice(shell.indexOf("addEventListener('pointermove'"), shell.indexOf("addEventListener('pointerleave'"))
-    assert.match(move, /pointerOnBallOrPanel\(\)/, 'the pointer move is tested against the ball, not the window')
+    assert.match(move, /pointerOnUi\(event\)/, 'the pointer move is tested against the ball, not the window')
     assert.match(move, /enterUi\(\)/, 'and only crossing onto it opens the panel')
     assert.match(move, /leaveUi\(\)/, 'while crossing off it collapses')
     // The panel counts as hovered too, or crossing the 10px gap between ball and panel would
     // collapse the panel the pointer is travelling towards.
     assert.match(pageFunction(shell, 'pointerOnBallOrPanel'), /getBoundingClientRect/, 'the open panel is part of the hover region')
+    // `pointerOnUi` is that test with one exception, and the exception is not the window either: a
+    // docked ball is not on screen at all, so the answer there is the strip it left behind.
+    const onUi = pageFunction(shell, 'pointerOnUi')
+    assert.match(onUi, /if \(docked === undefined\) return pointerOnBallOrPanel\(\)/,
+      'one answer to "is the pointer on us", and with no dock it is the ball and the card')
+    assert.match(onUi, /return pointerInDockBand\(point\)/,
+      'while a docked ball is off screen, so the strip it left behind answers instead')
     // Entering the *window* is not entering the ball. `pointerenter` on the body fires from
     // anywhere in a 742x544 rectangle, which sits over the user's desktop, so the handler has to
     // ask where the pointer actually is before opening anything.
     const enter = shell.slice(shell.indexOf("addEventListener('pointerenter'"), shell.indexOf("addEventListener('pointermove'"))
-    assert.match(enter, /pointerOnBallOrPanel\(\)/, 'entering the window is not entering the ball')
+    assert.match(enter, /pointerOnUi\(event\)/, 'entering the window is not entering the ball')
     assert.match(enter, /enterUi\(\)/, 'and only the ball opens the panel')
     // This is only reachable because the helper polls the pointer and keeps the window capturing
     // over the ball. An earlier version had the page decide, and a click-through window receives no
     // enter event at all — the panel could not open, and the source looked correct throughout.
-    assert.match(enter, /if \(!pointerOnBallOrPanel\(\)\) return/, 'the enter is gated rather than assumed')
+    assert.match(enter, /if \(!pointerOnUi\(event\)\) return/, 'the enter is gated rather than assumed')
   })
 
   it('imports the transcript model from the helper page', () => {

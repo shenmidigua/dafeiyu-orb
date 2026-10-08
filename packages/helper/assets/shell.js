@@ -13,13 +13,235 @@ import {
 } from './icons.js'
 
 const api = window.dshOrb
+
+/**
+ * How long the ball keeps a face up for work happening in another conversation that is not writing.
+ *
+ * Reasoning and tool calls each get their own window on the same terms as the words do, and a longer one,
+ * because neither reports itself as often: a model thinks in long stretches with nothing to say in between,
+ * and a tool call is a single event rather than a stream. Too short and the face would drop and come back in
+ * the middle of one thought, which reads as a stutter rather than as a state.
+ */
+const OTHER_WORK_HOLD_MS = 4000
+
+/**
+ * How long the ball keeps typing along after the last word arrived from another conversation.
+ *
+ * Another conversation's work reaches this page as one small message per kind per second — never as words,
+ * see `announceOtherStream` in the host — and this is how long the last one is trusted. A window rather than
+ * a state for the same reason the composer's is: the page cannot see the loop's own end, so it goes by the
+ * last frame it heard.
+ *
+ * It is a *fallback*, not the mechanism: the host also reports when the attempt writing those words has
+ * ended, and the face comes off then. The window is what covers a stream that ends without saying so, and it
+ * deliberately outlives nothing — a face held only by its own timer is a ball that types on after the answer
+ * is finished, which is the pause this pair of signals exists to remove.
+ */
+const OTHER_STREAM_HOLD_MS = 2500
+
+/**
+ * 球的全部动画：谁会播、什么条件触发、配置里叫什么。
+ *
+ * 这张表是"以谁为准"的声明，因为触发链是一条**有顺序**的判定，而顺序本身就是语义：
+ * `syncGif()` 从上往下走，**第一个命中的分支赢**，下面的分支连看都不会被看。所以"两个条件同时
+ * 成立时播哪个"这个问题，答案不在这两个槽位的注释里，而在这张表的行序里。表里从上到下 = 优先级
+ * 从高到低，和 `syncGif` 里的分支顺序一一对应（`syncGif` 是唯一的调度点，其余函数只负责把某种
+ * 状态摆好）。
+ *
+ * 配置键就是 `memes.json` 里的槽位名；"自动"= 不需要用户动手，它自己会播。
+ *
+ * ── 一次性提示（播一遍就交还，`{槽位}.enabled` 控制，文件 `{槽位}.file`）──
+ *  1. drag      拎起.gif + 悬空.gif   「拖拽中」——你按住球在拖：先播 intro（拎起）再循环悬空
+ *  2. drop      下落.gif              「拖拽松手」——落地那一下，一次性
+ *  3. dockArrive 冒泡 1登场*.gif      「吸附后鼠标停在球的条上」：探出球 → 登场 clip → 循环（左右各一套）
+ *  4. click     摸头.gif              「点了球一下」——你手动点出来的反应
+ *  5. wake      叹号.gif              「麦克风听到唤醒词」——自动：确认词被识别到就播，并顺手打开面板、开始录音
+ *  6. ask       问号.gif              「AI 停下来向你提问」——自动（`tool/call` + `ask_user_question`）
+ *  7. nod       点头.gif              「你发了一条消息给 agent」——自动；**两个来源**见下面的说明
+ *  8. fail      停止工作.gif          「回合出错 **或**你按了停止」——自动（`reason.kind` 是 error/aborted）
+ *  9. done      摇铃.gif              「回合正常跑完」——自动（`reason.kind === 'completed'`）
+ * 10. interrupted 惊吓.gif            「会话关闭时未收尾的回合被补发中断」——自动（`'interrupted'`）
+ * 11. approval  问号.gif              「AI 等你批准一个工具」——自动（`'blocked'` 或 `approval/asked`）
+ * 12. maxtokens 叹号.gif              「回合达到输出长度上限」——自动（`'max-tokens'`）
+ *     8–12 这五条是**同一套机制**（回合怎么结束），判定与排查见下面的规则 G/H。
+ * 13. arrive    到达.gif + 打招呼.gif 「页面刚加载完」——自动，**每次加载只播一遍**
+ * 14. typing    记录 1.gif            「你在球面板的输入框里打字」；窗口 TYPING_HOLD_MS（3 s）。**只此一个来源**：
+ *                                    DSH 主窗口的输入框不外发草稿/键入事件，所以"在主窗口打字"这件事主机看不到。
+ *                                    试过退而求其次——在你**发出**消息时点亮它——但那是"消息发出**之后**才开始
+ *                                    打字"，说的是假话，所以撤掉了；那一瞬间只有 `nod`（第 7 行）。
+ * 15. reply     打字(普通).gif        「模型正在生成文字」——自动，状态来自 agentState === 'replying'
+ * 16. tool      画板.gif              「模型正在调用工具」——自动；**按 `tool.tools` 再按工具名细分**，见下
+ * 17. thinking  思考(认真地).gif      「模型在推理」——自动
+ *
+ * ── 同一个模型，但在**你没在看的那个对话**里（DSH 主窗口）──
+ *    这里的三条**复用上面同名的槽位**（`reply`/`tool`/`thinking`），不是新槽位；分开列是因为它们是
+ *    `syncGif` 里独立的三条分支，而且**排在 15–17 之后**——本页自己的状态整体优先于别的对话，这样
+ *    "同一个回合同戴两张脸"时不会互相打架。每个都有自己的 mode 后缀，所以从一种切到另一种会重新播片
+ *    而不是停在上一张的最后一帧。窗口是 `OTHER_STREAM_HOLD_MS`（2.5 s，文字）与 `OTHER_WORK_HOLD_MS`
+ *    （4 s，工具与思考），由主机广播的种类刷新。
+ * 18. reply-elsewhere   同上 reply     「主窗口在生成文字」
+ * 19. tool-elsewhere    同上 tool      「主窗口在调用工具」；主机**带上工具名时**用 `tool.tools` 的专属脸
+ * 20. thinking-elsewhere 同上 thinking  「主窗口在推理」
+ *
+ * ── 只要条件成立就一直戴着的状态 ──
+ * 21. speak     PNGTuber 说话.gif     「球正在朗读」——自动
+ * 22. voice     点头.gif              「麦克风在录音 / 正在转写」（dictationPhase）
+ * 23. hover     期待 2.gif + 打招呼 1.gif「鼠标停在球上」——先播 intro（打招呼）再循环期待
+ * 24. (无槽位)  ——                    「对话进行中 / 面板展开」：戴冻结头像 avatar
+ * 25. sleep     打哈欠 + 睡觉*.gif    「闲置一段时间后」——自动：打哈欠 → 打盹 → 睡着，`sleep.afterMs`
+ * 26. skit      带薪拉屎 / 饮料 / 跳舞 「球闲置时每隔 gapMs 演一小段」——自动（见规则 F：别的会话在干活时不演）
+ * 27. poor      吸氧.gif              「余额低于 poor.below」——自动；没有 poor 配置时由下面接管
+ * 28. idle      PNGTuber 闲置.gif     「什么都不成立时的默认循环」——兜底
+ * 29. (无槽位)  ——                    什么都没有配置时：戴冻结头像并冻结它
+ *
+ * 两个不属于这张表的例外，避免以后找错地方：
+ *  • **吸附（docked）时会提前 return**（`if (docked !== undefined)`），第 24 行以下全都不走——条上
+ *    显示什么由吸附那套自己管，球这边"保持上一次画面不动"就是它对吸附的承诺。
+ *  • **随机 burst 不在这里**：它由 `scheduleMemeBurst()` / `playMemeBurst()` 自己的定时器驱动，从
+ *    整个 `dir` 目录里随机抽（`memes.json` 顶层那个 `enabled` 只管它，不是总开关）。
+ *
+ * ── 三条"改变上表含义"的规则，容易漏，所以写在这里 ──
+ *
+ * **A. 点头（第 7 行）有两个来源**，而且**可靠性不同**：一是**球自己的面板**发消息——页面在
+ *    `submitComposer()` 里直接播，和发送是同一行代码，不可能漏；二是**DSH 主窗口**发消息——主机订阅
+ *    `session/event` 认出 `user/message` 后广播 `{ outcome: 'user' }`，页面再播。第二条依赖全局订阅，
+ *    而该订阅**不在这个插件的类型化事件表里**（历史上"写两遍都静默失败"就是这个原因），所以它写在
+ *    `try/catch` 里，并且第一次收到任何会话事件时会往 `stream.log` 写一行作为可验证的凭据。
+ *
+ * **B. 工具名的细分（第 13 行）**：`tool` 是所有工具共用的那张脸；`tool.tools` 里按**工具名**列出的
+ *    条目会覆盖它，没列到的工具（`grep`/`glob`/`write`…）继续用共用脸。名字就是工具卡片上的名字
+ *    （`pwsh`/`edit`/`read`…），所以这是**纯配置**：改一行就换脸，DSH 改名了也只是那行失效、自动回落
+ *    共用脸，不会报错。**取脸是按需的**（`loadNamedToolFrame`）：第一次遇到某个工具名才去问 helper，
+ *    答案是"没有专属脸"也会被缓存，所以第二次不再问。另一个会话的工具名要**主机广播带过来**
+ *    （`streamNews` 里的 `tool` 字段），因为球的对话记录不是那个对话、没有工具卡片可读。
+ *
+ * **C. 工具脸的最小显示时长**：按工具名取到的脸一旦戴上，**至少留 `TOOL_FACE_HOLD_MS`（1300 ms）**。
+ *    片长只有几百毫秒而命令可能十毫秒就跑完，没有这个下限时同一支工具脸"有时候看得到有时候看不到"
+ *    （这是实测报障）。它**只延迟、不否决**：该来的状态都会来，只是晚一点。共用脸不受此限，否则一个
+ *    纯写字的回合会一直挂着工具图片。判定在**所有有意义的分支之后、回到待机之前**，所以它挡不住任何
+ *    真实状态。
+ *
+ * **D. 陈旧的 `running` 不再被相信**：`agentState` 只认 `running === true` 的块，而"运行中"这个标记
+ *    是主机打上的——一旦有路径没把它清掉，球就永远卡在工具脸，**而且因为块不再变化，页面收不到任何
+ *    消息、自己走不回来**（这个 bug 报过两次）。所以：**对话记录静默超过 `STALE_BLOCK_MS`（20 s）时，
+ *    所有块都不再算 running**。依据是干活的模型不可能静默这么久；而摘下面具的那次重绘必须**被安排**
+ *    （`staleAgentTimer`），因为陈旧块不会再发消息。块后来又动了就会被重新信任。
+ *
+ * **E. 工具名的到达有前提**：主机只在**认得**这一帧时才广播名字——`tool-call-delta`（流式参数）或
+ *    `block-start`/`block-end` 且块类型是 `tool-call`（参数一次给全）。两者都没有时只有 `tool/call`
+ *    事件，名字到不了页面，于是一个列了 `tool.tools` 的工具**也会**显示共用脸。这不是配置错，而是
+ *    主机没拿到名字。
+ *    **排查工具**：`~/.dsh/dsh-orb/tools.log` 是唯一权威——主机每调一次工具写一行
+ *    （`call name=grep id=… pending=none`），helper 每次被问名字写一行（`asked="grep" own-face=true`）。
+ *    两边对着看就知道断在哪：**只有前半行** → 主机没广播，或页面没收到；**两半都有** → 名字通了，
+ *    问题在画那一层。`stream.log` 里那些 `tool (pwsh) arriving` 是**每 15 秒的摘要**，短对话可能一次
+ *    都写不出来，所以**不能**用它判断"有没有名字"。
+ *
+ * **F. "在休息"不只看本页的 `agentState`，还要看别的会话**：打盹（第 22 行）和小品（第 23 行）都由
+ *    `restingNow()` 把门，而它原本只检查**本页自己的**工作状态（`agentState === ''`、`!running`…）。
+ *    于是你在 DSH 主窗口工作时，球这边 `agentState` 一直是空的、**自认为在休息** → 跳舞/小品照样开演
+ *    → **盖住"别的会话在工作"那三张脸**（这是实测报障的现象，逻辑上也不成立：那段时间球并不闲）。
+ *    现在 `restingNow()` 把 `otherStreamAt` 的三个窗口和工具脸持有期也算作"不闲"。
+ *
+ * **G. 回合有六种结束方式，由 `turn/end` 的 `reason.kind` 决定**（表里第 8/9 行那些"回合结束"的脸照它分）。
+ *    **六张脸全部实测通过**（`done` 摇铃、`interrupted` 惊吓、`ask` 问号 都亲眼看到过）：
+ *
+ *    | 配置槽位 | 含义 | 判定信号 |
+ *    |---|---|---|
+ *    | `done` | 任务完成 | `turn/end` 且 `reason.kind === 'completed'` |
+ *    | `fail` | 出错 **或**被你手动停止 | `'error'` / `'aborted'`（停止按钮发的是 `aborted`） |
+ *    | `interrupted` | 会话关闭时未收尾的回合被补发中断 | `'interrupted'` |
+ *    | `approval` | 等待你批准工具 | `'blocked'`，**或**独立事件 `approval/asked` |
+ *    | `ask` | AI 停下来提问 | 事件 `tool/call` 且**工具名**是 `ask_user_question` |
+ *    | `maxtokens` | 达到输出长度上限 | `'max-tokens'` |
+ *
+ *    **信号长什么样**（照抄你会话记录里的真实结构，别凭感觉写）：
+ *
+ *    ```json
+ *    {"type":"turn/end","seq":12837,"data":{"turn":96,"reason":{"kind":"aborted","reason":{"kind":"user"}}}}
+ *    {"type":"tool/call","seq":12955,"data":{"turn":98,"step":3,"callId":"call_00_…","name":"pwsh","arguments":"…"}}
+ *    ```
+ *
+ *    **`reason` 和 `name` 都在 `data` 里，不在事件顶层。** 这是本规则唯一一处曾经写错的地方（见下面的 H）。
+ *
+ *    **两个信号源，别混**：`assistant/message` 流那边的 `type: 'end'` 只说"这一段输出停了"，**不说为什么**
+ *    —— 靠它区分 `done`/`fail` 只能猜。权威的是 `session/event` 里的 **`turn/end` + `reason.kind`**，它同时
+ *    管**别的会话**（主窗口）：主机分类后广播 `{ type: 'session-turn', outcome: 'ended', category }` 到页面。
+ *    **球自己的对话不重复播**：那六个事件在它自己的对话记录里本来就有，主机对"自己的会话"直接跳过，
+ *    否则同一张脸会播两遍（和 `user/message` 不回声是同一个道理）。
+ *    这个映射照 `@mzzsfy/dsh-turn-notify` 抄的 —— 两个插件读同一条流，不该对"发生了什么"有分歧。
+ *
+ *    **显示时长**：这些脸走 `TURN_END_MIN_HOLD_MS`（2200 ms）的下限。原因是 `oneShotHoldMs` 对**循环**片
+ *    只留 85%（本意是"打断型提示快点把球还回去"），而这些片子不到一秒 —— 实测被报成"一瞬间"。
+ *
+ * **H. 这条链上失败一律是静默的，所以有三个必须记住的坑**（每一个都花掉一次重启）：
+ *
+ *    1. **`reason` 在 `data` 里**。第一版读的是 `event.reason`，永远 `undefined` → 六类**一个都没分类**。
+ *       "没分类"和"没事件"在球上长得一模一样，所以它静默了整整一轮。
+ *    2. **不要发明消息类型**。`helper` 的 `deliver()` 是**逐类型分派**的（19 种），**没有兜底分支**，
+ *       不认识的类型**直接丢掉**。本规则第一版广播的是 `{ type: 'turn-ended' }` —— 这个类型 helper 不认识，
+ *       所以消息在 helper 那一层就没了，页面永远收不到。**现在改走已经全线打通的 `session-turn`**
+ *       （只新增一个 `outcome: 'ended'` 取值）。`deliver()` 现在也加了未知类型报错，不再静默。
+ *    3. **页面侧的读取表要和主机的分类表对齐**。`TURN_END_READERS` 曾经只列了五个（漏了 `ask`），
+ *       而球**自己**对话里的提问走的是另一条路（`playAskFrame`），把遗漏掩盖了 —— 只有"主窗口提问"断掉。
+ *       现在 `packages/helper/tests/turn-end-readers.test.ts` 直接比对两份名单。
+ *
+ *    **排查顺序**（从最上游往最下游，每一步都有落盘证据）：
+ *
+ *    | 看哪里 | 说明 |
+ *    |---|---|
+ *    | `~/.dsh/dsh-orb/tools.log` 的 `event turn/end own=…` | 事件**有没有送到**、守卫有没有放行 |
+ *    | 同文件的 `turn ended: <分类>` | 分类**成功没有**（没有这行 = 没分类，回去看坑 1） |
+ *    | 同文件的 `sent kind=…` / `suppressed …` | 主机**发出去没有**、是不是被节流挡了 |
+ *    | helper 的 stderr | `undelivered message type=…` = 踩了坑 2 |
+ *    | `packages/helper/tests/turn-end-readers.test.ts` | 踩了坑 3 的话它会直接红 |
+ */
 const COLLAPSE_MS = 180
 const ANIMATION_MS = 300
+/**
+ * The grace a docked ball used to get before a hover pulled it back out, in milliseconds.
+ *
+ * Nothing unsnaps on a hover any more — the strip drags the ball out, and a hover plays the arrival
+ * clip instead — so this is the old grace and is kept only because the page's own test pins it as
+ * the constant that *used* to be the second route out. The hover that does something now is
+ * {@link DOCK_ARRIVE_DWELL_MS}, which is a dwell rather than a grace and is short enough to read as
+ * one gesture.
+ */
 const DOCK_HOVER_DELAY_MS = 800
 /** How often the page re-reads the burst config while bursts are off or unreadable. */
 const MEME_POLL_MS = 30000
 /** How long the typing frame stays after the last keystroke in the ball's own composer. */
 const TYPING_HOLD_MS = 3000
+/**
+ * How long a per-tool face stays on the ball once it is up.
+ *
+ * The clips run about a second and a command can finish in ten milliseconds, so without a floor the face is only
+ * seen when the tool happens to be slow — which arrived as a report that the same tool "sometimes" played its
+ * animation and sometimes did not. Longer than the clips, so one full pass is always visible.
+ *
+ * Three seconds rather than the 1300 ms it started at: that was still reported as too brief to read, and a tool
+ * call is a momentary event whose whole point is that the user notices it. It is a floor, so a slow tool — one
+ * that is still running when the floor expires — is unaffected.
+ */
+const TOOL_FACE_HOLD_MS = 3000
+/**
+ * How long a block may claim to be running without the transcript saying anything else.
+ *
+ * A working model is never quiet for this long: tokens arrive on both sides of a tool call, and the call's own
+ * status changes while it runs. A block that has stayed "running" through this much silence is one that whatever
+ * should have settled it did not settle, and believing it leaves the ball stuck on a face with no way back —
+ * which has now been reported twice, from two different directions.
+ */
+const STALE_BLOCK_MS = 20000
+/**
+ * How long a turn-ending face stays up, at least.
+ *
+ * `oneShotHoldMs` holds a looping clip for 85% of its length, which is right for a cue that interrupts something
+ * — it hands the ball over before the clip's own loop point. But these are not interruptions: they are the ball
+ * answering "the turn ended", and the clips are under a second, so the face was reported twice as a flash that
+ * was barely caught. A floor is the same answer the per-tool faces got, for the same reason.
+ */
+const TURN_END_MIN_HOLD_MS = 2200
 /** Grace after the wake chime before the recorder starts taking frames. */
 const DICTATION_DELAY_MS = 350
 /**
@@ -43,13 +265,16 @@ const ONE_SHOT_MIN_MS = 900
  */
 const ONE_SHOT_CUT_MS = 70
 /**
- * The one tool call that gets a face of its own.
+ * How long the question face stays up once the agent has asked something, milliseconds.
  *
- * `web_search` is deliberately not on this list: a search returns snippets the agent already has,
- * while `web_fetch` is the call where it is waiting on a page it has not seen yet — that wait is
- * the one the user can see the length of, and the one worth showing something during.
+ * A fixed beat instead of one pass of the file, which is the rule every other one-shot here
+ * follows, and the exception is what the face is *for*. The question GIF a pack ships loops
+ * forever, so `oneShotHoldMs` would hand it one pass minus a lead — under a second — and what the
+ * user has to be able to see is that the ball has stopped and is waiting on them, which a blink
+ * does not say. The clip is free to run several of its own passes inside this beat: there is no
+ * pose to hand over to at the end, because what follows is whatever the ball was already doing.
  */
-const WEB_FETCH_TOOL = 'web_fetch'
+const ASK_HOLD_MS = 6000
 /** How long to wait for the host's transcript before telling the user it went missing. */
 const DICTATION_TIMEOUT_MS = 90000
 /**
@@ -71,6 +296,91 @@ const WAVE_STEP_MS = 50
  */
 const WAKE_HOLD_MS = 2600
 const DOCK_DRAG_OFF_PX = 24
+/**
+ * How far below the window's top edge the docked strip is drawn, in CSS pixels.
+ *
+ * The bar's own `top`, mirroring `#dock-tab { top: … }` in `floating.css`. Nothing computes with it
+ * any more, and that is the point: it equals `DOCK_GLOW` — the distance `dockedTabBounds` lifts the
+ * window above the ball's row — so the two cancel in the hand-off's own y. See the note there; the
+ * constant is kept because the tests read it to check the CSS and the module still agree, which is
+ * what would catch one of them being changed on its own.
+ */
+const DOCK_TAB_INSET = 8
+/**
+ * How far inside the display edge the dock parks the ball, in CSS pixels.
+ *
+ * Mirrors `DOCK_IN_PAD` in `geometry.ts`, and it is the page's second copy of a number the helper
+ * owns — {@link DOCK_TAB_INSET} is the first. It has to be a copy rather than a measurement for the
+ * same reason: the bar's box says where the display edge is, but the ball's own slot is a constant
+ * further in and nothing on screen is drawn at it while the ball is hidden.
+ *
+ * It is the position the hand-off has to put the ball at, so a copy that drifts is a ball that
+ * jumps the moment it is pulled out. `dock-tab-drag.test.ts` reads both this and the module's own
+ * constant and compares them.
+ */
+const DOCK_IN_PAD = 5
+/**
+ * How long the pointer has to rest on the strip before the arrival is worth playing.
+ *
+ * Held at zero, and the zero is the whole of the decision: a wait here was measured as essentially the
+ * entire cost of the gesture — with a peek round trip of ~32 ms on this machine, the entrance appeared
+ * 127 ms after the hand reached the strip, of which 121 ms was this timer, and the hand can feel that on
+ * a thing it touches on purpose. Playing at once is also what makes the strip feel like a control rather
+ * than a hint, so the strip's hover is now: the ball comes out (still a round trip, still `peekDock`),
+ * and the entrance starts with it.
+ *
+ * What the wait was for is recorded rather than deleted, because the argument for it has not changed and
+ * may come back: a hand crossing the strip on its way somewhere else is not a hover, and the clip is a
+ * whole gesture — 2.28s of it — so playing on the crossing would make every pass down the edge of the
+ * screen fire one. It is kept as a timer rather than cut out of `beginDockArrive` so that threshold can be
+ * restored by changing this one number: the arm/drop structure around it is what makes "crossed" and
+ * "rested" different, and only the number says how long. The press that pulls the ball back out is
+ * unaffected either way: it is a separate gesture with its own listener, and it does not wait for this.
+ */
+const DOCK_ARRIVE_DWELL_MS = 0
+/**
+ * Whether hovering the docked strip pulls the ball out.
+ *
+ * Off while the pull-out is being retired. A hover on the strip then does nothing: the ball stays in its strip
+ * wearing whatever it was wearing, and the click that pulls it out — `beginDockDrag`, a separate gesture with its
+ * own listener — is untouched. Both halves of the gesture read this, so nothing is left half-shown: the peek that
+ * grows the window, and the arrival clip that greets it.
+ *
+ * One switch rather than a deletion on purpose. The gesture has a dozen constants and a round trip through the
+ * helper behind it, so "pause it, then decide" is a line here, while "take it out" is a change to the geometry,
+ * the hit-testing, the content sizing and the tests — and the reason to retire it is a judgement about whether
+ * the frame is wanted, which is exactly the kind of thing that gets re-decided.
+ */
+const DOCK_HOVER_ENABLED = false
+/**
+ * How much wider than the docked strip the arrival counts as hovered, in CSS pixels.
+ *
+ * The main process holds the window over a reported rect plus its own `CAPTURE_MARGIN`, so a
+ * pointer 1px outside the strip is inside a window that is capturing and still generates the
+ * events this is read from. Measured off the tab element rather than restated from `geometry.ts`,
+ * so the two cannot drift: the only loose end is this margin, which the test pins to the helper's
+ * own constant.
+ */
+const DOCK_ARRIVE_MARGIN_PX = 8
+/**
+ * How much further the pointer has to travel *past* the peeking ball before the peek is put away,
+ * in CSS pixels.
+ *
+ * The peek has no tolerance at all without this, and the ball is flush with the screen's inner
+ * edge: `peekBallOrigin` puts it at `bounds.width - BALL_SIZE / 2`, so its left edge is the last
+ * pixel column the hand can be on before it has left the ball. A single pixel of tremor there
+ * crosses from "on the ball" to "off it", and since leaving is what dismisses the peek, the ball
+ * goes away and comes back with every twitch — the strip flickering under a hand that never
+ * actually left it.
+ *
+ * So the two directions are given different bars rather than one shared edge: a hand has to be
+ * clearly off the ball to dismiss the peek, and only has to be near it to raise one. That is what
+ * hysteresis is for, and it is why this is not a second `DOCK_ARRIVE_MARGIN_PX`: that one widens
+ * the strip so the two sides of the protocol agree about where the strip *is*, while this one
+ * deliberately makes them disagree about where the peek *ends* — the entry bar and the exit bar
+ * are 12px apart on purpose, and a pointer anywhere between them keeps whatever it had.
+ */
+const DOCK_PEEK_RELEASE_PX = 12
 const COMPOSER_MIN_PX = 72
 const COMPOSER_LINE_PX = 20
 const COMPOSER_MAX_PX = COMPOSER_MIN_PX + COMPOSER_LINE_PX * 3
@@ -423,8 +733,75 @@ function main() {
   let skipDockCommit = false
   let suppressExpand = false
   let docked
-  let dockHoverArmed = true
+  /**
+   * Whether the carry in progress came out of the dock, and so wears no carry face of its own.
+   *
+   * A press on the ball closes a hand on something the user could see, and the whole drag vocabulary
+   * applies: the lift, then the hang loop for as long as it is held. A pull out of the strip does
+   * not. The ball was hidden a moment ago and there is no pose to lift out of, so the carry has no
+   * face to wear and the ball keeps the one it arrived with — which is the drop it plays on the way
+   * out, and then its resting pose.
+   *
+   * It is a second flag rather than a reuse of {@link dragging} because `dragging` is load-bearing
+   * well beyond the picture: it is the hit-test region, the reason a hover does not expand the panel,
+   * and the flag the release reads. Only the face is being suppressed here.
+   */
+  let carriedFromDock = false
+  /**
+   * Whether the gesture in progress is a pull out of the dock, where the ball undocks and the hand
+   * does not carry it.
+   *
+   * This is the other half of {@link carriedFromDock}, and the two are consequences of the same
+   * fact — that a pull out of the strip is not a carry. That one is about the *picture* (no lift, no
+   * hang loop, the drop instead); this one is about the *motion*, and it is the one the user can feel.
+   *
+   * What a pull does instead of following the hand is travel: the helper slides the ball back on
+   * screen from behind the edge over `DOCK_SLIDE_OUT_MS`, and the drop plays across that slide, so
+   * the ball is seen coming in and falling at once. The pointer keeps its own job — it is what
+   * recognised the pull and what ends it — but it does not drag the ball, and the ball is not put
+   * under the cursor. That pairing is the feel: inward travel and 下落 together, hand off.
+   *
+   * It lasts for the whole gesture rather than just the slide, because the moments after the slide
+   * are the ones where a follow would show: the pointer is still down and still moving, and a ball
+   * that began travelling and then snapped onto the cursor would read as two gestures. Which is why
+   * it is cleared on the *press* and on the release, and read by the move handler alone.
+   *
+   * A flag of its own, and not a reuse of `carriedFromDock`, because the two answer different
+   * questions and only one of them is about the gesture's honesty: the face a dock pull wears is
+   * settled (there is no pose to lift out of), but whether the ball follows the hand is a feel the
+   * user is still deciding on. Keeping them apart is what makes bringing the follow back a one-line
+   * change — drop this guard in the move handler and the centre grab below it is live again.
+   */
+  let undocking = false
+  /**
+   * The side a press on the strip started from, latched on `pointerdown` and kept for the gesture.
+   *
+   * It is separate from {@link docked} because the hand-off clears `docked` mid-gesture while the
+   * pull is still being measured: the direction has to survive that, or the threshold would be
+   * compared against the wrong edge and every move past the hand-off would read as inward.
+   */
+  let dockSide
+  /**
+   * The pointer's own last position, in screen coordinates and in the page's, kept for the docked
+   * strip's drag.
+   *
+   * A press on the strip has no grab offset to measure — the ball is not under the pointer, it is
+   * parked off the screen edge — so both the hand-off and the offset it hands to every later move
+   * are derived from these four numbers instead. `screen - client` is the window's own origin, which
+   * is the whole of the conversion between the coordinates `orb:move` is expressed in and the ones
+   * `getBoundingClientRect` is measured in. See `handDockDragToBall`.
+   */
+  let lastScreenX = 0
+  let lastScreenY = 0
+  let lastClientX = 0
+  let lastClientY = 0
   let dockPointerInside = false
+  /**
+   * The dwell timer for the docked arrival: armed when the pointer arrives on the strip, and
+   * dropped when it leaves before {@link DOCK_ARRIVE_DWELL_MS} is up. See `beginDockArrive`.
+   *
+   * Distinct from `dockArriveTimer`, which is the clip's own hold.
+   */
   let dockHoverTimer
   let collapseTimer
   let collapseFrame
@@ -474,12 +851,29 @@ function main() {
   let replySrc
   let thinkingSrc
   let toolSrc
+  // When the last frame of each kind arrived from a conversation that is not this ball's own — the DSH window
+  // the user is actually looking at. Keyed by kind (`typing`, `thinking`, `tool`), because a turn is not one
+  // activity: it reasons, then writes, then runs a tool, and only the writing is words arriving. Kept apart
+  // from `agentState` on purpose: that is *this* page's turn, and letting somebody else's stream set it would
+  // move the ball's own clock, ring its own bell and put the transcript's tool cards into a state nothing ran.
+  const otherStreamAt = new Map()
   // The fetch face: a `data:` URL worn while a web page is being fetched. Separate from `toolSrc`
   // because a pack that names one has said something specific about that one call, and every other
   // tool still shares `tool`. `undefined` when the pack names no such file, which is what leaves
   // `tool` in charge of a fetch as well.
-  let webfetchSrc
-  let webfetchPending = false
+  // One face per tool name, as the pack answered for each: a `data:` URL, or `null` for "this call wears the
+  // shared tool face". Keyed by the name in the transcript's tool card. See `loadNamedToolFrame`.
+  const toolFrames = new Map()
+  const toolFramePending = new Set()
+  // When the transcript last changed. A block marked running counts as running only while this is recent: see
+  // `agentPhase`, and `STALE_BLOCK_MS` for why the page second-guesses the flag at all.
+  let transcriptAt = Date.now()
+  // The one pending repaint for "the claim that was keeping a face up has gone stale". See `stage`.
+  let staleAgentTimer
+  // The tool another conversation is calling, as the host reported it. Empty when the host did not say — an
+  // older host, or a frame that carried no name — in which case the shared tool face is what a call over there
+  // wears, exactly as before this existed.
+  let otherTool = ''
   // The poor frame's read, kept from racing the sweep with itself: two passes over `refreshFrames()`
   // can overlap, and the frame is a whole GIF.
   let poorPending = false
@@ -494,11 +888,95 @@ function main() {
   let arriveShown
   let arriveStep = 0
   let arrivePlayed = false
+  /**
+   * The docked arrival: the ball comes half way out of the edge on a hover of the strip, and the
+   * entrance clip plays on it once the pointer has rested there, followed by the loop the ball rests
+   * on while the pointer stays.
+   *
+   * The ball's only way back onto the desktop is still the drag in `dockTab`'s own listeners — this
+   * is a greeting, not a way out, and nothing here may unsnap anything. What it does do is *show*
+   * the ball: the strip is 34px of grey against the edge, and a clip played behind a hidden ball
+   * would be a greeting nobody could see. The dock survives it and the ball is still not the user's
+   * to move. Cached like the other named frames, because the pack's clip is megabytes and every
+   * hover would otherwise re-read it. The frames are `{ left, right }`, each `{ file, loop }` — the
+   * entrance that edge plays and the resting loop it hands over to — and only one thing is timed by a
+   * number on this page: how long the pointer has to rest before the entrance is worth playing
+   * ({@link DOCK_ARRIVE_DWELL_MS}, which is zero). How long the entrance stays up is not a number here
+   * at all: the frame carries the length the helper measured off the file (`gifDurationMs`), so a clip
+   * that is re-cut hands over on its own last frame. The loop has no hold; it ends with the hover or
+   * the dock. Two edges rather than one because the ball is drawn flush against a screen edge looking
+   * into the screen, so a clip drawn for the right edge faces out on the left: see {@link dockArriveFor}.
+   */
+  let dockArriveFrame
+  let dockArriveShown
+  let dockArriveStep = 0
+  let dockArriveTimer
+  /** Whether the frame is being read right now, so two hovers inside one read share it. */
+  let dockArrivePending = false
+  /**
+   * The sources already handed to a decoder, so a frame is warmed once rather than on every hover.
+   *
+   * A `data:` GIF arrives already downloaded, but not already *decoded*: Chromium still has to turn its
+   * frames into bitmaps, and an `<img>` paints a placeholder — the little broken-image icon inside a
+   * white edge — until that is done. The clip that showed it on every hover was the avatar: 7.7MB,
+   * already being decoded from page load, and still going when a hover swapped `src` underneath it.
+   * See {@link warmFrame}.
+   */
+  let warmedFrames = new Set()
+  /**
+   * Whether the ball is currently standing half out of its edge, shown by a hover rather than by a
+   * hand.
+   *
+   * The page's half of the helper's own `peeking`. It is what the `docked-peek` class on the body
+   * follows — and so what makes the ball visible again — and it is what {@link pointerOnUi} asks
+   * before it will count the ball itself as something the pointer is on.
+   *
+   * Dropped by `applyDocked` the moment there is no dock left, and *only* there: a peek that ends
+   * because the user pulled the strip must not tell the helper to put the window back on its tab,
+   * because the helper is about to be asked to slide the ball out from exactly where the peek left
+   * it, and it has to still believe the ball is standing there.
+   */
+  let dockPeeked = false
+  /**
+   * Whether the sweep has finished its read.
+   *
+   * Without it, a pack that names no clip — the shipped default — would re-ask on every turn of the
+   * poll and re-read a missing file for the life of the page. The read happens once; a slot that is
+   * empty stays empty, which is also what the other named frames do.
+   */
+  let dockArriveRead = false
   // The finished-task frame: one pass of a GIF whenever a turn ends by itself.
   let doneFrame
   let doneShown
+  // The acknowledgement. Not a state but an event: it is shown for the length of its own clip and then gone,
+  // which is why it carries a step rather than a flag.
+  /** The tool face in hand and the floor on how soon it may be replaced. See the note inside `syncGif`. */
+  const toolFaceHoldState = { mode: '', until: 0 }
+  let nodFrame
+  let nodPending = false
+  let nodTimer
+  let nodStep = 0
+  let nodShown
   let doneTimer
   let doneStep = 0
+  // The failure face: one pass of a GIF whenever a turn ends because it failed. The other reading of
+  // the same edge, so the two are mutually exclusive by construction — see `playFailFrame`.
+  let failFrame
+  let failShown
+  let failTimer
+  let failStep = 0
+  let failPending = false
+  // The question face: one shot of a GIF the moment the agent stops the turn to ask something,
+  // worn for `ASK_HOLD_MS` and then handed back. It sits beside the finished-task frame because
+  // the two are the same kind of event — the turn changed shape — and apart from it because they
+  // say opposite things: one turn is over, the other is parked waiting on the user.
+  let askFrame
+  let askShown
+  let askTimer
+  let askStep = 0
+  // Whether a read of that frame is already in flight, so two questions arriving inside one read
+  // share it instead of racing each other over the same GIF.
+  let askPending = false
   // The wake reaction: one pass of a GIF the moment the keyword fires, before the speaker
   // has said anything. It is the only cosmetic that answers the wake word itself.
   let wakeFrame
@@ -544,6 +1022,9 @@ function main() {
   let skitTimer
   let skitPlaying = false
   let skitFrame
+  // The skit clip played last, so the next one is drawn from the rest of the pool. Held here rather
+  // than in the helper because the plan is read once per page and the rotation outlives that read.
+  let skitLastSrc
   let hovering = false
   let typingAt = 0
   let typingTimer
@@ -1228,9 +1709,54 @@ function main() {
   function syncGif() {
     if (pageClosed()) return
     syncSleep()
+    // Read once, with a default, so this function stops being a list of everything the page has to hand it.
+    // The page tests compile `syncGif` out of this file and inject its captured variables one at a time, so
+    // every new module-level value it reads turns every one of those files red with "x is not defined" — which
+    // happened three times. A default here means the compiled body runs with nothing injected, and the only
+    // thing the tests then have to provide is what they are actually about.
+    const holdStream = typeof OTHER_STREAM_HOLD_MS === 'number' ? OTHER_STREAM_HOLD_MS : 2500
+    const holdWork = typeof OTHER_WORK_HOLD_MS === 'number' ? OTHER_WORK_HOLD_MS : 4000
+    const streamAt = typeof otherStreamAt !== 'undefined' && otherStreamAt !== null ? otherStreamAt : new Map()
+    // The pack's per-name answers, which a compiled body has no counterpart for either: an empty map is the
+    // honest default — it means "no tool has its own face", which is what every pack meant before this slot.
+    const namedToolFaces = typeof toolFrames !== 'undefined' && toolFrames !== null ? toolFrames : new Map()
+    // The tool a foreign conversation is calling, defaulted for the same reason: a compiled body has no such
+    // variable, and `''` is the honest default — it means "nobody said which tool", which is what this page
+    // assumed about every call over there before the host started sending names.
+    const namedOtherTool = typeof otherTool === 'string' ? otherTool : ''
+    // The acknowledgement cue's marker, defaulted for the same reason as the three above: a compiled body has
+    // no such variable, and `undefined` is the honest value — it says no nod is playing.
+    const nodMarker = typeof nodShown !== 'undefined' ? nodShown : undefined
+    // The turn-ending cue's marker, defaulted like the rest: a compiled body has no such variable, and
+    // `undefined` is the honest value — it says no ending is being shown.
+    const turnEndMarker = typeof turnEndShown !== 'undefined' ? turnEndShown : undefined
+    // The tool face in hand and the floor on how soon it may be replaced. Inlined rather than reached for
+    // through module scope, because the page tests compile this function alone and a name it cannot see is a
+    // rule that silently stops being tested. `faceHold` is the state object: on the page it is the module-level
+    // pair, and a test hands in its own.
+    const faceHold = typeof toolFaceHoldState === 'object' && toolFaceHoldState !== null
+      ? toolFaceHoldState
+      : { mode: ``, until: 0 }
+    const holdTheToolFace = () => {
+      if (faceHold.mode === '') return false
+      if (Date.now() >= faceHold.until) {
+        faceHold.mode = ''
+        return false
+      }
+      return true
+    }
+    const notedToolFace = (mode) => {
+      faceHold.mode = mode
+      faceHold.until = Date.now() + (typeof TOOL_FACE_HOLD_MS === 'number' ? TOOL_FACE_HOLD_MS : 1300)
+    }
     const gif = document.querySelector('#ball-gif')
-    // Being carried around the desktop outranks every pose, including the click reaction.
-    if (dragging && dragSrc !== undefined) {
+    // Being carried around the desktop outranks every pose, including the click reaction — unless
+    // the carry started at the dock, which has no carry face: see {@link carriedFromDock}. Skipping
+    // the branch rather than special-casing the source is what lets the drop below show through, so
+    // a pull out of the strip is the ball falling out of it and then resting, with no hang loop in
+    // between. Everything the *gesture* needs is unaffected — the hit-test, the suppressed hover and
+    // the docking are `dragging`'s, and that is untouched.
+    if (dragging && dragSrc !== undefined && !carriedFromDock) {
       const intro = dragIntroSrc !== undefined && Date.now() < dragIntroUntil
       const mode = intro ? 'drag-intro' : 'drag'
       if (gif.dataset.mode !== mode) {
@@ -1247,6 +1773,33 @@ function main() {
       if (gif.dataset.mode !== mode) {
         gif.dataset.mode = mode
         gif.src = dropShown.src
+      }
+      return
+    }
+    // The arrival at the dock: the greeting the ball plays *instead of* coming back out, worn while
+    // it stays hidden behind the strip. It is a cue the user asked for with their own hand — the
+    // pointer came to rest on the strip — so it sits with the click reaction rather than with the
+    // states below, and above the click reaction because the hand that pulled the strip is the
+    // gesture in progress. A carry cuts it off: the strip is being dragged, and the ball is on its
+    // way out.
+    if (dockArriveShown !== undefined) {
+      const shown = dockArriveShown
+      const mode = `dock-arrive-${shown.step}`
+      // The source is compared too, not just the mode: the entrance and the loop it hands over to
+      // share one step, so the mode does not change across the hand-off, and only the source tells
+      // the image element to switch from the entrance's frames to the loop's.
+      //
+      // The assignment itself stays plain and synchronous. Every hover changes the ball's whole
+      // picture at once, and an `<img>` paints an empty white box for as long as the incoming frames
+      // take to decode — a box that showed on *every* hover, not just the first. The cure for that is
+      // not to make this line asynchronous, which would leave the ball wearing the old clip and race
+      // every later state against the wait; it is to have the frames decoded *before* the line runs,
+      // so the browser has a bitmap the moment `src` moves. That is {@link warmFrame}, and it is
+      // called the instant the frame is read — at startup and again on any on-demand read — which is
+      // the only point at which it can be free.
+      if (gif.dataset.mode !== mode || gif.src !== shown.src) {
+        gif.dataset.mode = mode
+        gif.src = shown.src
       }
       return
     }
@@ -1270,9 +1823,52 @@ function main() {
       }
       return
     }
+    // The agent has stopped and asked the user something. It outranks the finished-task frame, the
+    // greeting, and every face the agent wears while it works — `tool` above all, because that is
+    // the one this event arrives *as*: a question is a running tool call, so a branch below the
+    // tooling face would never be reached and the ball would show its drawing board while it waited
+    // for an answer. It sits below the wake reaction, the only cue that is the user's own voice
+    // being answered: this face is a six-second *hold* rather than a cue, so a chime borrowing the
+    // ball for half a second costs it nothing, while the reverse would swallow the acknowledgement.
+    if (askShown !== undefined) {
+      const mode = `ask-${askShown.step}`
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = askShown.src
+      }
+      return
+    }
+    // The run failed. It is the same event as the finished-task frame below and the opposite news, so
+    // it sits directly above it: one of the two is up at any moment, never both. Like every other cue
+    // it outranks the resting poses — including the poor face, which is a *state* — and hands the ball
+    // back to whatever the resting logic says as soon as its one pass is over.
+    if (failShown !== undefined) {
+      const mode = `fail-${failShown.step}`
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = failShown.src
+      }
+      return
+    }
     // The task just finished. Like the click reaction this is its own event rather than a
     // state to sit in, so it briefly outranks the resting poses: a turn that ends while the
     // pointer happens to rest on the ball still has to be visible.
+    if (nodMarker !== undefined) {
+      const mode = `nod-${nodMarker.step}`
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = nodMarker.src
+      }
+      return
+    }
+    if (turnEndMarker !== undefined) {
+      const mode = `turn-end-${turnEndMarker.step}`
+      if (gif.dataset.mode !== mode) {
+        gif.dataset.mode = mode
+        gif.src = turnEndMarker.src
+      }
+      return
+    }
     if (doneShown !== undefined) {
       const mode = `done-${doneShown.step}`
       if (gif.dataset.mode !== mode) {
@@ -1322,14 +1918,21 @@ function main() {
     // different images means the swap from a fetch to the next tool call in the same turn repaints
     // nothing and leaves the fetch face frozen on the ball.
     if (agentState === 'tooling') {
-      const web = agentTool === WEB_FETCH_TOOL && webfetchSrc !== undefined
-      const mode = web ? 'webfetch' : 'tool'
-      const src = web ? webfetchSrc : toolSrc
+      // Inlined rather than called, and the same three lines appear in the other conversation's branch below.
+      // `syncGif` is the one function the page tests compile out of this file, so every helper it calls is one
+      // more name those bodies have to define — which has now cost three rounds of test wrangling for no
+      // behaviour anyone can see. Four duplicated lines are cheaper than a list of things a body must have.
+      const named = agentTool !== '' ? namedToolFaces.get(agentTool) : null
+      const mode = named !== null && named !== undefined ? `tool-named:${agentTool}` : 'tool'
+      const src = named ?? toolSrc
       if (src !== undefined) {
         if (gif.dataset.mode !== mode) {
           gif.dataset.mode = mode
           gif.src = src
         }
+        // Only a face drawn for this tool by name. The shared face is what a turn with no mapping wears, and
+        // holding that would leave a picture of a tool on a ball that is only writing.
+        if (named !== null && named !== undefined) notedToolFace(mode)
         return
       }
     }
@@ -1337,6 +1940,46 @@ function main() {
     if (thinkingSrc !== undefined && agentState === 'thinking') {
       if (gif.dataset.mode !== 'thinking') {
         gif.dataset.mode = 'thinking'
+        gif.src = thinkingSrc
+      }
+      return
+    }
+    // Everything below is *another* conversation's work, so it comes after everything above, which is this
+    // page's own turn. The three kinds are ranked the way this page ranks its own: words first, because that
+    // is the answer somebody is waiting for, then a call, then reasoning. Each has its own mode, so stepping
+    // from one kind to the next starts the clip again instead of leaving it where the last one stopped.
+    //
+    // Words being written in a conversation this ball is not in — the DSH window the user is actually looking
+    // at. The same face as the ball's own answer, because it is the same event one window over.
+    if (replySrc !== undefined && Date.now() - (streamAt.get('typing') ?? 0) < holdStream) {
+      if (gif.dataset.mode !== 'reply-elsewhere') {
+        gif.dataset.mode = 'reply-elsewhere'
+        gif.src = replySrc
+      }
+      return
+    }
+    // A call running over there. `otherTool` is the name the host sent with the window, and it is what makes a
+    // pack's per-tool faces reachable from the conversation the user is actually typing in — the ball's own
+    // transcript is elsewhere, so this page has no tool card to read the name from. `agentTool` is deliberately
+    // not consulted: that is this page's own call, which the branch above already answered for.
+    if (Date.now() - (streamAt.get('tool') ?? 0) < holdWork) {
+      const named = namedOtherTool !== '' ? namedToolFaces.get(namedOtherTool) : null
+      const suffix = named !== null && named !== undefined ? `tool-named-elsewhere:${namedOtherTool}` : 'tool-elsewhere'
+      const src = named ?? toolSrc
+      if (src !== undefined) {
+        if (gif.dataset.mode !== suffix) {
+          gif.dataset.mode = suffix
+          gif.src = src
+        }
+        if (named !== null && named !== undefined) notedToolFace(suffix)
+        return
+      }
+    }
+    // Thinking out loud over there. Its window is the longest of the three, because reasoning arrives as
+    // nothing in particular between the words rather than as a stream of its own.
+    if (thinkingSrc !== undefined && Date.now() - (streamAt.get('thinking') ?? 0) < holdWork) {
+      if (gif.dataset.mode !== 'thinking-elsewhere') {
+        gif.dataset.mode = 'thinking-elsewhere'
         gif.src = thinkingSrc
       }
       return
@@ -1372,6 +2015,10 @@ function main() {
       }
       return
     }
+    // The tool that just finished can still be in hand when nothing has taken its place yet. Everything the
+    // pack asked for has had its chance by now — this sits below every branch that means something — so the
+    // hold can only ever delay the resting faces at the bottom.
+    if (holdTheToolFace()) return
     // An open panel wears the avatar face — but a configured meme loop outranks it. The ball is
     // not doing anything in particular just because the panel happens to be showing, and a pack
     // that names an `idle` has already said what the ball looks like when it is not doing
@@ -1379,6 +2026,12 @@ function main() {
     // memes behaves exactly as before. The poor face counts as a resting loop here for the obvious
     // reason: it is the same state under a condition, and a pack that names only that one has still
     // said what the ball looks like at rest.
+    //
+    // `running` is in this condition and nowhere else. A turn in flight briefly wore the reasoning face
+    // instead, on the theory that a turn in progress is work in progress — and it made a *resting* ball wear a
+    // tool face, which is what a missing reasoning frame plus a tool-shaped fallback adds up to. The frozen
+    // avatar is vague, but it is never wrong about which action is happening, and a model between two chunks is
+    // not doing any action in particular.
     const play = running || asking() || tccGateVisible || attachedSelection !== ''
       || (expanded && idleSrc === undefined && !brokeNow())
     if (play) {
@@ -1414,6 +2067,14 @@ function main() {
     // one for an account that is nearly out of money. Which of them is worn is a decision rather than
     // a state, so it is made here, on every repaint — a balance that falls below the line changes the
     // face the ball is already wearing, and topping up changes it back.
+    //
+    // Docked, neither of them: the ball belongs to the strip and wears what the strip puts on it. So
+    // docked returns *before* the idle branch and, just as importantly, before the `still` branch
+    // below — that one is the frozen avatar for a ball with no loop to wear, and reaching it froze the
+    // ball onto a canvas and painted that back over the clip, which read as a flicker at the end of
+    // every hover. Leaving the element alone is the whole of the docked contract: whatever the strip
+    // last put on it stays, and the arrival above replaces it when the dwell fires.
+    if (docked !== undefined) return
     const broke = brokeNow()
     if (broke || idleSrc !== undefined) {
       const mode = broke ? 'poor' : 'idle'
@@ -1445,10 +2106,25 @@ function main() {
   /**
    * The ball is at rest: neither the user nor the agent is doing anything with it. Only
    * while this holds does the nap clock run, and any activity starts it over.
+   *
+   * Another conversation counts. `agentState` is only ever about *this* panel's transcript, so while the user
+   * works in the DSH window the ball reads as idle here — and the skit and the nap clock, which are gated on this,
+   * would go off in the middle of somebody else's answer and paint over the very face that says work is happening.
+   * Reported as the skit covering the work animations, which is exactly what it was.
+   *
+   * The windows are read without going through `syncGif`'s local copies: this is module scope, and the values are
+   * the module-level constants. Nothing here clears a window — that is the repaint's business, not a predicate's.
    */
   function restingNow() {
+    const elsewhere = otherStreamAt
+    const busyElsewhere = Date.now() - (elsewhere.get('typing') ?? 0) < OTHER_STREAM_HOLD_MS
+      || Date.now() - (elsewhere.get('tool') ?? 0) < OTHER_WORK_HOLD_MS
+      || Date.now() - (elsewhere.get('thinking') ?? 0) < OTHER_WORK_HOLD_MS
+    // And the floor under a per-tool face: while one is still up, the ball is not resting either.
+    const holdingFace = toolFaceHoldState.mode !== '' && Date.now() < toolFaceHoldState.until
     return !pageClosed() && !hovering && !expanded && !running && !asking()
       && !tccGateVisible && attachedSelection === '' && agentState === ''
+      && !busyElsewhere && !holdingFace
       && !document.body.classList.contains('docked')
   }
 
@@ -1601,8 +2277,16 @@ function main() {
     let thinking = false
     let tooling = false
     let tool = ''
+    // A block marked running is believed only while the transcript is still moving. The host settles a tool call
+    // by matching its result on an id, and settles every open block when a turn ends — and when neither happens
+    // the flag stays up forever, which is what leaves the ball frozen on a tool face with no way back. A model
+    // that is actually working is never silent for `STALE_BLOCK_MS`: tokens arrive either side of a call, and the
+    // call's own status changes while it runs. So silence is the signal that the flag is abandoned rather than
+    // true, and the ball goes back to resting on its own.
+    const stale = Date.now() - transcriptAt > STALE_BLOCK_MS
     for (const block of blockData.values()) {
       if (block.running !== true) continue
+      if (stale) continue
       if (block.kind === 'assistant') return { state: 'replying', tool: '' }
       if (block.kind === 'tool') {
         tooling = true
@@ -1618,20 +2302,23 @@ function main() {
 
   /** Repaint only when the phase or the running tool flips, not on every token. */
   function syncAgent() {
+    // The page tests compile this function on its own, so a helper it calls has to be either inlined or
+    // defaulted here — and this one cannot be inlined, because its whole job is to ask the helper process for a
+    // file and cache the answer. A no-op default keeps a compiled body running and changes nothing in the page.
+    const readNamedTool = typeof loadNamedToolFrame === 'function' ? loadNamedToolFrame : () => {}
     const next = agentPhase()
     if (next.state === agentState && next.tool === agentTool) return
     const wasTooling = agentState === 'tooling'
     agentState = next.state
+    // The name before the face that depends on it: the tool branches read `agentTool`, so loading first would
+    // ask for the previous call's file and leave the new one waiting for the next repaint.
     agentTool = next.tool
-    // A fetch that starts before the frame sweep has made its round would otherwise wear the
-    // generic tool face for the whole call, which is the one call worth having a face for.
-    if (next.state === 'tooling' && next.tool === WEB_FETCH_TOOL && webfetchSrc === undefined) {
-      void loadWebfetchFrame()
-    } else if (wasTooling) {
-      // The call that was being fetched has finished, so the frame it was reading is dead weight.
-      // Dropping it lets the next fetch ask again, which is what makes editing `memes.json` take
-      // effect without a restart.
-      webfetchSrc = undefined
+    if (next.state === 'tooling') {
+      // A call that names a tool the pack draws apart has to ask for that file, and the first call of a session
+      // routinely starts before the frame sweep has made its round. Asking for a name the pack has already
+      // answered for is a no-op inside — the cache holds both a picture and a "nothing special" — so this costs
+      // nothing on the second call of a turn.
+      void readNamedTool(next.tool)
     }
     syncGif()
   }
@@ -1718,6 +2405,11 @@ function main() {
     return Math.round(low + Math.random() * (high - low))
   }
 
+  /** One of `list`, chosen at random. Callers guarantee a non-empty list. */
+  function pickOne(list) {
+    return list[Math.floor(Math.random() * list.length)]
+  }
+
   function wait(ms) {
     return new Promise((resolve) => { setTimeout(resolve, ms) })
   }
@@ -1749,16 +2441,60 @@ function main() {
   }
 
   /**
-   * One skit: the repeated frame a few times, with the interjection dropped in the middle.
-   * The order is fixed here; only the number of repeats is random.
+   * The frame a plan item carries as its identity — a single clip itself, a run its first clip.
+   *
+   * A run is remembered by where it starts, because that is what the ball shows while it plays: the
+   * rotation in {@link rotateSkit} is about not beginning the same gag twice in a row.
+   */
+  function skitLead(item) {
+    return item.kind === 'sequence' ? item.frames[0] : item.frame
+  }
+
+  /**
+   * The item this skit plays: one of the plan's pool, drawn here rather than by the helper.
+   *
+   * The helper hands the plan over once, when the page loads, and this runs every few minutes for as
+   * long as the ball is on screen — so the page is the only half that knows what it played last, and
+   * that is exactly the item left out of the draw. A pool of one is all repeats by definition, so it
+   * is handed over as it is.
+   */
+  function rotateSkit(pool) {
+    const candidates = pool.length > 1 ? pool.filter((item) => skitLead(item).src !== skitLastSrc) : pool
+    const item = candidates.length > 0 ? pickOne(candidates) : pool[0]
+    skitLastSrc = skitLead(item).src
+    return item
+  }
+
+  /**
+   * One skit's frames, in order: a run played once through, or a repeated clip with an interjection.
+   *
+   * Which of the two is the item's own kind. A *run* is a scripted sequence — the pack drew a gag with
+   * a setup and a punchline — so it plays each of its clips once, in the order the config wrote them,
+   * and stops there: no repeats and no interjection, because the last clip is what ends it. A *single*
+   * clip is the loop this slot has always been, repeated a few times with the interjection dropped in
+   * the middle; only the number of repeats is random there.
    */
   function skitSequence(info) {
+    const pool = Array.isArray(info.files) && info.files.length > 0 ? info.files : [info.item]
+    // A plan the page cannot read is a plan that plays nothing, rather than one that throws on the
+    // resting loop's timer — the same reading every other cue in this file takes of a missing file.
+    const known = pool.filter((item) => item !== null && typeof item === 'object'
+      && (item.kind === 'sequence' ? Array.isArray(item.frames) && item.frames.length > 0 : item.frame !== undefined))
+    if (known.length === 0) return []
+    const item = rotateSkit(known)
+    if (item.kind === 'sequence') return [...item.frames]
+    const file = item.frame
     const count = pickIn(info.times)
     const frames = []
     const middle = Math.floor(count / 2)
     for (let index = 0; index < count; index += 1) {
-      if (index === middle && info.interject !== null) frames.push(info.interject)
-      frames.push(info.file)
+      // An interjection that is the clip being interrupted is not an interruption: the sequence
+      // drops it, which is how every other cue in this file keeps one clip from being handed to the
+      // ball twice in a row.
+      if (index === middle && info.interject !== null && info.interject.src !== file.src) {
+        frames.push(info.interject)
+      }
+      frames.push(file)
     }
     return frames
   }
@@ -1808,6 +2544,16 @@ function main() {
    * keeps its frozen avatar, so a config that names none of them costs nothing.
    */
   async function refreshFrames() {
+    // The resting face, warmed before anything else. This is the `<img>`'s own `src` in the markup —
+    // `deepseek-avatar-square.gif`, 7.7MB — so the browser is already fetching and decoding it from the
+    // moment the page loads, whether or not a single slot is configured. It is also the face the ball
+    // is wearing whenever nothing else applies, which is exactly the state a docked hover starts from.
+    //
+    // Warming it here is what keeps a hover from showing a broken-image placeholder: the hover swaps
+    // `src` to one of the small clips, and if that giant is still mid-decode the browser is running two
+    // decodes at once and paints its "not ready" box — the little icon with a white edge — instead of
+    // either picture. Asking for it up front means it is finished long before a pointer can arrive.
+    warmFrame(avatarSrc)
     if (idleSrc === undefined) {
       const src = await fetchFrame(() => api.memeIdle())
       if (src !== undefined) {
@@ -1841,7 +2587,6 @@ function main() {
         syncGif()
       }
     }
-    if (webfetchSrc === undefined) await loadWebfetchFrame()
     if (sleepInfo === undefined || sleepInfo === null) {
       const plan = await fetchSleep()
       if (plan !== null) {
@@ -1862,17 +2607,45 @@ function main() {
       const frame = await fetchClick()
       if (frame !== null) clickFrame = frame
     }
+    if (nodFrame === undefined || nodFrame === null) {
+      const frame = await fetchNod()
+      if (frame !== null) nodFrame = frame
+    }
     if (doneFrame === undefined || doneFrame === null) {
       const frame = await fetchDone()
       if (frame !== null) doneFrame = frame
+    }
+    // Read in the sweep with the other turn-end faces. The on-demand read in `playFailFrame` is the
+    // safety net for a failure that beats the sweep; this is what makes the common case instant.
+    if (failFrame === undefined || failFrame === null) {
+      const frame = await fetchFail()
+      if (frame !== null) failFrame = frame
     }
     if (wakeFrame === undefined || wakeFrame === null) {
       const frame = await fetchWake()
       if (frame !== null) wakeFrame = frame
     }
+    if (askFrame === undefined || askFrame === null) {
+      const frame = await fetchAsk()
+      if (frame !== null) askFrame = frame
+    }
     if (dropFrame === undefined || dropFrame === null) {
       const frame = await fetchDrop()
       if (frame !== null) dropFrame = frame
+    }
+    // Read in the sweep like the other named faces. This is the one that matters most: the clip is
+    // only ever played by a hover, and a hover can arrive seconds after the page does. Marked read
+    // whether or not a file resolved, so an empty slot is asked about once rather than every turn.
+    if (!dockArriveRead) {
+      dockArriveRead = true
+      const frame = await fetchDockArrive()
+      dockArriveFrame = frame === null ? null : frame
+      // Warmed the moment the edges are in hand, so the hover that arrives later is not the first thing
+      // to ask the decoder for these frames. This is the difference between a box on the ball and a fish,
+      // and it costs nothing until a hover asks for it. Both edges, because the clip the *other* edge
+      // would play is the one the next drag out and back in will ask for.
+      warmDockArriveFrame(dockArriveFrame?.left)
+      warmDockArriveFrame(dockArriveFrame?.right)
     }
     if (voiceSrc === undefined) await loadVoiceFrame()
     if (speakSrc === undefined) await loadSpeakFrame()
@@ -2025,7 +2798,7 @@ function main() {
     if (clickFrame === undefined || clickFrame === null) return
     clickStep += 1
     clickShown = { src: clickFrame.src, step: clickStep }
-    const hold = oneShotHoldMs(clickFrame.ms, clickFrame.loops)
+    const hold = clickHoldMs(clickFrame)
     clearTimeout(clickTimer)
     clickTimer = setTimeout(() => {
       clickShown = undefined
@@ -2046,6 +2819,337 @@ function main() {
     if (!Array.isArray(frames)) return null
     const usable = frames.map((frame) => timedFrameOf(frame)).filter((frame) => frame !== null)
     return usable.length === 0 ? null : usable
+  }
+
+  /**
+   * Hide the ball's picture while it has no picture, and show it the moment it has one.
+   *
+   * An `<img>` waiting on a source paints a box of its own: a small broken-image glyph in the top-left
+   * corner, inside a white-edged rectangle. Docked, the clip's square corners let that box read for
+   * exactly what it is — the user saw a flash of an empty frame, with an icon in it, on every hover.
+   *
+   * Decoding ahead of time does not prevent it, and it is worth being clear about why, because it was
+   * tried first and did not work: a swap starts a fresh decode every time, and the box is what an
+   * `<img>` paints *during* one. A warmed cache shortens that window; it cannot close it.
+   *
+   * So the element is hidden for exactly the interval in which it has a source it cannot yet draw, and
+   * the only way to know that interval is to watch the assignment that starts it. `src` is therefore
+   * shadowed on this one element: the setter marks the picture as not drawn *before* handing the value
+   * on, and the element's own `load` — the only party that knows a decode has finished — marks it drawn
+   * again. The getter is untouched, so every reader in the page (`syncGif`'s comparisons, the tests'
+   * `shown()`) sees the same string it always did.
+   *
+   * Nothing here waits on anything and nothing here is awaited: a caller of `syncGif` gets its `src`
+   * assignment done synchronously as before, which is what keeps the swap free of races. Only the
+   * drawing of the element is gated, and an element that is merely invisible still has its box, so
+   * `pointerOnUi`'s `getBoundingClientRect()` — and the strip's hover with it — is unaffected.
+   *
+   * Two ways to change the picture, and both have to go through the gate. Assigning `src` is the one
+   * every face in `syncGif` uses; *removing* the attribute is the one the docked peek uses to strip the
+   * idle loop off a ball coming out of the dock, and it is not a `src` assignment at all — so shadowing
+   * the property alone left it ungated. Measured in Chromium, that is the flash: `removeAttribute('src')`
+   * leaves `complete` true and `naturalWidth` 0, and it fires **no** event. Nothing puts `ball-drawn` back
+   * to false, the rule below never hides the element, and the engine paints the broken-image box — the
+   * white rectangle with the little picture glyph in its top-left corner — for the whole 120 ms
+   * `DOCK_ARRIVE_DWELL_MS` between the peek appearing and the entrance landing. `src` is therefore only
+   * one of the two attributes watched, and the pair is the whole of "this element has no picture".
+   *
+   * A source that fails takes the `error` path and leaves the ball undrawn, which is the honest answer:
+   * there is nothing to show, and a box saying so is worse than an absence.
+   */
+  function armBallPicture() {
+    const ball = document.querySelector('#ball-gif')
+    if (ball === null || typeof ball.addEventListener !== 'function') return
+    const setDrawn = (drawn) => {
+      if (drawn) document.body.classList.add('ball-drawn')
+      else document.body.classList.remove('ball-drawn')
+    }
+    setDrawn(ball.complete === true && ball.naturalWidth > 0)
+    ball.addEventListener('load', () => setDrawn(true))
+    ball.addEventListener('error', () => setDrawn(false))
+    // `HTMLImageElement.prototype.src` is where the real accessor lives, so the shadow delegates to it
+    // rather than reimplementing the URL resolution — a relative path has to keep resolving against the
+    // document, which is not this function's business to know.
+    const proto = Object.getPrototypeOf(ball)
+    const real = Object.getOwnPropertyDescriptor(proto, 'src')
+    if (real === undefined || real.set === undefined) return
+    // The other half of the same gate, for the other way the picture is taken away. `removeAttribute`
+    // is shadowed on this one element only, and it marks the picture undrawn *before* the attribute
+    // goes: the box exists from the moment the source does, and a hide queued behind the removal would
+    // be a hide one frame too late. Nothing else about the call changes — it delegates to the real
+    // method, so `hasAttribute('src')` still answers false afterwards and every reader sees the
+    // element it always did.
+    const realRemove = ball.removeAttribute
+    ball.removeAttribute = function removeAttribute(name) {
+      if (name === 'src') setDrawn(false)
+      return realRemove.call(this, name)
+    }
+    Object.defineProperty(ball, 'src', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return real.get.call(ball)
+      },
+      set(value) {
+        // Before the assignment, not after: the placeholder exists from the moment the source changes,
+        // and a hide queued behind it would be a hide one frame too late.
+        setDrawn(false)
+        real.set.call(ball, value)
+      },
+    })
+  }
+
+  /**
+   * Hand a source to a decoder now, so whatever puts it on screen later has nothing to wait for.
+   *
+   * This does not stop the flash on its own and is not the fix for it — see {@link armBallPicture} for
+   * what is. It is kept because it is what makes the hidden window *short*: a frame already decoded
+   * answers from cache instead of decoding again, so the ball is undrawn for a repaint rather than for
+   * a whole clip.
+   *
+   * The ball is one `<img>` that changes its whole picture constantly, and a `data:` clip is already
+   * downloaded by the time anything asks for it, so what is left is Chromium's decode. Warming decodes
+   * into the same cache the real element reads from, off-screen, at the moment the source is *known*
+   * rather than at the moment the pointer arrives. There is no way to make the swap itself wait without
+   * leaving the ball wearing the previous face and racing every later state against the wait.
+   *
+   * Off-screen and invisible on purpose. A warmer that flashed on the ball would trade a box for a fish,
+   * and one that sat in the layout would make the page measure a second ball. `decode()` is asked for
+   * rather than `onload` because it resolves only once the frames are actually paintable. A source that
+   * fails to decode is dropped from the set and warmed again next time: a clip that cannot decode now
+   * will not decode later either, and one more attempt on a slot the user has not fixed costs nothing.
+   */
+  function warmFrame(src) {
+    if (typeof src !== 'string' || src === '' || warmedFrames.has(src)) return
+    warmedFrames.add(src)
+    const warm = new Image()
+    warm.decoding = 'sync'
+    warm.src = src
+    void warm.decode().catch(() => {
+      warmedFrames.delete(src)
+    })
+  }
+
+  /** Warm one edge's clips: the entrance, and the loop it hands over to. */
+  function warmDockArriveFrame(frame) {
+    if (frame === undefined || frame === null) return
+    warmFrame(frame.file.src)
+    warmFrame(frame.loop)
+  }
+
+  /**
+   * The docked arrival clips, or `null` while the pack names none, names one that is not on disk, or
+   * is an older build with no such channel.
+   *
+   * Every one of those answers is the same answer, and that is the whole of the fallback: a profile
+   * whose `dockArrive` slot is missing or misspelled leaves the strip exactly as it was — no clip,
+   * no error, and the drag out of the dock is untouched because it never went through here. The one
+   * deliberate exception is a read that fails while the page is up: that is reported once, because
+   * a slot that is configured and silently never plays is the one thing here worth a log line.
+   *
+   * Both edges arrive in one answer and this page keeps the pair, rather than asking again when the
+   * ball docks to the other edge: the ball is drawn flush against the edge and looking *into* the
+   * screen, so the two edges want mirrored pictures, and the read that has to be free is the one a
+   * hover waits on. The left edge falls back to the right's clip when the pack named none for it,
+   * which is every profile written before the `left` key existed.
+   */
+  async function fetchDockArrive() {
+    if (typeof api.memeDockArrive !== 'function') return null
+    let frames
+    try {
+      frames = await api.memeDockArrive()
+    } catch (error) {
+      console.warn('dockArrive: the meme channel failed', error)
+      return null
+    }
+    // The channel answers `{ left, right }` now, each half `{ file, loop }`. Two older shapes are accepted
+    // too: a bare `{ file, loop }`, which is the same clip on both edges, and a bare `{ src, ms }`, which
+    // the page used to play as the whole of the arrival. Each is the exact behaviour of the build that
+    // sent it, so an older helper keeps the strip it always had.
+    if (frames === null || typeof frames !== 'object') return null
+    const entranceOf = (value) => {
+      if (value === null || typeof value !== 'object') return null
+      if ('file' in value) {
+        const file = timedFrameOf(value.file)
+        if (file === null) return null
+        const loop = typeof value.loop === 'string' && value.loop !== '' ? value.loop : null
+        return { file, loop }
+      }
+      const file = timedFrameOf(value)
+      return file === null ? null : { file, loop: null }
+    }
+    if ('right' in frames || 'left' in frames) {
+      const right = entranceOf(frames.right)
+      if (right === null) return null
+      const left = frames.left === undefined || frames.left === null ? right : entranceOf(frames.left)
+      return { left: left ?? right, right }
+    }
+    const both = entranceOf(frames)
+    return both === null ? null : { left: both, right: both }
+  }
+
+  /** The clip for the edge the ball is docked to, falling back to the shared one. */
+  function dockArriveFor(side) {
+    if (dockArriveFrame === undefined || dockArriveFrame === null) return null
+    return side === 'left' ? dockArriveFrame.left : dockArriveFrame.right
+  }
+
+  /**
+   * The docked arrival: the pointer rested on the strip, so the entrance plays once and the loop
+   * the ball rests on after it — if the pack named one — takes over.
+   *
+   * The frame is normally already in hand — `refreshFrames()` asks for it at startup — and the
+   * on-demand read below is for the first hover after a restart, which can beat that sweep. A hover
+   * that arrives while the read is in flight joins it rather than starting a second one, because
+   * the frame is a whole GIF and two hovers inside one read are one clip.
+   *
+   * The hand-over is timed by the clip's *own* measured length, which the frame carries as `ms`
+   * (`gifDurationMs` in `memes.ts` reads the frame delays out of the bytes). It used to be a constant
+   * on this page, measured once against `冒泡 1登场水平翻转.gif` when that file was 30 frames of 40 ms, and
+   * the file was then cut down to 22 — the constant stayed at 1280 ms, and the extra 400 ms was enough
+   * for the entrance to start its second pass before the loop replaced it. What the eye saw was "it
+   * played once and then played the beginning again". Nothing here has to know how long a clip is: the
+   * read that hands the frame over measures it, so a clip of any length, re-cut at any time, hands over
+   * on its own last frame.
+   *
+   * It is the clip's *whole* length and not the `oneShotHoldMs` share of it: the lead that rule takes
+   * exists to dodge a restart, and there is nothing to dodge — what follows the arrival is the loop the
+   * ball rests in rather than a pose held on the end of it. The loop has no hold of its own: it is the
+   * resting face, and it stays until the pointer leaves or the dock goes, both of which run through
+   * {@link clearDockArrive}.
+   */
+  function playDockArrive() {
+    if (dockArriveFrame === undefined) {
+      if (dockArrivePending) return
+      dockArrivePending = true
+      void fetchDockArrive().then((frames) => {
+        dockArrivePending = false
+        if (frames === null) return
+        dockArriveFrame = frames
+        // Same reasoning as the sweep above, on the path a hover beats the sweep to. The read is why
+        // the first hover after a restart is the one that flashes, so this is the read that matters
+        // most — warming it here is what makes that first hover quiet too. Both edges are warmed: the
+        // clip the *other* edge would play is the one the next drag out and back in will ask for.
+        warmDockArriveFrame(frames.left)
+        warmDockArriveFrame(frames.right)
+        playDockArrive()
+      })
+      return
+    }
+    // The edge the ball is standing on, which is what picks the picture: the two edges want mirrored
+    // clips because the ball looks into the screen from either one.
+    const arrival = dockArriveFor(docked)
+    // No clip for this edge — the pack names none, or named one that is not on disk. Silent, and the
+    // strip still drags the ball out.
+    if (arrival === null) return
+    const entrance = arrival.file
+    stopDockArriveTimer()
+    // A new step every hover, so the image element reloads the clip instead of holding the pose the
+    // last hover stopped on. Hovering again restarts it from the first frame, which is the point.
+    dockArriveStep += 1
+    dockArriveShown = { src: entrance.src, step: dockArriveStep }
+    dockArriveTimer = setTimeout(() => {
+      dockArriveTimer = undefined
+      // The entrance is done. With a loop the ball rests on it — the same `dock-arrive-N` face, only
+      // now drawing the loop's own frames — and without one it goes back to the docked idle, which is
+      // exactly what a hover did before the loop existed.
+      dockArriveShown = arrival.loop === null
+        ? undefined
+        : { src: arrival.loop, step: dockArriveStep }
+      syncGif()
+    }, entrance.ms)
+    syncGif()
+  }
+
+  /**
+   * Show the ball half way out of the edge it is docked to, as the strip's hint.
+   *
+   * One step, and the order inside it is the only thing here worth stating: the class goes on
+   * *after* the helper has grown the window. The ball is drawn at `--ball-column` inside it, which
+   * a 34px tab rect has no room for, so showing it first would paint a slice of ball clipped by the
+   * edge of a strip for as long as the round trip takes.
+   *
+   * The pointer is re-checked after the await, because the round trip is long enough for it to have
+   * left the strip or for the user to have started pulling the ball out. Either of those closes the
+   * peek; this only has to notice, rather than paint over the top of it.
+   */
+  async function openDockPeek() {
+    // The other half of the retired hover gesture. Checked here as well as in `beginDockArrive` because this is
+    // the only function that asks the helper to slide the ball out, and a caller that reaches it another way must
+    // not be able to bring the frame back. See {@link DOCK_HOVER_ENABLED}.
+    if (!DOCK_HOVER_ENABLED) return
+    if (docked === undefined || dockPeeked) return
+    // An older helper has no peek to ask for, and the channel is the whole mechanism: without it
+    // there is nowhere to show the ball, so the strip behaves exactly as it did before this existed
+    // rather than playing a clip on an element that is off the screen.
+    if (typeof api.peekDock !== 'function') return
+    const side = docked
+    // Claimed before the await, so a second hover during the round trip joins this one instead of
+    // starting a second peek on the same strip.
+    dockPeeked = true
+    // Stripped, not repainted, and *before* the round trip rather than after it.
+    //
+    // The ball is on screen now carrying whatever it wore before the dock — the idle loop — and
+    // `#ball-gif` has no background of its own, so taking the source off leaves the half ball blank
+    // until the dwell puts the arrival on it. That is the whole of the docked contract between the
+    // peek appearing and the entrance starting: nothing to look at, and nothing from the state the
+    // ball was in before the strip took it.
+    //
+    // A repaint here would be worse than useless. Docked, `syncGif` leaves the element alone (see the
+    // note above the idle branch), and the only thing below it would do is `freezeGif` — which
+    // repaints the element from a canvas and puts that back as its source, so the avatar would flash
+    // over the arrival at the end of every hover.
+    //
+    // Where the line sits is the other half of that contract, and it is not cosmetic. `beginDockArrive`
+    // does not await this function: it arms `DOCK_ARRIVE_DWELL_MS` in the same breath, so the dwell and
+    // this round trip are a race. Stripped *after* the await, a round trip slower than the dwell lands
+    // the arrival on the ball first and this line then takes that arrival off again — and nothing puts
+    // it back, because `syncGif`'s `dock-arrive-N` branch finds the mode and the source already equal to
+    // what it was about to assign and skips the swap. The ball would be left with no picture for the
+    // rest of the hover, which is the empty frame this slot keeps growing back. Stripped *before* it,
+    // there is nothing left for the order of the two halves to decide: the element is empty from the
+    // first frame of the peek, whatever the helper takes to answer.
+    const gif = document.querySelector('#ball-gif')
+    if (gif !== null) gif.removeAttribute('src')
+    // Re-checked after the await, because the round trip is long enough for the pointer to have left
+    // the strip or started pulling the ball out. Either of those closes the peek; this only has to
+    // notice, rather than paint over the top of it.
+    await api.peekDock()
+    if (!dockPeeked || docked !== side) return
+    document.body.classList.add('docked-peek')
+    // The ball is on screen now, so the rects the window has to capture over have changed — and it
+    // is reported *after* the window has grown, or the rect would describe where the ball was.
+    syncHitTest()
+  }
+
+  /**
+   * Put the ball back behind its strip.
+   *
+   * The reverse order, for the same reason: the ball comes off the screen before the window shrinks
+   * under it. `applyDocked` does the page's half by itself when the dock goes, so this is only for
+   * a peek that ends with the dock still standing — the pointer leaving the strip.
+   */
+  async function closeDockPeek() {
+    if (!dockPeeked) return
+    dockPeeked = false
+    document.body.classList.remove('docked-peek')
+    syncHitTest()
+    if (typeof api.unpeekDock !== 'function') return
+    await api.unpeekDock()
+  }
+
+  /** Put the arrival away, timer and all. The ball keeps whatever face the rest of `syncGif` says. */
+  function clearDockArrive() {
+    stopDockArriveTimer()
+    if (dockArriveShown === undefined) return
+    dockArriveShown = undefined
+    syncGif()
+  }
+
+  function stopDockArriveTimer() {
+    if (dockArriveTimer === undefined) return
+    clearTimeout(dockArriveTimer)
+    dockArriveTimer = undefined
   }
 
   /**
@@ -2153,6 +3257,117 @@ function main() {
     syncGif()
   }
 
+  /** The acknowledgement frame, or `null` while it is off or unreadable. */
+  async function fetchNod() {
+    if (typeof api.memeNod !== 'function') return null
+    let frame
+    try {
+      frame = await api.memeNod()
+    } catch {
+      return null
+    }
+    return timedFrameOf(frame)
+  }
+
+  /**
+   * Show the acknowledgement once.
+   *
+   * Called when the user has just handed the agent something to do — from this panel's composer, or from another
+   * window if the host reports it. Nothing is shown when the pack names no file, so a pack without this slot
+   * behaves exactly as it did. The hold is the clip's own length, cut before its loop point by
+   * {@link oneShotHoldMs}: this is a nod, not a loop.
+   */
+  function playNodFrame() {
+    if (nodFrame === undefined || nodFrame === null) {
+      if (nodPending) return
+      nodPending = true
+      void fetchNod().then((frame) => {
+        nodPending = false
+        if (frame === null) return
+        nodFrame = frame
+        playNodFrame()
+      })
+      return
+    }
+    nodStep += 1
+    nodShown = { src: nodFrame.src, step: nodStep }
+    clearTimeout(nodTimer)
+    nodTimer = setTimeout(() => {
+      nodShown = undefined
+      syncGif()
+    }, oneShotHoldMs(nodFrame.ms, nodFrame.loops))
+    syncGif()
+  }
+
+  /**
+   * The endings that arrive from the host rather than from this page's own transcript.
+   *
+   * `turn/end` carries the reason a turn stopped, and the reason is what tells these four apart — the assistant
+   * stream's own `end` frame only says a stream stopped. So the host classifies it and sends
+   * `{ type: 'turn-ended', category }`; this plays whatever the pack drew for that category.
+   *
+   * One entry per face, and each is a one-shot: it is shown for the length of its own clip and then handed back.
+   * A category the pack names no file for resolves to `null` and nothing is shown, which is what lets a config
+   * turn any of the four off without a code change.
+   */
+  const TURN_END_READERS = {
+    done: () => api.memeDone(),
+    fail: () => api.memeFail(),
+    interrupted: () => api.memeInterrupted(),
+    approval: () => api.memeApproval(),
+    maxtokens: () => api.memeMaxtokens(),
+    // The sixth. Its face was missing from this table while the other five were listed, so a question asked in
+    // the DSH window played nothing at all — and the ball's *own* questions hid it, because those arrive as a
+    // block in its transcript and go through `playAskFrame` instead of here.
+    ask: () => api.memeAsk(),
+  }
+  /** The frame in hand per category, `null` once the helper has said there is none. */
+  const turnEndFrames = new Map()
+  const turnEndPending = new Set()
+  const turnEndTimers = new Map()
+  let turnEndStep = 0
+  let turnEndShown
+
+  /**
+   * Show the face for one turn ending, once.
+   *
+   * The frame is read on demand: the first ending of a session routinely beats the startup sweep, and a face that
+   * arrives after the clip is over is a face nobody sees. `turnEndPending` keeps two endings inside that one read
+   * from racing over the same GIF, which is a whole file.
+   */
+  async function playTurnEndFrame(category) {
+    const read = TURN_END_READERS[category]
+    if (read === undefined) return
+    if (!turnEndFrames.has(category)) {
+      if (turnEndPending.has(category)) return
+      turnEndPending.add(category)
+      let frame = null
+      try {
+        frame = timedFrameOf(await read())
+      } catch {
+        // A read that failed is not an answer: it stays uncached, so the next ending asks again.
+      } finally {
+        turnEndPending.delete(category)
+      }
+      if (frame === null) return
+      turnEndFrames.set(category, frame)
+    }
+    const frame = turnEndFrames.get(category)
+    if (frame === null) return
+    turnEndStep += 1
+    turnEndShown = { src: frame.src, step: turnEndStep }
+    clearTimeout(turnEndTimers.get(category))
+    turnEndTimers.set(category, setTimeout(() => {
+      turnEndTimers.delete(category)
+      // Only if nothing newer has taken the ball: a second ending inside the first one's hold outranks it.
+      if (turnEndShown?.step === turnEndStep) turnEndShown = undefined
+      syncGif()
+      // A floor, not a length: the clip keeps its own timing and this only stops a sub-second clip from being a
+      // flash. See {@link TURN_END_MIN_HOLD_MS}.
+    }, Math.max(oneShotHoldMs(frame.ms, frame.loops), TURN_END_MIN_HOLD_MS)))
+    syncGif()
+  }
+
   /** The finished-task frame, or `null` while it is off or unreadable. */
   async function fetchDone() {
     if (typeof api.memeDone !== 'function') return null
@@ -2183,7 +3398,152 @@ function main() {
     syncGif()
   }
 
-  /** The skit plan: `{ gapMs, file, times, interject }`, or `null` while it is off or unreadable. */
+  /** The failure frame, or `null` while it is off or unreadable. */
+  async function fetchFail() {
+    if (typeof api.memeFail !== 'function') return null
+    let frame
+    try {
+      frame = await api.memeFail()
+    } catch {
+      return null
+    }
+    return timedFrameOf(frame)
+  }
+
+  /**
+   * Play the failure face once.
+   *
+   * The other half of the same edge `playDoneFrame` answers: a turn that ran to its own end rings, a
+   * turn that threw wears this. It is called from {@link setRunning} rather than from a cue of its own,
+   * because the host says which of the two it was in the same message — `{ type: 'turn', running: false,
+   * failed: true, failure: { code, message } }` — and a failed run is not something to celebrate.
+   *
+   * A frame that is not in hand is read on demand: the first failure after a page load can beat the
+   * frame sweep, and being told to wait for a poll before the ball will admit something broke is not
+   * acceptable. A pack that names no failure face resolves to `null` and the ball keeps the face it
+   * had, which is the whole of the fallback.
+   */
+  function playFailFrame() {
+    if (failFrame === undefined || failFrame === null) {
+      if (failPending) return
+      failPending = true
+      void fetchFail().then((frame) => {
+        failPending = false
+        if (frame === null) return
+        failFrame = frame
+        playFailFrame()
+      })
+      return
+    }
+    failStep += 1
+    failShown = { src: failFrame.src, step: failStep }
+    clearTimeout(failTimer)
+    failTimer = setTimeout(() => {
+      failShown = undefined
+      syncGif()
+    }, oneShotHoldMs(failFrame.ms, failFrame.loops))
+    syncGif()
+  }
+
+  /**
+   * Whether a tool name is one of the ways a subagent is run.
+   *
+   * Kept for the one thing left to build: a subagent that *stopped working* is only visible in the child
+   * session's own log — `turn/end: { reason: { kind: 'error' } }` — which the helper can read and this
+   * page cannot, and this is the name the host will have to match to say which call it belonged to.
+   *
+   * A predicate that read the parent's side was written and measured away. `upsertBlock` sees the
+   * subagent's call settle, so `detail.isError` looked like the signal; against two real subagents whose
+   * insides failed — a `read` of a missing file, and a shell syntax error — the parent's `tool/result` was
+   * `isError: false` for both, because a subagent that can still answer ends its own turn `completed`. The
+   * flag this page can read is not the flag that means "stopped working", so it is not read.
+   */
+  function isSubagentTool(name) {
+    return name === 'subagent' || (typeof name === 'string' && name.startsWith('subagent_'))
+  }
+
+  /** The question face, or `null` while the pack names none or its file cannot be read. */
+  async function fetchAsk() {
+    if (typeof api.memeAsk !== 'function') return null
+    let frame
+    try {
+      frame = await api.memeAsk()
+    } catch {
+      return null
+    }
+    return timedFrameOf(frame)
+  }
+
+  /**
+   * Wear the question face for {@link ASK_HOLD_MS}, starting now.
+   *
+   * Called from the question card itself, so what it answers is exactly what the card answers: the
+   * agent has asked, and the turn is parked until the user says something. A frame that is not in
+   * hand yet is read on demand — the first question after a page load can beat the frame sweep —
+   * and `askPending` keeps two questions that arrive inside that one read from racing over the same
+   * GIF. A pack that names no question file, or names one that is not there, resolves to `null`
+   * here and the ball simply keeps the face it had.
+   *
+   * There is one `#ball-gif` and one timer for this slot, which is the whole of "no stacking": a
+   * second question takes a new step, which is what makes the image element reload the clip from
+   * its first frame instead of holding the last one, and clears the timer, which is what restarts
+   * the six seconds from the second question rather than leaving the first one's clock running.
+   */
+  function playAskFrame() {
+    if (askFrame === undefined || askFrame === null) {
+      if (askPending) return
+      askPending = true
+      void fetchAsk().then((frame) => {
+        askPending = false
+        if (frame === null) return
+        askFrame = frame
+        playAskFrame()
+      })
+      return
+    }
+    askStep += 1
+    askShown = { src: askFrame.src, step: askStep }
+    clearTimeout(askTimer)
+    askTimer = setTimeout(() => {
+      askShown = undefined
+      syncGif()
+    }, ASK_HOLD_MS)
+    syncGif()
+  }
+
+  /**
+   * One item of the plan's pool, or `null` when it is malformed.
+   *
+   * A single clip is `{ kind: 'single', frame: { src, ms } }` and a scripted run is
+   * `{ kind: 'sequence', frames: [...] }`. A bare frame — what a helper written before runs existed
+   * hands over — is read as the single clip it is, so the two shapes agree here rather than in every
+   * caller: the pool is the one thing `skitSequence` reads.
+   */
+  function skitItemOf(value) {
+    if (value === null || typeof value !== 'object') return skitSingleOf(value)
+    if (value.kind === 'sequence') {
+      if (!Array.isArray(value.frames)) return null
+      // Walked once per frame rather than per filter: `timedFrameOf` reads the whole base64.
+      const frames = value.frames.map(timedFrameOf).filter((frame) => frame !== null)
+      return frames.length === 0 ? null : { kind: 'sequence', frames }
+    }
+    return skitSingleOf(value.frame === undefined ? value : value.frame)
+  }
+
+  /** A single clip as a pool item, whatever shape it arrived in. */
+  function skitSingleOf(value) {
+    const frame = timedFrameOf(value)
+    return frame === null ? null : { kind: 'single', frame }
+  }
+
+  /**
+   * The skit plan: `{ gapMs, files, item, times, interject }`, or `null` while it is off or unreadable.
+   *
+   * The pool is read as a list and kept as one: `skitSequence` draws from it once per skit. A plan
+   * that names only one clip — the shape this slot had before it took a list, and before an item
+   * could be a run — is a pool of one, so the pool is what a page written now reads while an
+   * old-style helper still drives the same ball.
+   */
   async function fetchSkit() {
     if (typeof api.memeSkit !== 'function') return null
     let plan
@@ -2196,9 +3556,12 @@ function main() {
     const numbers = (pair) => Array.isArray(pair) && pair.length === 2
       && pair.every((value) => typeof value === 'number' && Number.isFinite(value))
     if (!numbers(plan.gapMs) || !numbers(plan.times)) return null
-    const file = timedFrameOf(plan.file)
-    if (file === null) return null
-    return { gapMs: plan.gapMs, times: plan.times, file, interject: timedFrameOf(plan.interject) }
+    // Walked once per item rather than per filter: `timedFrameOf` reads the whole base64.
+    const files = Array.isArray(plan.files) ? plan.files.map(skitItemOf).filter((item) => item !== null) : []
+    const item = skitItemOf(plan.item === undefined ? plan.file : plan.item)
+    if (item !== null && !files.some((known) => skitLead(known).src === skitLead(item).src)) files.unshift(item)
+    if (files.length === 0) return null
+    return { gapMs: plan.gapMs, times: plan.times, files, item, interject: timedFrameOf(plan.interject) }
   }
 
   /**
@@ -2211,7 +3574,27 @@ function main() {
     if (value === null || typeof value !== 'object') return null
     if (typeof value.src !== 'string' || value.src === '') return null
     if (typeof value.ms !== 'number' || !Number.isFinite(value.ms) || value.ms <= 0) return null
-    return { src: value.src, ms: value.ms, loops: loopsForever(value.src) }
+    // A hold the pack asked for rides beside the length the helper measured, and only when it asked: `0` means
+    // "the clip's own", which is what every frame meant before a pack could say otherwise, so the field is
+    // left off rather than carried as a zero. Only the click slot can have one — see `clickHoldMs`.
+    const hold = typeof value.holdMs === 'number' && Number.isFinite(value.holdMs) && value.holdMs > 0
+      ? Math.min(Math.round(value.holdMs), 60_000)
+      : 0
+    return { src: value.src, ms: value.ms, loops: loopsForever(value.src), ...(hold > 0 ? { holdMs: hold } : {}) }
+  }
+
+  /**
+   * How long a click reaction stays up: what the pack asked for, or the clip's own length cut before its loop
+   * point.
+   *
+   * The cut is right for a clip whose animation is the message — the pose it ends on is never re-shown — and
+   * wrong for a short clip the user asked for with their own hand: `摸头.gif` is 640 ms, so the cut held it
+   * for 544, which reads as a flicker rather than as the ball answering a pat.
+   */
+  function clickHoldMs(frame) {
+    const asked = frame?.holdMs
+    if (typeof asked === 'number' && asked > 0) return asked
+    return oneShotHoldMs(frame.ms, frame.loops)
   }
 
   /** The peek frames: `{ src, intro }` where the intro is optional, or `null` when unnamed. */
@@ -2260,30 +3643,50 @@ function main() {
   }
 
   /**
-   * Fetch the fetch face once, then repaint.
+   * Fetch the face for one named tool, once, and remember it — including remembering that there is none.
    *
-   * Two callers: the startup sweep, and `syncAgent` on the edge where a `web_fetch` starts. The
-   * second one matters because the first fetch of a session routinely beats the sweep, and a face
-   * that arrives after the call is over is a face nobody ever sees. `webfetchPending` keeps the
-   * two from racing over a frame that is a whole GIF.
-   *
-   * It is safe to call while a fetch is not running: the frame is only worn while one is, and
-   * `syncGif` on arrival is a no-op in every other state. So the frame is also dropped again when
-   * the call that wanted it ends, which is what lets an edited `memes.json` apply to the next
-   * fetch rather than to the next restart.
+   * The name comes from the transcript's own tool cards, which is the only thing the page knows a call by, and
+   * a pack answers with a file only for the tools it wants drawn apart. Everything else gets `null`, and the
+   * `null` is cached as deliberately as a picture: most tools fall back to the shared face, and asking again
+   * on every token of a call that runs for a minute would be a round trip per keystroke for an answer that
+   * cannot change. It is keyed by name, so a turn that runs three tools fetches three faces and no more, and
+   * it survives the call ending — so an edited `memes.json` lands on the next call rather than on a restart.
    */
-  async function loadWebfetchFrame() {
-    if (webfetchSrc !== undefined || webfetchPending) return
-    webfetchPending = true
+  async function loadNamedToolFrame(name) {
+    if (name === '' || toolFrames.has(name) || toolFramePending.has(name)) return
+    toolFramePending.add(name)
     try {
-      const src = await fetchFrame(() => api.memeWebfetch())
-      if (src !== undefined) {
-        webfetchSrc = src
+      // Not `fetchFrame`: that one folds "no picture" and "the call failed" into the same `undefined`, and
+      // here they are different answers — one is worth remembering, the other is worth retrying.
+      const src = await api.memeToolNamed(name)
+      if (typeof src === 'string' && src !== '') toolFrames.set(name, src)
+      else if (src === null) toolFrames.set(name, null)
+      // The frame arrived: restart the window it is needed in.
+      //
+      // This is the whole reason a fast tool's face used to be invisible. The page asks for the picture the moment
+      // it hears the tool's name, but the helper has to read a file of one or two megabytes, base64 it and send it
+      // back over IPC — and a tool like `grep` or `todo_write` is over in a few milliseconds. So by the time the
+      // frame was in hand the window had closed and the branch below declined: the face was fetched and never
+      // worn. Measured, that was the whole difference between `pwsh` (which the user could see) and the other
+      // five (which they could not) — `pwsh`'s frame was already cached from an earlier call, so it painted on the
+      // first repaint.
+      //
+      // Only for a frame that is actually needed: a name nobody is waiting for must not reopen a window and put a
+      // tool face on a ball that has moved on.
+      if (src === undefined) return
+      const own = agentState === 'tooling' && agentTool === name
+      const other = otherTool === name
+      if (own || other) {
+        // `otherStreamAt` is the module-level map `syncGif` reads through its own local name.
+        if (other) otherStreamAt.set('tool', Date.now())
         syncGif()
       }
+    } catch {
+      // A read that failed is not an answer: it stays uncached, so the next call asks again.
     } finally {
-      webfetchPending = false
+      toolFramePending.delete(name)
     }
+    syncGif()
   }
 
   /**
@@ -2391,7 +3794,11 @@ function main() {
       ? [schedule.gapMs, schedule.holdMs, schedule.frames]
       : []
     const valid = pairs.length === 3 && pairs.every((pair) => Array.isArray(pair) && pair.length === 2)
-    memeInfo = valid ? schedule : undefined
+    // And the switch the helper reports with them: a schedule whose three ranges are intact but which is
+    // switched off is an off schedule, not a malformed one. Reading only the ranges here left the two halves
+    // disagreeing — `playMemeBurst` asks for `enabled` and would refuse to play — so what an off schedule
+    // did was poll the helper every thirty seconds forever instead of once a gap.
+    memeInfo = valid && schedule.enabled === true ? schedule : undefined
   }
 
   /**
@@ -2409,7 +3816,17 @@ function main() {
     scheduleMemeBurst()
   }
 
-  function setRunning(next, interrupted = false) {
+  /**
+   * The turn started, ended, or ended badly.
+   *
+   * `failed` is the host's word for *why* it ended: it reads the `turn/end` reason itself and says
+   * `failed: true` only for a run that threw (`reason.kind === 'error'`, which is where the codes and
+   * messages — `MALFORMED_RESPONSE`, `DeepSeek Messages stream: tool input is invalid JSON` — are kept,
+   * in the host's own log). That flag is the only thing separating the two faces of one edge: a turn
+   * that ran to its own end rings the bell, a run that threw wears the failure face, and the user
+   * stopping it themselves does neither.
+   */
+  function setRunning(next, interrupted = false, failed = false) {
     // The transition is what matters, not the value: the host replays `turn` on every page
     // load, so reading `running === false` alone would ring the bell every time the ball starts.
     const wasRunning = running
@@ -2431,8 +3848,10 @@ function main() {
       return
     }
     // A turn ended. Only one that ran to its own end is a finished task: stopping the agent
-    // yourself is not something to celebrate.
-    if (wasRunning && !interrupted) playDoneFrame()
+    // yourself is not something to celebrate, and a run that threw is not a finished task at all —
+    // it gets the failure face instead of the bell, whether or not this page saw it start.
+    if (failed && !interrupted) playFailFrame()
+    else if (wasRunning && !interrupted) playDoneFrame()
     if (interrupted) {
       for (const node of blocks.values()) {
         if (node.dataset.kind === 'tool' && node.dataset.state === 'running') {
@@ -2468,6 +3887,35 @@ function main() {
     document.body.classList.toggle('expand-right', state.horizontal === 'right')
     document.body.classList.toggle('expand-up', state.vertical === 'up')
     document.body.classList.toggle('expand-down', state.vertical === 'down')
+  }
+
+  /**
+   * Whether a pointer at `point` — a `{ clientX, clientY }`, in the page's own coordinates — is on
+   * the strip a docked ball leaves behind.
+   *
+   * Deliberately not `pointerOnBallOrPanel()`, which asks about the ball and the card and is exactly
+   * wrong here: while docked both of those are `visibility: hidden` and drawn at `--ball-column`
+   * inside a 34px window, so no pointer can ever be on either of them. The strip is what is on
+   * screen, and the main process is holding the window over it (`overCapturedRegion`), so a pointer
+   * here is a pointer the page is hearing about at all.
+   *
+   * The rect is the tab element's own — the same box `syncHitTest` reports, at `DOCK_HIT_WIDTH` —
+   * widened by {@link DOCK_ARRIVE_MARGIN_PX} because the helper's capture margin means the window
+   * still delivers events a few pixels outside it. That bleed is taken on the inward edge only:
+   * vertically the band is the strip exactly, since a clip that fired from 8px above the bar would
+   * be answering a pointer that is nowhere near it.
+   */
+  function pointerInDockBand(point) {
+    if (docked === undefined || point === undefined) return false
+    if (dockTab.hidden || dockTab.offsetParent === null) return false
+    const rect = dockTab.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return false
+    // The box the page reports, plus the helper's capture margin on the inward edge. On the outward
+    // one there is nothing to widen into: that side is the screen edge.
+    const from = docked === 'left' ? rect.left : rect.left - DOCK_ARRIVE_MARGIN_PX
+    const to = docked === 'left' ? rect.right + DOCK_ARRIVE_MARGIN_PX : rect.right
+    return point.clientX >= from && point.clientX <= to
+      && point.clientY >= rect.top && point.clientY <= rect.bottom
   }
 
   function clearDockHoverTimer() {
@@ -2520,24 +3968,33 @@ function main() {
     document.body.classList.toggle('docked', next !== undefined)
     document.body.classList.toggle('docked-left', next === 'left')
     document.body.classList.toggle('docked-right', next === 'right')
+    // Whatever a peek had put on screen goes with the dock. The page's half is dropped here rather
+    // than through `closeDockPeek`, and that is the whole reason it is not a call to it: pulling the
+    // ball out reaches here *before* the helper is asked to slide it, and the helper has to still
+    // believe the ball is standing at the edge for that slide to be skipped. Telling it to put the
+    // window back on its tab first would re-park the ball off the screen and run the slide from
+    // there — precisely the jump the peek exists to avoid. Any other caller here has already
+    // overridden the window by its own route, so dropping the class is the whole of what is left.
+    dockPeeked = false
+    document.body.classList.remove('docked-peek')
     clearDockHoverTimer()
+    // The arrival belongs to the strip. Undocking takes the strip away, so the clip that was playing
+    // on it has nothing left to be about — and a docked *state* frame left up over a free ball would
+    // be a ball wearing an arrival that never arrived anywhere.
+    clearDockArrive()
     // Every branch below changes what the window should capture over, so every branch reports.
-    // Docking is the case that most needs it: the ball is gone and a 6px tab is what is left, and
+    // Docking is the case that most needs it: the ball is gone and the strip is what is left, and
     // without this the window would still be capturing over where the ball used to be.
     if (next === undefined) {
       dockTab.hidden = true
-      dockHoverArmed = true
       syncHitTest()
       return
     }
-    if (becameDocked) {
-      dockHoverArmed = false
-      dockHoverTimer = setTimeout(() => {
-        dockHoverTimer = undefined
-        dockHoverArmed = true
-        if (dockPointerInside) void unsnapDocked()
-      }, DOCK_HOVER_DELAY_MS)
-    }
+    // A hover that is already resting on the strip when the ball docks is the one case `enterUi`
+    // cannot see: the pointer never crossed anything, so no event is coming. The dwell is armed
+    // here instead, and reads the same `dockPointerInside` the crossing would have set. Nothing
+    // unsnaps on a timer any more — this is a greeting, and the strip is the only way out.
+    if (becameDocked && dockPointerInside) beginDockArrive()
     dockTab.hidden = false
     syncHitTest()
   }
@@ -2561,6 +4018,31 @@ function main() {
     if (dragging) skipDockCommit = true
     applyDocked(undefined)
     applyDockedFrom(await api.unsnap())
+  }
+
+  /**
+   * Undock as one leg of a pull that is still going on, so the ball is seen sliding out of the edge.
+   *
+   * {@link unsnapDocked} puts the ball on its slot in a single frame, which is right for every caller
+   * that is *finishing* something — a click on the tab, a programmatic release — because there is no
+   * gesture afterwards to watch it travel. The pull is not that: the hand is still down and still
+   * moving, and the ball it just grabbed was a moment ago behind the edge, invisible. Snapping it
+   * means the whole outward journey the user was shown on the way *in* (250ms of `snap`) has no
+   * counterpart on the way out — the ball simply is at the cursor. So this asks the main process to
+   * run the same slide the docking did, and that slide is abandoned by the next `moveBall` anyway,
+   * which is what keeps it from being a delay the hand has to wait out.
+   *
+   * Everything else is `unsnapDocked`'s, deliberately: the same `suppressExpand`, the same
+   * `skipDockCommit` (the release must not re-dock a ball the user just dragged out), and the same
+   * `applyDocked(undefined)` first — the `docked` class has to come off before the slide starts or
+   * the ball would be `visibility: hidden` for the whole of it.
+   */
+  async function unsnapDockedSmooth() {
+    if (docked === undefined) return
+    suppressExpand = true
+    if (dragging) skipDockCommit = true
+    applyDocked(undefined)
+    applyDockedFrom(await api.unsnapSmooth())
   }
 
   async function setExpanded(next, force = false) {
@@ -2613,7 +4095,10 @@ function main() {
     collapseFrame = setTimeout(() => {
       collapseFrame = undefined
       panel.hidden = true
-      void api.setExpanded(false)
+      // A collapse armed while the ball was free can come due after it has been docked, and then this is
+      // the call that ends a peek behind the page's back — see `scheduleCollapse`. Anything the strip is
+      // showing belongs to the strip; a docked ball has no panel for this step to put away anyway.
+      if (docked === undefined) void api.setExpanded(false)
       syncHitTest()
     }, ANIMATION_MS)
   }
@@ -2625,6 +4110,14 @@ function main() {
 
   function scheduleCollapse() {
     if (pinned || running || asking() || dragging) return
+    // A docked ball has no panel to collapse. What this timer would do is `setExpanded(false)`, and the
+    // helper's answer to that is `applyTab()` — which ends a *peek* as a side effect (`peeking = false`),
+    // silently: nothing tells the page, which keeps `dockPeeked` and the `docked-peek` class. From then
+    // on the page draws the strip at the peeked offsets inside the 34px tab window (off its own window,
+    // so the strip and the ball both vanish) and measures the exit test against a ball that is no longer
+    // on screen, so a hand resting on the strip reads as gone and every twitch replays the arrival. The
+    // hand leaving a docked strip is served by `closeDockPeek()`; there is nothing here to arm.
+    if (docked !== undefined) return
     if (collapseTimer !== undefined) clearTimeout(collapseTimer)
     collapseTimer = setTimeout(() => {
       collapseTimer = undefined
@@ -3734,6 +5227,8 @@ function main() {
       syncThinkPreview(node)
     } else if (block.kind === 'tool') {
       updateToolNode(node, block)
+      // A subagent that stopped working is watched in its *own* session and reported from there: the flag
+      // this block carries is false even when the subagent failed. See `isSubagentTool`.
     } else {
       updateAssistantNode(node, block)
     }
@@ -3753,13 +5248,20 @@ function main() {
       stagedFrame = undefined
       const list = staged.splice(0)
       const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 120
+      // The transcript moved, so any block's claim to be running is fresh again. See `agentPhase`.
+      if (list.length > 0) transcriptAt = Date.now()
       for (const item of list) {
         if (item.type === 'block') upsertBlock(item)
         else if (item.type === 'block-drop') removeBlock(item.key)
-        else if (item.type === 'turn') setRunning(item.running === true, item.interrupted === true)
+        else if (item.type === 'turn') setRunning(item.running === true, item.interrupted === true, item.failed === true)
         else if (item.type === 'reset') clearTranscript()
       }
       syncAgent()
+      // A stale block produces no further messages — that is what stale means — so the repaint that takes the
+      // face off has to be scheduled rather than waited for. Clearing the timer on every message keeps this to
+      // one pending check at a time, which is also why it is not a repeating interval.
+      clearTimeout(staleAgentTimer)
+      staleAgentTimer = setTimeout(syncAgent, STALE_BLOCK_MS + 250)
       if (nearBottom) transcript.scrollTop = transcript.scrollHeight
     })
   }
@@ -3985,6 +5487,10 @@ function main() {
 
   function showQuestion(payload) {
     if (!payload || typeof payload.id !== 'string' || !Array.isArray(payload.questions) || payload.questions.length === 0) return
+    // The face is played before the card is built, and on the repeat path as well: a payload for the
+    // question already on screen is still the agent asking, and what a repeat restarts is the six
+    // seconds — never a second instance, because this slot owns a single image and a single timer.
+    playAskFrame()
     if (pending?.id === payload.id) {
       syncQuestion()
       return
@@ -4051,15 +5557,36 @@ function main() {
    * capturing whenever it is over one of our rectangles: an earlier version of this arrangement
    * had the page decide, and a click-through window receives no enter event at all, so the panel
    * could not open. Deciding in the main process is what makes this handler reachable.
+   *
+   * Nothing is counted here for the docked case, and that is deliberate rather than an oversight. The
+   * docked branch below never sets `hovering`, so the `pointermove` de-duplication
+   * (`if (on === hovering) return`) cannot fire for a hand on the strip: every pixel that hand moves
+   * arrives here, and the main process's own 30Hz pointer feed arrives here too, from the other side.
+   * All of those are the *same* hover, and `beginDockArrive` is what tells them apart — it refuses to
+   * re-arm the dwell while a peek, a wait, or a clip is already standing, which is what stops a
+   * resting hand from replaying the entrance. A leave clears all three, so a hand that comes back is
+   * greeted again every time. Counting entries here instead would have to swallow that second greeting
+   * to work at all, and the second greeting is the strip's whole purpose.
    */
   function enterUi() {
     dockPointerInside = true
-    applyHover(true)
-    if (dragging || collapsing) return
     if (docked !== undefined) {
-      if (dockHoverArmed) void unsnapDocked()
+      // Docked, the pointer can only be on the strip, and the strip does one thing: it brings the
+      // ball half way out of the edge as a hint that there is something behind it, and after a short
+      // rest it plays the arrival clip on it. Coming back out is a drag on the strip (`dockTab`'s own
+      // listeners) and nothing else — a hover that unsnapped would make the ball jump out from under
+      // a pointer that was only passing by.
+      //
+      // `applyHover(true)` is deliberately *not* called here. The hover intro it starts is a face
+      // the visible ball wears, and the ball is hidden behind the strip while docked — a docked
+      // hover playing it would be a "greeting" that answers a hand resting on a strip, played on a
+      // ball nobody can see, and then thrown over by the arrival clip the strip is actually for.
+      // The strip's own greeting is `beginDockArrive()` alone.
+      beginDockArrive()
       return
     }
+    applyHover(true)
+    if (dragging || collapsing) return
     if (suppressExpand) return
     void setExpanded(true)
   }
@@ -4067,20 +5594,106 @@ function main() {
   /** And this is the pointer leaving, which is what collapses the panel again. */
   function leaveUi() {
     dockPointerInside = false
+    // A hand crossing the strip is not a hover, and the clip is a whole gesture: anything still
+    // waiting to start is dropped here — the dwell included, which is the half that makes "crossed"
+    // different from "rested" — and the clip already playing is taken down rather than left running
+    // on a strip the pointer has abandoned. The peek goes with it: the ball was only ever out
+    // because the pointer was here.
+    clearDockHoverTimer()
+    clearDockArrive()
+    void closeDockPeek()
     applyHover(false)
     suppressExpand = false
     if (dragging || collapsing) return
     scheduleCollapse()
   }
 
+  /**
+   * Arm the arrival clip for a pointer that has just come to rest on the strip, and bring the ball
+   * half way out of the edge on the way.
+   *
+   * The dwell is a timer rather than a test of how long the pointer took to arrive, because the
+   * question is whether it is *still* here {@link DOCK_ARRIVE_DWELL_MS} later, and only the timer can
+   * answer that. Every entry arms a fresh one — the clip plays on every hover, which is what the
+   * strip is for — and each is dropped on its own terms: `leaveUi` clears it on the way out, and the
+   * callback re-checks that the pointer is still inside and the ball still docked before it fires.
+   *
+   * The two are ordered on purpose: the ball *shows* first and the clip follows it, which is the
+   * order the hover reads in — the strip has something behind it, and then that something greets
+   * you. It is also why the peek is not on a timer of its own; being able to see what you are
+   * hovering is the affordance, not the greeting.
+   *
+   * The press that drags the ball out does not go through here and does not wait for it.
+   */
+  function beginDockArrive() {
+    // The hover pull-out is being retired, and this is the whole of it: the peek that slides the ball out and the
+    // arrival clip that greets it are two halves of one gesture, so pausing either alone would leave the other
+    // showing. Off here means a hover on the strip does nothing at all — the ball stays where it is, wearing what
+    // it was wearing. Set {@link DOCK_HOVER_ENABLED} back to `true` to bring the whole gesture back.
+    if (!DOCK_HOVER_ENABLED) return
+    // A peek that is already open has had its entrance armed and is playing it. The helper's own
+    // pointer feed calls `enterUi` again the moment the grown window starts reporting the ball's own
+    // rect — which is right after the peek reported its new hit-test regions — and without this the
+    // whole arrival restarts on that crossing: a second step a couple of hundred ms after the first,
+    // which reads as a stutter rather than a greeting. So a hover that is already being served only
+    // makes sure the ball is out.
+    //
+    // The flag in `enterUi` is what normally gets there. This is the belt to that braces, for the one
+    // window the flag cannot cover: between a leave and the next entry the strip can report "on it"
+    // twice, and both must be one hover. `dockArriveShown` is also checked so that a clip already up —
+    // with the slot's `loop` clip it stays up for the rest of the hover — is never restarted.
+    if (dockPeeked || dockHoverTimer !== undefined || dockArriveShown !== undefined) {
+      void openDockPeek()
+      return
+    }
+    void openDockPeek()
+    clearDockHoverTimer()
+    dockHoverTimer = setTimeout(() => {
+      dockHoverTimer = undefined
+      if (!dockPointerInside || docked === undefined) return
+      playDockArrive()
+    }, DOCK_ARRIVE_DWELL_MS)
+  }
+
+  // While the ball is docked these two ask about the strip instead. That is the only thing on screen
+  // then, and `pointerOnBallOrPanel()` cannot see it: the ball and the card are hidden and drawn at
+  // `--ball-column` inside a 34px window, so every point of that window answers "no" and the page
+  // would never learn that a hand had arrived on the one control it has left.
+  //
+  // A peeked ball is an exception of its own, and it needs naming for the opposite reason to the
+  // strip: the ball is back on screen while the peek is up, so the ordinary test *would* find it —
+  // but `docked` is still set, so the strip branch answers "no" for it, and the peek would dismiss
+  // itself the moment the hand moved from the strip toward the ball it had just revealed. So while
+  // the ball is showing, it counts too.
+  //
+  // It counts with slack, and the slack is the point. The ball sits flush against the screen's inner
+  // edge, so its boundary is the last column of pixels a hand can occupy before it is off the ball —
+  // and leaving is what dismisses the peek. One pixel of tremor there flips the answer, the ball goes
+  // back behind the strip, the strip is then the only thing under the hand, and the next pixel brings
+  // it out again: the flicker, from a hand that never left. So the exit test is the ball's rect grown
+  // by `DOCK_PEEK_RELEASE_PX`, while the strip's own band is untouched — entering still takes the
+  // strip, and only leaving takes the wider box. Between the two bars nothing changes, which is what
+  // makes a resting hand stable.
+  function pointerOnUi(point) {
+    if (docked === undefined) return pointerOnBallOrPanel()
+    if (dockPeeked && point !== undefined) {
+      const rect = ball.getBoundingClientRect()
+      const slack = DOCK_PEEK_RELEASE_PX
+      if (rect.width > 0 && rect.height > 0
+        && point.clientX >= rect.left - slack && point.clientX <= rect.right + slack
+        && point.clientY >= rect.top - slack && point.clientY <= rect.bottom + slack) return true
+    }
+    return pointerInDockBand(point)
+  }
+
   document.body.addEventListener('pointerenter', (event) => {
     pointerAt = event
-    if (!pointerOnBallOrPanel()) return
+    if (!pointerOnUi(event)) return
     enterUi()
   })
   document.body.addEventListener('pointermove', (event) => {
     pointerAt = event
-    const on = pointerOnBallOrPanel()
+    const on = pointerOnUi(event)
     if (on === hovering) return
     if (on) enterUi()
     else leaveUi()
@@ -4103,7 +5716,7 @@ function main() {
         leaveUi()
         return
       }
-      if (pointerOnBallOrPanel()) enterUi()
+      if (pointerOnUi(point)) enterUi()
       else leaveUi()
     })
   }
@@ -4111,6 +5724,15 @@ function main() {
   ball.addEventListener('pointerdown', (event) => {
     if (!isPrimaryButton(event)) return
     dragging = false
+    // A press on the ball is the drag that *does* wear the carry face, so whatever the last carry
+    // was, this one starts as a ball press. Cleared here rather than on release so that a gesture
+    // which never released cleanly — a lost capture, a page reload mid-drag — cannot leave the next
+    // ball drag faceless.
+    carriedFromDock = false
+    // And the ball's press is the other kind of drag, so the undock's "the hand does not carry it" is
+    // cleared with it. The two flags are set together by the pull and must be unset together, or a
+    // pull that ended badly would leave the next ball drag ignoring the hand.
+    undocking = false
     collapsing = false
     skipClick = false
     lastOrigin = undefined
@@ -4164,6 +5786,8 @@ function main() {
         : { x: event.screenX - pointer.dx, y: event.screenY - pointer.dy }
       pointer = undefined
       lastOrigin = undefined
+      dockSide = undefined
+      undocking = false
       const skipDock = skipDockCommit
       skipDockCommit = false
       // The release position is asked for before the face changes: the ball has to end up
@@ -4185,6 +5809,8 @@ function main() {
     }
     pointer = undefined
     lastOrigin = undefined
+    dockSide = undefined
+    undocking = false
     syncHitTest()
     return false
   }
@@ -4210,27 +5836,233 @@ function main() {
   dockTab.addEventListener('pointerdown', (event) => {
     if (!isPrimaryButton(event)) return
     dragging = false
+    // This press may or may not become a pull — a nudge along the strip never crosses the threshold
+    // and never hands over — so the flag is cleared here and set only by the hand-off itself.
+    carriedFromDock = false
+    // Likewise the hand's own two states: a press on the strip starts with the ball not in the hand
+    // and not being slid, and it is the threshold that decides which of the two it becomes.
+    undocking = false
     collapsing = false
     skipClick = true
     lastOrigin = undefined
+    // The side this pull is anchored on, captured here and kept for the whole gesture. `docked` is
+    // the live state and the hand-off clears it, so the direction of the pull cannot be read off it
+    // once the ball is out — and the direction is what tells a pull away from the edge apart from a
+    // nudge along it.
+    dockSide = docked
+    lastScreenX = event.screenX
+    lastScreenY = event.screenY
+    lastClientX = event.clientX
+    lastClientY = event.clientY
     pointer = { dx: 0, dy: 0, startX: event.screenX, startY: event.screenY }
     dockTab.setPointerCapture(event.pointerId)
+    // Before the drag can outrun it, exactly as the ball's own press does: the window is only
+    // capturing over the rects this reports, and the pull that takes the ball back out immediately
+    // leaves the 34px strip. Reported late, those moves are never delivered and the gesture dies at
+    // the edge it started on.
+    syncHitTest()
   })
   dockTab.addEventListener('pointermove', (event) => {
-    if (pointer === undefined || docked === undefined) return
+    // A live gesture is `pointer` *and* either a dock to pull away from or a ball already in the
+    // hand. `docked` alone will not do: the hand-off below un-docks the ball on the move that
+    // crosses the threshold, so from the very next event there is no dock left to measure `inward`
+    // from — and a guard that asked for one would drop every move after the first, leaving the ball
+    // sitting at the hand-off point while the hand carried on without it. That is the whole of what
+    // "the ball does not follow me out of the dock" was.
+    if (pointer === undefined || (docked === undefined && !dragging)) return
     if (!primaryButtonHeld(event)) {
       void finishPointer(event)
       return
     }
-    lastOrigin = { x: event.screenX, y: event.screenY }
-    const inward = docked === 'right' ? pointer.startX - event.screenX : event.screenX - pointer.startX
-    if (inward <= DOCK_DRAG_OFF_PX) return
-    dragging = true
-    void unsnapDocked()
+    // The side the gesture started on, held for the whole pull. It cannot be read off `docked`,
+    // which is gone by the second move, and a direction that flips halfway through the gesture is a
+    // threshold measured against the wrong edge — on a right dock it would read every move outwards.
+    const fromRight = dockSide === 'right'
+    const inward = dragging
+      ? 0
+      : fromRight ? pointer.startX - event.screenX : event.screenX - pointer.startX
+    // Where the pointer was before this move, which is where the pull crossed the threshold if it
+    // crossed it here — a coalesced jump has to leave the ball under the hand, not behind it.
+    const wasScreenX = lastScreenX
+    const wasScreenY = lastScreenY
+    const wasClientX = lastClientX
+    const wasClientY = lastClientY
+    lastScreenX = event.screenX
+    lastScreenY = event.screenY
+    lastClientX = event.clientX
+    lastClientY = event.clientY
+    // The pull is not over when the threshold is crossed — it has only just been recognised. And on
+    // this gesture it is over as far as the ball's *position* goes: the undock below is the whole of
+    // the motion, and the hand does not take the ball afterwards. See {@link undocking}.
+    if (inward > DOCK_DRAG_OFF_PX && !dragging) {
+      handDockDragToBall({ screenX: wasScreenX, screenY: wasScreenY, clientX: wasClientX, clientY: wasClientY })
+      return
+    }
+    if (!dragging || collapsing) return
+    // A pull out of the dock stops here: the ball is travelling in under the helper's slide, and the
+    // pointer has no say in where it goes. Both halves matter — the move that crossed the threshold
+    // is not applied either, for the same reason. A `moveBall` at any point of the slide overwrites
+    // `this.origin` and bumps the animation generation, so the ball is teleported to the pointer and
+    // the travel the user is watching is cut off at whatever frame it had reached.
+    //
+    // Nothing is lost by ignoring the moves. They are not what brings the ball in — the slide is, and
+    // it lands on the ball's docked slot under its own easing. Were the follow wanted back, this is
+    // the guard to drop: the hand-off's own centre grab is still taken below, and the next move would
+    // take the ball over mid-slide from wherever the slide had reached.
+    if (undocking) return
+    // Carried by the pointer rather than by a `lastOrigin` of the tab's own: while undocked the ball
+    // is on the desktop with the hand, and this is the same `screen - offset` the ball's own move
+    // handler computes, so the two gestures cannot disagree about where it is.
+    void moveBall(event.screenX - pointer.dx, event.screenY - pointer.dy)
   })
   dockTab.addEventListener('pointerup', (event) => { void finishPointer(event) })
   dockTab.addEventListener('pointercancel', (event) => { void finishPointer(event) })
   dockTab.addEventListener('lostpointercapture', (event) => { void finishPointer(event) })
+
+  /**
+   * Take the ball out of its dock, at the moment the pull crosses `DOCK_DRAG_OFF_PX`: it undocks and
+   * slides back on screen, and the drop plays across the whole of that travel.
+   *
+   * Pointer capture stays on the strip and the strip keeps the listeners: it is the element the
+   * press started on, so it is the element that keeps receiving moves. All this has to do is stop
+   * being docked and hand the motion to the helper — `dragging` is the ball's own flag, and the block
+   * at the top of `syncGif` reads it, which is what makes the ball visible again the moment the
+   * `docked` class comes off.
+   *
+   * Where the ball *goes* is the helper's, not the hand's: `unsnapDockedSmooth` slides it in from
+   * behind the edge, and the moves that arrive after this are ignored. See {@link undocking} for the
+   * feel that pairing is for; the short version is that a pull out of the dock is an undock and not a
+   * carry, so the ball travels inward under its own easing instead of tracking the pointer.
+   *
+   * The face it comes out wearing is the drop, and it is the only face a pull out of the dock ever
+   * shows: there is no pickup (拎起) because there is no pose to lift out of, and no hang loop (悬空)
+   * because the ball was never handed to the hand — it fell out of the strip. See the note in the
+   * body, and {@link carriedFromDock} for why that is a flag of its own rather than a change to
+   * `dragging`. The release that may follow plays the drop again, so the whole gesture is 下落 either
+   * side of the pointerup, and the resting loop in between.
+   *
+   * The landing point below is the ball's *docked slot*, computed from the bar the same way the helper
+   * computed it, with no nudge. Computing it rather than reusing the bar is the point: the bar is a
+   * 6px sliver against an edge and the ball is parked a ball's width in from that edge on the right,
+   * so the two are only ever close on the left. The slot is also clear of the `DOCK_OVERLAP` re-dock
+   * line by construction, which is what a release needs — a ball put down on the bar itself would be
+   * a ball at the edge, and `clampBall` docks anything overlapping the edge by that much.
+   *
+   * The slot is what the helper's slide is aimed at, so `lastOrigin` and the slide agree on where the
+   * pull ends. The offset it leaves in `pointer` is the ball's *centre*, and it is the one thing here
+   * that is parked rather than used: see {@link undocking} — with the moves ignored there is nothing
+   * to subtract it from, and it is kept because it is exactly what would make the ball follow the
+   * hand again.
+   */
+  function handDockDragToBall() {
+    const side = docked
+    // The bar's own box, which is also the ball's: the strip is the docked ball's slot against the
+    // edge, and both sit `DOCK_GLOW` in from the window's edge — the CSS `top` on the tab mirrors
+    // `dockedTabBounds` in `geometry.ts`. Read from the element rather than restated here, because
+    // the page has no copy of either number, and all the grab has to be is right relative to the bar.
+    const bar = dockTab.getBoundingClientRect()
+    // Page coordinates to the screen coordinates `orb:move` is expressed in. `getBoundingClientRect`
+    // measures in the viewport, while a drag's position is `screenY` — and the two differ by the
+    // window's own origin, which is the pointer's `screen - client` exactly.
+    const toScreenX = lastScreenX - lastClientX
+    const toScreenY = lastScreenY - lastClientY
+    // The ball's docked slot, on the screen. `insideBallOrigin` in `geometry.ts` is what this has to
+    // reproduce, and it is a constant in from the *display* edge: `DOCK_IN_PAD` for a left dock,
+    // `DOCK_IN_PAD + BALL_SIZE` for a right one. The bar is the only thing here that knows where the
+    // display edge is, and it knows it from a fixed side for each dock: the strip's box is flush with
+    // the edge, so the edge is the box's `left` on a left dock and its `right` on a right one — the
+    // box is `DOCK_HIT_WIDTH` wide and its bar is drawn in the edge-most 6px, but the bar's own box
+    // is not the ball's, and taking the wrong edge is a whole ball's width of error.
+    //
+    // That wrong edge is the bug this replaces. It anchored on the box's `right` for *both* sides,
+    // which on a right dock is the display edge itself, and then set the ball a width back from it —
+    // so a right-docked ball was handed over at `display.right - BALL_SIZE` instead of
+    // `display.right - BALL_SIZE - DOCK_IN_PAD`: `DOCK_IN_PAD` out, on the far side of the whole
+    // `DOCK_OVERLAP` line, so a release re-docked the ball and the grab offset inherited the error
+    // for every move of the drag. On the left the same anchor happened to be close, which is why the
+    // left dock never showed it.
+    //
+    // `DOCK_HANDOFF_MARGIN_PX` gave the ball a nudge in from the slot and is gone: it existed to keep
+    // the ball clear of the `DOCK_OVERLAP` re-dock line, and with the grab on the centre the ball is
+    // at the pointer's own x from the next move on, which is well inside that line wherever a hand
+    // pulls from. See the note on the constant.
+    const edge = (side === 'left' ? bar.left : bar.right) + toScreenX
+    const x = side === 'left'
+      ? edge + DOCK_IN_PAD
+      : edge - DOCK_IN_PAD - ball.getBoundingClientRect().width
+    // `bar.top + toScreenY` is the ball's row already, with nothing to subtract: the strip's own box
+    // is drawn `DOCK_TAB_INSET` down from the window's top edge, and `dockedTabBounds` puts the
+    // window `DOCK_GLOW` above the ball's row — two equal constants that cancel. It used to subtract
+    // `DOCK_TAB_INSET` as well, which left the ball 8px high on every pull out of the dock: half of
+    // the same mistake as the x, in the axis nobody was looking at.
+    const y = bar.top + toScreenY
+    // The grab is taken on the ball's *centre*, and that is the whole of the feel this hand-off has.
+    //
+    // `dx`/`dy` are what every later move subtracts from the pointer to get the ball's top-left, so
+    // writing them as `half` — the pointer-to-centre offset of a `BALL_SIZE` square — puts the centre
+    // on the pointer and keeps it there: `screen - half` is the top-left that centres the ball, on
+    // every move of the drag. The other reading, `dx` measured to the ball's own corner, is the ball's
+    // *top-left* tracking the hand, which is what made a pull read as the whole ball sliding out from
+    // under the edge and then trailing the cursor by a half-width.
+    //
+    // It is the same grab the ball's own press takes (see `ballGrabOffset`): you drag a thing by the
+    // point you are holding. The strip is 34px against the screen edge, so the point actually held is
+    // not the centre — but the ball is hidden while docked and has no drawn point to take hold of, and
+    // the centre is the handle a hand reaching for a ball is aiming at. A pull that crossed the
+    // threshold by `DOCK_DRAG_OFF_PX` therefore comes out with the ball already under the hand, and
+    // the half-width of overhang that leaves past the edge is the next move's business, not this one's.
+    //
+    // The ball's *placement* and its *grab* stay two separate answers, and this is the pair of lines
+    // that keeps them apart: `lastOrigin` is where the ball is put — the helper's docked slot, so the
+    // release that may follow cannot re-dock it on the far side of `DOCK_OVERLAP` — while `pointer` is
+    // how it follows.
+    //
+    // `lastOrigin` is only read by `finishPointer` when `pointer` is `undefined`, which cannot happen
+    // while this drag is live — so what it really records is where the ball is *meant* to end up if
+    // the slide out is never interrupted. The slide is aimed at the same slot from the helper's side
+    // (`insideBallOrigin`), which is the agreement that matters: the ball arrives under the hand
+    // whether the hand moved or not.
+    const half = ball.getBoundingClientRect().width / 2
+    lastOrigin = { x, y }
+    pointer = { dx: half, dy: half, startX: pointer.startX, startY: pointer.startY }
+    dragging = true
+    dockPointerInside = false
+    // Undocking is the page's own state change and the helper's: `applyDocked(undefined)` takes the
+    // `docked` class off — which is what makes the ball visible again — and asks the helper to slide
+    // it back on screen from behind the edge, over `DOCK_SLIDE_OUT_MS` and with the same easing the
+    // docking-in used. That slide is the whole of the ball's motion on this gesture; see
+    // {@link undocking} for why the hand does not take it over.
+    //
+    // It is called here, *after* `dragging`, for the one thing that ordering decides: `unsnapDocked`
+    // sets `skipDockCommit` only when a drag is already in progress, and that flag is what stops the
+    // release from moving the ball. Called before `dragging`, the pull-out would end with the ball
+    // put under the cursor — the follow arriving by the back door, on the release rather than on a
+    // move, which is the harder of the two to notice.
+    void unsnapDockedSmooth()
+    // This pull is not a carry: the ball undocks and travels, and the hand does not drag it.
+    undocking = true
+    // This carry wears no face of its own, and the drop is the one that belongs to it.
+    //
+    // There is nothing to lift out of: the ball was hidden behind the strip a moment ago, and what
+    // this gesture is about is the ball coming back on screen — not being held. So the pickup (拎起)
+    // is not played, and neither is the hang loop (悬空) that the pickup normally leads into: a ball
+    // hanging from a hand that is not carrying it reads as a pose with no cause. What the hand
+    // actually did was pull the ball off the edge, and the clip for that is the drop (下落).
+    //
+    // The drop and the slide are one motion rather than two. `unsnapDockedSmooth` above is bringing
+    // the ball inward, and this clip plays across the whole of it, which is the feel this pairing
+    // exists for: 下落 while it comes back on screen.
+    //
+    // It is the same clip the release plays, and playing it twice in one gesture is the point rather
+    // than a stutter: coming out of the dock is the fall from the strip, letting go is the fall to
+    // wherever it lands, and both are the ball dropping. `playDropFrame` restarts its own one-shot on
+    // every call, so the second one is a fresh pass rather than the tail of the first.
+    carriedFromDock = true
+    playDropFrame()
+    // `syncGif` is still called: the drop is only half of what this has to report, and the ball's
+    // own visibility comes from the `docked` class coming off rather than from the frame.
+    syncGif()
+  }
 
   const selectionChip = document.querySelector('#selection-chip')
   const selectionChipText = document.querySelector('#selection-chip-text')
@@ -4335,6 +6167,9 @@ function main() {
       await setExpanded(true)
       return
     }
+    // Acknowledged before the send, not after: the point of the nod is that it answers the hand-over, and
+    // waiting for a round trip to a session that may be busy would make it an answer to the reply instead.
+    playNodFrame()
     const payload = composeSend(text, attachedSelection)
     clearPrompt()
     setAttachedSelection('')
@@ -4429,6 +6264,57 @@ function main() {
   api.onBlock((block) => { stage(block) })
   api.onBlockDrop((key) => { stage({ type: 'block-drop', key }) })
   api.onTurn((turn) => { stage({ type: 'turn', ...(turn ?? {}) }) })
+  // News about a turn in a conversation this ball is not in. It is deliberately *not* fed into `stage`: that
+  // would move this page's own turn state — and with it the process clock, the tool cards and the bell — for
+  // a turn that happened somewhere else. What it does is open a window; `syncGif` decides what to wear for it.
+  if (typeof api.onSessionTurn === 'function') {
+    api.onSessionTurn((payload) => {
+      const outcome = typeof payload?.outcome === 'string' ? payload.outcome : ''
+      // `streamed` is the host saying the attempt that was writing has ended, which is the one thing these
+      // windows cannot work out for themselves: they count nothing, so without it a face stays up for its whole
+      // grace period after the last word. Closing them here is what makes the ball stop typing when the answer
+      // does, rather than a couple of seconds later.
+      if (outcome === 'streamed') {
+        otherStreamAt.clear()
+        otherTool = ''
+        syncGif()
+        return
+      }
+      // The user handed the agent something to do, in a window that is not this one. Not a window and not a
+      // kind: it is an event, so it plays once and returns — the same cue the ball's own composer fires.
+      //
+      // The typing face deliberately does not ride along. It was tried and taken back out: the DSH window
+      // broadcasts nothing while its composer is being typed into — no draft, no keystroke, nothing this plugin
+      // can subscribe to — so the only moment available is the send, and a typing face that starts *after* the
+      // message has gone says something untrue about what the ball can see. The nod says the true thing: the
+      // message arrived.
+      if (outcome === 'user') {
+        playNodFrame()
+        return
+      }
+      // A turn ended somewhere else, with a reason. Four of the six endings arrive this way; the two that are not
+      // turn endings — the question and the approval — ride the same message, because to the ball they are all
+      // "something happened over there worth a face".
+      if (outcome === 'ended') {
+        void playTurnEndFrame(typeof payload?.category === 'string' ? payload.category : '')
+        return
+      }
+      // One kind at a time, and each keeps its own window: the model reasons, writes, then calls a tool, and
+      // the page has to be able to tell those apart to know which face — if any — is due.
+      if (outcome !== 'typing' && outcome !== 'thinking' && outcome !== 'tool') return
+      // A call over there arrives with the tool's name, which is the only way a pack that draws a face per tool
+      // can be obeyed from the window the user types in: the ball's own transcript is not this conversation, so
+      // its tool cards never reach this page and the name has to come over the wire. Asking for the frame here
+      // rather than when the face is painted matters, because the fetch is asynchronous and a call can be over
+      // before it lands — the same reason the page's own tool branch asks the moment a call starts.
+      if (outcome === 'tool' && typeof payload?.tool === 'string' && payload.tool !== '') {
+        otherTool = payload.tool
+        void loadNamedToolFrame(otherTool)
+      }
+      otherStreamAt.set(outcome, Date.now())
+      syncGif()
+    })
+  }
   api.onSession((id) => { sessionId = typeof id === 'string' ? id : '' })
   api.onHistory((items) => {
     historyItems = Array.isArray(items) ? items : []
@@ -4454,6 +6340,10 @@ function main() {
   tccAccessibilityOpen.addEventListener('click', () => { void openTccRight('accessibility') })
   api.onAvatar((src) => {
     avatarSrc = typeof src === 'string' && src !== '' ? src : 'deepseek-avatar-square.gif'
+    // Warmed here as well as in `refreshFrames`, because this callback is the only thing that knows
+    // the host has *replaced* the avatar: a different avatar is a different picture and a fresh 7.7MB
+    // decode, and the hover that arrives before it finishes is the one that shows the placeholder.
+    warmFrame(avatarSrc)
     const gif = document.querySelector('#ball-gif')
     if (!gif) return
     delete gif.dataset.mode
@@ -4505,6 +6395,7 @@ function main() {
     pending.error = typeof payload.text === 'string' ? payload.text : messages.incomplete
     renderQuestion()
   })
+  armBallPicture()
   syncGif()
   void startMemes()
   // The helper's menu owns the switch; these events mirror it into this page.

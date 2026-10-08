@@ -88,10 +88,10 @@ interface GifInputs {
 function modeFor(inputs: GifInputs): string {
   const gif = { dataset: {} as { mode?: string; src?: string } }
   const factory = new Function('deps', `
-    const { document, pageClosed, syncSleep, dragging, clickShown, arriveShown, wakeShown, doneShown,
-            typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive, voiceSrc,
-            dictationPhase, dropShown, dropStep, webfetchSrc, agentState, agentTool,
-            WEB_FETCH_TOOL, brokeNow } = deps
+    const { document, pageClosed, syncSleep, dragging, dockArriveShown, clickShown, arriveShown, wakeShown, doneShown,
+            failShown, askShown, typingSrc, replySrc, toolSrc, thinkingSrc, speakSrc, speakActive, voiceSrc,
+            dictationPhase, dropShown, dropStep, agentState, agentTool,
+            brokeNow } = deps
     ${pageFunction(shell, 'syncGif')}
     return syncGif
   `)
@@ -110,6 +110,14 @@ function modeFor(inputs: GifInputs): string {
     arriveShown: undefined,
     wakeShown: undefined,
     doneShown: undefined,
+    // And the failure face above that one, for the same reason: unnamed here is a `ReferenceError`
+    // rather than a failed expectation. Nothing has failed in these cases.
+    failShown: undefined,
+    // The question face sits above every face the agent wears while it works, and the speaking frame
+    // is one of those, so the branch has to be named here or the harness dies with "askShown is not
+    // defined" rather than reporting which mode won. It stays undefined: nothing is being asked
+    // while the ball is reading an answer out.
+    askShown: undefined,
     typingSrc: undefined,
     replySrc: undefined,
     toolSrc: undefined,
@@ -125,10 +133,11 @@ function modeFor(inputs: GifInputs): string {
     // slot does not reach up past the speaking frame.
     dropShown: undefined,
     dropStep: 0,
-    webfetchSrc: undefined,
+    // And the docked arrival, for the same reason again: the ball is on the desktop and not behind a
+    // strip while the speaker is talking, so the branch that plays that clip has to be inert here.
+    dockArriveShown: undefined,
     agentState: '',
     agentTool: '',
-    WEB_FETCH_TOOL: 'web_fetch',
   }) as () => void
   syncGif()
   assert.notEqual(gif.dataset.mode, undefined, 'syncGif fell through every branch without painting')

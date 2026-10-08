@@ -1,0 +1,22 @@
+Withdraw the subagent path that never fired, and prove the turn face on the page
+
+A test against two real subagents settled this: a subagent that can still answer ends its
+own `turn/end: completed`, so the parent's `tool/result` for it is `isError: false` —
+measured on one whose `read` of a missing file failed, and one whose shell command was a
+syntax error. The flag the page could read is not the flag that means "stopped working", so
+the playing is withdrawn rather than left in the tree looking like a feature. What carries it
+is the child session's own `turn/end: { reason: { kind: 'error' } }`, which lives in a log
+the helper can read and the page cannot; `isSubagentTool` stays for that channel and says so
+where it is defined.
+
+The turn-level face is now measured on the page itself. `probe_turn_face.mjs` runs the
+shipped `floating.html` with the shipped `preload.cjs`, answers the IPC channels with the
+pack's own `fail` clip, and sends the message `finishTurn` broadcasts on `orb:turn`. The ball
+box carries the GIF after `{ failed: true }` and a still after `{ running: false }` or
+`{ interrupted: true }` — the one check that catches a chain wired correctly and still
+showing nothing.
+
+Reading those logs needed a reader first: the store is many zstd frames concatenated, and
+`zstdDecompressSync` reads only the first (211 bytes out of 2MB). `read_session.mjs` splits on
+the frame magic; `check_subagent_result.mjs` and `peek_session_log.mjs` are what the
+measurement above used.

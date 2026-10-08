@@ -4,6 +4,7 @@
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, screen, shell } from 'electron'
 import { spawn } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { createConnection, type Socket } from 'node:net'
@@ -471,6 +472,24 @@ ipcMain.handle('orb:unsnap', async (event) => {
   return placement.unsnap()
 })
 
+ipcMain.handle('orb:unsnap-smooth', async (event) => {
+  if (!fromBall(event) || !placement) return { docked: undefined }
+  return placement.unsnapSmooth()
+})
+
+// The strip's hover. Kept apart from `orb:unsnap-smooth` on purpose: undocking is the user taking
+// the ball back, and a peek is the ball showing itself while the *dock stays put* — the same
+// `DockState` shape, a different promise about the strip that is still behind it.
+ipcMain.handle('orb:dock-peek', async (event) => {
+  if (!fromBall(event) || !placement) return { docked: undefined }
+  return placement.peek()
+})
+
+ipcMain.handle('orb:dock-unpeek', async (event) => {
+  if (!fromBall(event) || !placement) return { docked: undefined }
+  return placement.unpeek()
+})
+
 ipcMain.on('orb:prompt', (event, text) => {
   if (!fromBall(event)) return
   write({ type: 'prompt', text })
@@ -586,10 +605,32 @@ ipcMain.handle('orb:meme-tool', (event) => {
   return picker().tool()
 })
 
-ipcMain.handle('orb:meme-webfetch', (event) => {
+ipcMain.handle('orb:meme-tool-named', (event, name) => {
   if (!fromBall(event)) return null
-  return picker().webfetch()
+  // A name that is not a string is not a reason to read anything: the page sends what the transcript says, and
+  // `null` back means "this tool wears the shared face", which is the same answer an unlisted name gets.
+  const answer = typeof name === 'string' && name !== '' ? picker().toolNamed(name) : null
+  void noteToolFaceRequest(name, answer)
+  return answer
 })
+
+/**
+ * Note that the page asked for one named tool's face, and what it was told.
+ *
+ * The page cannot log anywhere a human can read, and a lookup that quietly answers "nothing special" is
+ * indistinguishable from a lookup that never happened — which is exactly the question this answers. Off unless
+ * `DSH_ORB_TOOL_LOG` names a file, because it is a write on the path of every tool call.
+ */
+async function noteToolFaceRequest(name: unknown, answer: unknown): Promise<void> {
+  const path = process.env.DSH_ORB_TOOL_LOG
+  if (path === undefined || path === '') return
+  try {
+    const src = await answer
+    appendFileSync(path, `${new Date().toISOString()} asked=${JSON.stringify(name)} answered=${src === null ? 'null' : `${String(src).length} chars`}\n`)
+  } catch {
+    // A readout that cannot be written is not a reason to change what the ball wears.
+  }
+}
 
 ipcMain.handle('orb:meme-sleep', (event) => {
   if (!fromBall(event)) return null
@@ -616,6 +657,11 @@ ipcMain.handle('orb:meme-arrive', (event) => {
   return picker().arrive()
 })
 
+ipcMain.handle('orb:meme-dock-arrive', (event) => {
+  if (!fromBall(event)) return null
+  return picker().dockArrive()
+})
+
 ipcMain.handle('orb:meme-poor', (event) => {
   if (!fromBall(event)) return null
   return picker().poor()
@@ -624,6 +670,36 @@ ipcMain.handle('orb:meme-poor', (event) => {
 ipcMain.handle('orb:meme-done', (event) => {
   if (!fromBall(event)) return null
   return picker().done()
+})
+
+ipcMain.handle('orb:meme-nod', (event) => {
+  if (!fromBall(event)) return null
+  return picker().nod()
+})
+
+ipcMain.handle('orb:meme-interrupted', (event) => {
+  if (!fromBall(event)) return null
+  return picker().interrupted()
+})
+
+ipcMain.handle('orb:meme-approval', (event) => {
+  if (!fromBall(event)) return null
+  return picker().approval()
+})
+
+ipcMain.handle('orb:meme-maxtokens', (event) => {
+  if (!fromBall(event)) return null
+  return picker().maxtokens()
+})
+
+ipcMain.handle('orb:meme-fail', (event) => {
+  if (!fromBall(event)) return null
+  return picker().fail()
+})
+
+ipcMain.handle('orb:meme-ask', (event) => {
+  if (!fromBall(event)) return null
+  return picker().ask()
 })
 
 ipcMain.handle('orb:meme-wake', (event) => {
@@ -813,6 +889,12 @@ function deliver(message: unknown): void {
     win.webContents.send('orb:turn', message)
     return
   }
+  if (record.type === 'session-turn') {
+    // News about a turn in a conversation this ball is not in. Forwarded whole, because the page switches on
+    // the outcome: only `streaming` exists so far, and the payload's `sessionId` is what a log line names.
+    win.webContents.send('orb:session-turn', message)
+    return
+  }
   if (record.type === 'status') {
     win.webContents.send('orb:status', (record as { text?: unknown }).text)
     return
@@ -877,6 +959,10 @@ function deliver(message: unknown): void {
     tccWait = undefined
     wait?.((record as { status?: unknown }).status)
   }
+  // A message this function does not know is a message the page never sees, and it fails *silently*: the host
+  // sends, the helper drops, and the ball does nothing — which is indistinguishable from a host that never sent
+  // anything. That is exactly how a face for the six turn endings came to do nothing for a whole round of testing.
+  console.error(`dsh-orb helper: undelivered message type=${String(record.type)}`)
 }
 
 /** Ball plus overlays: the windows the host must skip when it picks an observation window. */

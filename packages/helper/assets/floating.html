@@ -98,6 +98,10 @@
     <button id="ball" type="button">
       <img id="ball-gif" src="deepseek-avatar-square.gif" alt="" draggable="false">
     </button>
+    <!-- Voice wake readouts: hidden by CSS on purpose, kept in the markup so the
+         feature can be shown again by deleting one rule in floating.css
+         (`#wake-badge, #wake-meter { display: none }`). Both are still built and
+         still updated by shell.js; only the painting is off. -->
     <p id="wake-badge" hidden></p>
     <!-- The live wake meter, under the ball: how close the current window's score is to the
          threshold, and how many windows in a row have counted. It is up only while the engine is

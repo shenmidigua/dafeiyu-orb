@@ -38,7 +38,7 @@ const body = source.slice(head, end + 1)
 
 const build = new Function('deps', `
   const { document, pageClosed, syncSleep, dragging, dragSrc, dragIntroSrc, dragIntroUntil,
-          clickShown, arriveShown, wakeShown, doneShown, typingSrc, replySrc, toolSrc, thinkingSrc,
+          clickShown, arriveShown, wakeShown, doneShown, failShown, askShown, typingSrc, replySrc, toolSrc, thinkingSrc,
           speakSrc, speakActive, voiceSrc, dictationPhase, dropShown, webfetchSrc, agentState,
           agentTool, idleSrc, hoverSrc, hoverIntroSrc, introUntil, hovering, napShown, skitInfo,
           skitFrame, sleepFrameAt, running, asking, tccGateVisible, attachedSelection, expanded,
@@ -58,6 +58,11 @@ function show(options = {}) {
     dragIntroUntil: 0,
     clickShown: options.clickShown, arriveShown, wakeShown: options.wakeShown,
     doneShown: options.doneShown,
+    // The failure face is off: this walk is about the greeting. `walk_fail_sequence.mjs` walks it.
+    failShown: undefined,
+    // And the question face, for the same reason the harnesses name it: `syncGif` reads it, so leaving
+    // it out of this closure is a `ReferenceError` rather than a wrong answer.
+    askShown: undefined,
     typingSrc: undefined, replySrc: options.replySrc, toolSrc: 'TOOL', thinkingSrc: undefined,
     speakSrc: undefined, speakActive: false, voiceSrc: undefined, dictationPhase: 'idle',
     dropShown: options.dropShown, webfetchSrc: undefined,
@@ -124,9 +129,12 @@ for (const [label, input] of [['idle', {}], ['expanded', { expanded: true }]]) {
 // The branch has to sit above the resting loop, or the greeting is never seen: that is the whole
 // difference between this feature and a changed `idle` frame. Both markers are required to be
 // there — `indexOf` answers -1 for a branch that was deleted, and -1 is below every position, so a
-// missing branch would otherwise pass this check for exactly the wrong reason.
+// missing branch would otherwise pass this check for exactly the wrong reason. That is not theoretical:
+// the resting branch used to be spelled `gif.dataset.mode !== 'idle'`, the poor face rewrote it as the
+// two-way choice below, and this check has to fail loudly rather than compare against a position that
+// no longer exists. It did.
 const branch = source.indexOf('arriveShown !== undefined')
-const loop = source.indexOf("gif.dataset.mode !== 'idle'")
+const loop = source.indexOf('if (broke || idleSrc !== undefined)')
 const ordering = branch !== -1 && loop !== -1 && branch < loop
 console.log(`${ordering ? 'ok  ' : 'FAIL'}  the greeting is decided above the resting loop`)
 if (!ordering) bad += 1

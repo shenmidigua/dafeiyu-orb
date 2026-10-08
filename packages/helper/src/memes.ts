@@ -1,12 +1,19 @@
 /**
- * Meme bursts for the resting ball.
- * The helper owns this cosmetic layer: an idle ball shows a frozen avatar frame, so the
- * page asks for one random image at a time and plays it for a moment. Nothing here
- * touches the host, the session, or the stored avatar.
+ * Meme frames for the ball, read from `memes.json` and the pack folders it points at.
+ *
+ * This is the half that *resolves files*: a slot name in, a `data:` URL (and how long it is) out. Which slot
+ * is wanted, and when, is the page's business — `shell.js` decides that, and its file header carries the
+ * full trigger table in one place, including the order the conditions are tested in and therefore which one
+ * wins when two are true at once. Read that table first; this file only says what each slot may name.
+ *
+ * The random bursts described by {@link MemeSchedule} are the one part of this file that is not a named
+ * slot: they draw at random from every image in `dir`, which is why the top-level `enabled` in the config
+ * switches *them* rather than the whole cosmetic layer.
  */
 
 import { readFile, readdir } from 'node:fs/promises'
-import { basename, extname, isAbsolute, join } from 'node:path'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { basename, dirname, extname, isAbsolute, join } from 'node:path'
 
 /** Image kinds a burst frame may be. */
 const MIME_BY_EXTENSION: Record<string, string> = {
@@ -19,6 +26,16 @@ const MIME_BY_EXTENSION: Record<string, string> = {
 
 /** Largest frame the ball accepts: the bytes cross IPC as one base64 string. */
 const MAX_FRAME_BYTES = 12_000_000
+/**
+ * Where each per-name tool lookup is recorded, in the orb's runtime folder.
+ *
+ * The page cannot be inspected from outside the app, and "the pack has no face for this tool" is
+ * indistinguishable from "the page never asked" — both leave the ball on the shared face. One line per call is
+ * cheap enough to leave on, and it is the only way to tell those two apart from here.
+ */
+const TOOL_LOG = 'tools.log'
+/** Lines kept before the log is started over, so a long session cannot grow it without end. */
+const TOOL_LOG_MAX_LINES = 500
 /** Folder listings are reused for a minute, so a burst never rescans a large pack. */
 const LIST_TTL_MS = 60_000
 /** The config file is re-read on this cadence: editing it needs no restart. */
@@ -33,7 +50,15 @@ const GIF_MAX_MS = 8000
 
 /** Timing of one burst. */
 export interface MemeSchedule {
-  /** Bursts are off unless the config file turns them on. */
+  /**
+   * Bursts are off unless the config file turns them on.
+   *
+   * The top-level `enabled` in `memes.json`, and *only* the bursts: every named slot — the resting loop, the
+   * hover, the click reaction, the turn-end faces — is switched by its own `enabled` and keeps working while
+   * this is off. That is worth saying plainly because the name reads like a master switch and is not one,
+   * and because this is the switch that plays clips the pack never named: a burst draws at random from every
+   * GIF in `dir`, which is how an animation the user never chose ends up on the ball.
+   */
   readonly enabled: boolean
   /** Idle time between bursts, milliseconds. */
   readonly gapMs: readonly [number, number]
@@ -59,10 +84,45 @@ export interface NamedFrame {
   readonly file: string
 }
 
+/**
+ * The click reaction: a named frame plus how long the user's own pat is answered for.
+ *
+ * The default rule cuts a looping clip just before its own restart, which is right for a clip whose
+ * animation *is* the message — the pose it ends on is never re-shown. It is wrong for the one clip the user
+ * asked for with their own hand: `摸头.gif` is 640 ms, so the cut held it for 544, which reads as a flicker
+ * rather than as the ball answering a pat. Saying `"holdMs": 1400` replaces the cut for this slot only.
+ */
+export interface ClickFrame extends NamedFrame {
+  /** How long the face stays up in milliseconds, or `0` for the clip's own length. */
+  readonly holdMs: number
+}
+
 /** The peek state: the loop plus an optional intro played once when the pointer arrives. */
 export interface HoverFrame extends NamedFrame {
   /** A file name played once before {@link file}, or `''` for no intro. */
   readonly intro: string
+}
+
+/**
+ * The docked arrival: a one-pass entrance plus an optional loop worn while the pointer rests.
+ *
+ * The opposite direction to {@link HoverFrame}: {@link file} is the entrance, played once the moment
+ * the dwell fires, and {@link loop} is the resting face the ball wears for as long as the pointer
+ * stays on the strip after that. A pack that names no loop plays the entrance and then goes back to
+ * the docked idle — exactly the behaviour before the loop existed.
+ *
+ * {@link file} is what *both* edges play. The clips are mirrored pictures of each other — the ball is
+ * flush against a screen edge and faces into the screen — so a pack can name an {@link left} entrance
+ * for the left edge alone, and {@link leftLoop} the loop that goes with it. Naming neither leaves the
+ * left edge playing the same clip as the right, which is what every profile written before this did.
+ */
+export interface DockArriveFrame extends NamedFrame {
+  /** A file name looped once the entrance has finished, or `''` for no loop. */
+  readonly loop: string
+  /** The left edge's own entrance, or `''` to play {@link file} there too. */
+  readonly left: string
+  /** The left edge's own loop, or `''` to wear {@link loop} there too. */
+  readonly leftLoop: string
 }
 
 /** What the ball shows while the pointer is on it. */
@@ -73,11 +133,42 @@ export interface HoverFrames {
   readonly intro: { readonly src: string; readonly ms: number } | null
 }
 
+/** Which edge of the display the ball is docked to. */
+export type DockSide = 'left' | 'right'
+
+/** The docked arrival the strip plays: the entrance, and the loop worn after it finishes. */
+export interface DockArriveFrames {
+  /** The one-pass entrance and how long it lasts. */
+  readonly file: TimedFrame | null
+  /** The loop the ball rests on after the entrance, or `null` for none. */
+  readonly loop: string | null
+}
+
+/**
+ * The strip's arrival for one edge: the clip played, and the loop worn after it.
+ *
+ * The left edge gets its own answer because its picture is the other way round: the ball is drawn
+ * flush against the edge and looking into the screen, so a clip drawn for the right edge faces out on
+ * the left. Both edges are asked for at once rather than one per dock, and that is deliberate: the
+ * hover that needs the answer is the one that can least afford another round trip, and a pack that
+ * names no left clip costs one shared entrance in both fields.
+ */
+export interface DockArriveEdges {
+  readonly left: DockArriveFrames | null
+  readonly right: DockArriveFrames | null
+}
+
 /** No named frame: that state keeps the frozen avatar. */
 export const FRAME_DEFAULTS: NamedFrame = { enabled: false, file: '' }
 
+/** No click reaction, and no hold asked for. */
+export const CLICK_DEFAULTS: ClickFrame = { ...FRAME_DEFAULTS, holdMs: 0 }
+
 /** No peek: the pointer leaves the avatar alone. */
 export const HOVER_DEFAULTS: HoverFrame = { ...FRAME_DEFAULTS, intro: '' }
+
+/** No docked arrival: the strip plays nothing on a hover. */
+export const DOCK_ARRIVE_DEFAULTS: DockArriveFrame = { ...FRAME_DEFAULTS, loop: '', left: '', leftLoop: '' }
 
 /**
  * The carry state: the loop worn while the ball is held, plus an optional one-pass
@@ -196,24 +287,66 @@ export interface SleepPlanInfo {
 export interface TimedFrame {
   readonly src: string
   readonly ms: number
+  /**
+   * A hold the pack asked for, in milliseconds, or absent for the clip's own length.
+   *
+   * Optional rather than zero-filled on purpose: absent is what every frame meant before a pack could ask for
+   * a hold, so a pack that never sets one travels exactly as it always did.
+   */
+  readonly holdMs?: number
 }
 
-/** A short scripted idle skit: one frame repeated a few times with another dropped in the middle. */
+/**
+ * One item of a skit's pool: either a single clip, or a scripted run of clips played once each.
+ *
+ * A sequence is a *group* rather than a longer pool: the pack that draws "简单模式 then 困难模式" means
+ * both, in that order, once — a joke with a setup and a punchline, not the same clip four times. It is
+ * therefore finished when its last clip is, and none of the single clip's machinery (the repeats, the
+ * interjection) applies to it.
+ */
+export type SkitItem =
+  | { readonly kind: 'single'; readonly frame: TimedFrame }
+  | { readonly kind: 'sequence'; readonly frames: readonly TimedFrame[] }
+
+/**
+ * A short scripted idle skit: what the ball plays when it is left alone.
+ *
+ * An item of the pool is drawn per skit, and what happens next depends on which kind it is: a single
+ * clip repeats a few times with an interjection dropped in the middle, a sequence plays its clips once
+ * each and stops. Which item is drawn is the page's to decide — see {@link SkitPlan} below.
+ */
 export interface SkitPlan {
   /** Idle time between skits, milliseconds. */
   readonly gapMs: readonly [number, number]
-  /** The repeated frame and how many times one skit plays it. */
-  readonly file: TimedFrame
+  /**
+   * The pool a skit is drawn from, as the items that actually resolve.
+   *
+   * A list the way {@link ArrivePlan} is one, and for the same reason: a pack that names three gags
+   * means all three, so the slot names a pool and the page picks from it — the helper cannot, because
+   * it hands the plan over once and the page then plays a skit every few minutes, and because only
+   * the page knows which item it played last.
+   */
+  readonly files: readonly SkitItem[]
+  /** One item to play now, kept so a page written before `files` existed plays one. */
+  readonly item: SkitItem
   readonly times: readonly [number, number]
-  /** One extra frame played in the middle of the repeats, or `null`. */
+  /** For a single clip, one extra frame played in the middle of the repeats, or `null`. */
   readonly interject: TimedFrame | null
 }
 
-/** One named file of a skit, plus the cadence, repetition range, and its middle frame. */
+/** One item of a skit as the config spells it: a file name, or a run of file names played in order. */
+type SkitEntry = string | readonly string[]
+
+/** One named file of a skit, plus the cadence and everything a draw needs. */
 interface SkitFrame extends NamedFrame {
   readonly gapMs: readonly [number, number]
   readonly times: readonly [number, number]
+  /** Pool items the skit is drawn from, in config order. Each is one clip or one scripted run. */
+  readonly files: readonly SkitEntry[]
+  /** One frame played in the middle of a single clip's repeats, or `''`. */
   readonly interject: string
+  /** Interjection candidates; one is chosen per skit. Empty keeps {@link interject} alone. */
+  readonly interjects: readonly string[]
 }
 
 /** No skit. */
@@ -222,7 +355,9 @@ export const SKIT_DEFAULTS: SkitFrame = {
   file: '',
   gapMs: [120_000, 300_000],
   times: [3, 5],
+  files: [],
   interject: '',
+  interjects: [],
 }
 
 /** The helper half of the ball's cosmetic frames: the resting loop, hover, typing, replying, and the bursts. */
@@ -256,14 +391,13 @@ export interface MemePicker {
   /** A `data:` URL the ball shows while a tool call is running. */
   tool(): Promise<string | null>
   /**
-   * A `data:` URL the ball shows while a web page is being fetched.
+   * The face for one named tool, or `null` when the pack draws that call the same as every other.
    *
-   * A loop for the same reason {@link tool} is one: the length of a fetch is nobody's to know in
-   * advance. It is a *separate* slot rather than a variant of `tool` because fetching a page is the
-   * one tool call the user watches rather than waits for, and a pack that gives it its own face
-   * should not have to give up the face every other tool shares.
+   * The name is the one in the transcript's tool card, which is also what the page passes back: it is the
+   * only thing either side knows a call by. `null` is the ordinary answer — a pack that lists three tools
+   * wants the other twenty to keep sharing {@link tool} — and the page reads it as "wear the shared face".
    */
-  webfetch(): Promise<string | null>
+  toolNamed(name: string): Promise<string | null>
   /** The click reaction, played once with the length of its own animation. */
   click(): Promise<TimedFrame | null>
   /**
@@ -276,6 +410,19 @@ export interface MemePicker {
    */
   arrive(): Promise<readonly TimedFrame[] | null>
   /**
+   * The docked arrival: the clip the strip plays when the pointer rests on it, once — per edge.
+   *
+   * A slot of its own rather than a reuse of {@link arrive}, which is the greeting the ball turns up
+   * with as the page opens. The two are different events — one is the ball announcing itself, this
+   * one is a hand coming to rest on the strip the docked ball left behind — and they play on
+   * different surfaces: this clip is worn by the strip, while the ball stays hidden for the whole of
+   * it. A pack that draws both has already said so by naming both.
+   *
+   * Both edges answer together, and the left one falls back to the right's clip when the pack names
+   * none for it: see {@link DockArriveEdges}. A pack that names no clip at all answers `null`.
+   */
+  dockArrive(): Promise<DockArriveEdges | null>
+  /**
    * The resting face for a nearly empty account: the frame, and the balance line to compare with.
    *
    * A loop like {@link idle}, because it *is* the resting loop under a condition rather than a cue of
@@ -286,6 +433,33 @@ export interface MemePicker {
   poor(): Promise<PoorFrame | null>
   /** The finished-task frame, played once with the length of its own animation. */
   done(): Promise<TimedFrame | null>
+  /** A `data:` URL the ball shows once, when a session closes before its turn finished. */
+  interrupted(): Promise<TimedFrame | null>
+  /** A `data:` URL the ball shows once, when the agent is waiting on a tool approval. */
+  approval(): Promise<TimedFrame | null>
+  /** A `data:` URL the ball shows once, when a turn stopped at the output limit. */
+  maxtokens(): Promise<TimedFrame | null>
+  /** A `data:` URL the ball shows once, when the user has just sent it a message. */
+  nod(): Promise<TimedFrame | null>
+  /**
+   * The failure face: played once when a run ends because it failed.
+   *
+   * A one-shot like {@link done}, and the *other* half of the same edge: a turn that ran to its own end
+   * rings the bell, a turn that threw wears this instead. The two never both play, because they are the
+   * same event read two ways — which is also why the page stops ringing the bell when this face is
+   * configured. It replaces {@link done} rather than sitting beside it.
+   */
+  fail(): Promise<TimedFrame | null>
+  /**
+   * The question face: played once the moment the agent stops the turn to ask something.
+   *
+   * A one-shot like {@link done} rather than a loop like {@link tool}, because what it marks is a
+   * moment — the agent has asked and is waiting on an answer — and not a state the ball stays in for
+   * as long as some condition holds. It is a slot of its own rather than a reuse of {@link wake}
+   * because the two are different events: an exclamation mark answers the user's own voice, a
+   * question mark is the agent asking one, and a pack that draws both has already said so.
+   */
+  ask(): Promise<TimedFrame | null>
   /** The wake-word frame, played once as soon as the keyword fires. */
   wake(): Promise<TimedFrame | null>
   /** The carry: the hang loop plus the one-pass pickup, or `null` while it is off. */
@@ -314,11 +488,33 @@ interface MemeConfig extends MemeSchedule {
   readonly reply: NamedFrame
   readonly thinking: NamedFrame
   readonly tool: NamedFrame
-  readonly webfetch: NamedFrame
-  readonly click: NamedFrame
+  /**
+   * One face per tool name, for the tools a pack wants to draw apart from the rest.
+   *
+   * `tool` is what every call wears; this is what a named call wears instead. Keys are the tool names the
+   * transcript uses — `pwsh`, `edit`, `read` — read straight out of the tool cards, so the mapping is config
+   * rather than code: renaming a tool is a line in `memes.json`, not a release. A name that is not listed
+   * falls back to `tool`, which is what every call did before this existed.
+   */
+  readonly tools: Readonly<Record<string, NamedFrame>>
+  readonly click: ClickFrame
   readonly arrive: ArrivePlan
+  /** The docked arrival: what the strip plays when the pointer rests on it. */
+  readonly dockArrive: DockArriveFrame
   readonly poor: PoorPlan
   readonly done: NamedFrame
+  /** The acknowledgement: what the ball wears the moment the user hands the agent something to do. */
+  readonly nod: NamedFrame
+  /** The failure face: what the ball wears when a run ends because it failed. */
+  readonly fail: NamedFrame
+  /** The cut-short face: the session closed before the turn finished. Rare, and worth its own picture. */
+  readonly interrupted: NamedFrame
+  /** The waiting-for-you face: the agent is parked on a tool approval it cannot give itself. */
+  readonly approval: NamedFrame
+  /** The ran-out-of-room face: the turn stopped because it hit the model's output limit. */
+  readonly maxtokens: NamedFrame
+  /** The question face: what the ball wears when the agent asks the user something. */
+  readonly ask: NamedFrame
   readonly wake: NamedFrame
   readonly drag: DragFrame
   readonly drop: NamedFrame
@@ -334,14 +530,20 @@ interface MemeConfig extends MemeSchedule {
  *    "typing": { "file": "typing.gif" }, "reply": { "file": "answer.gif" },
  *    "voice": { "file": "nod.gif" }, "speak": { "file": "talk.gif" },
  *    "thinking": { "file": "reasoning.gif" }, "tool": { "file": "tool.gif" },
- *    "webfetch": { "file": "fetch.gif" },
  *    "click": { "file": "pat.gif" }, "arrive": { "files": ["hello.gif", "wave.gif"] },
- *    "done": { "file": "bell.gif" }, "wake": { "file": "bang.gif" },
+ *    "dockArrive": { "file": "arrive-flip.gif", "loop": "arrive-loop.gif",
+ *                    "left": "arrive.gif", "leftLoop": "arrive-left-loop.gif" },
+ *    "done": { "file": "bell.gif" }, "fail": { "file": "cry.gif" }, "wake": { "file": "bang.gif" },
+ *    "ask": { "file": "question.gif" },
  *    "drag": { "file": "hang.gif", "intro": "lift.gif" }, "drop": { "file": "land.gif" },
  *    "sleep": { "afterMs": 300000, "stepMs": 300000, "yawn": { "file": "yawn.gif", "times": 2 },
  *               "files": ["nap1.gif", "nap2.gif"] },
- *    "skit": { "gapMs": [120000, 300000], "file": "skit.gif", "times": [3, 5], "interject": "mid.gif" } }`
+ *    "skit": { "gapMs": [120000, 300000], "files": ["skit.gif", "dance.gif"], "times": [3, 5],
+ *              "interject": "mid.gif" } }`
  * `dir` takes one folder or a list. `random` is injectable so tests stay deterministic.
+ *
+ * A slot whose value is a list of files (`arrive.files`, and `skit.files` with its `interjects`)
+ * keeps every name that resolves: a pack that lost one clip loses that clip and nothing else.
  */
 export function createMemePicker(configPath: string, random: () => number = Math.random): MemePicker {
   let config: MemeConfig | undefined
@@ -390,13 +592,71 @@ export function createMemePicker(configPath: string, random: () => number = Math
     return path === null ? null : readFrame(path)
   }
 
-  /** A named file as a `data:` URL plus one pass of its own animation. */
-  async function timedFrame(file: string, dirs: readonly string[]): Promise<TimedFrame | null> {
+  /** A named file as a `data:` URL plus one pass of its own animation, and the hold a pack asked for. */
+  async function timedFrame(file: string, dirs: readonly string[], holdMs = 0): Promise<TimedFrame | null> {
     const path = await locate({ enabled: true, file }, dirs)
     const body = path === null ? null : await readBytes(path)
     if (path === null || body === null) return null
     const mime = MIME_BY_EXTENSION[extname(path).toLowerCase()] ?? 'image/gif'
-    return { src: `data:${mime};base64,${body.toString('base64')}`, ms: gifDurationMs(body) }
+    // The hold rides along only when the pack asked for one: `0` is "the clip's own length", which is what
+    // every frame means when the field is absent. Nothing else changes shape, so a pack that never sets
+    // `holdMs` travels exactly as it always did.
+    return {
+      src: `data:${mime};base64,${body.toString('base64')}`,
+      ms: gifDurationMs(body),
+      ...(holdMs > 0 ? { holdMs } : {}),
+    }
+  }
+
+  /**
+   * The skit items that actually resolve: the pool, plus the interjections a single clip may use.
+   *
+   * The pool comes back whole, because the page is the half that rotates it: it plays a skit every few
+   * minutes and is the only one that knows which item it played last, so a pool it cannot see is a
+   * rotation it cannot run. The interjections are resolved here too (they cost a read each, and a
+   * scripted run never uses one) but they travel as a pool the page draws from per skit — the run of
+   * "maybe an interruption" is the page's decision and has to be made when the skit plays, not once
+   * when the page loads. Read fresh on every {@link MemePicker.skit} rather than remembered: that call
+   * happens once per page, so a cache would buy nothing and would pin the old pool for the life of the
+   * page after somebody edited the config. The clip lengths come with the frames because they are what
+   * the page schedules with.
+   */
+  async function skitPools(current: MemeConfig): Promise<{
+    readonly items: readonly SkitItem[]
+    readonly interjects: readonly TimedFrame[]
+  }> {
+    // The old single file leads: a page that only understands a single clip (or a config written
+    // before this slot took a list) then plays exactly what it played before.
+    const pool: readonly SkitEntry[] = current.skit.files.length === 0 ? [current.skit.file] : current.skit.files
+    const items: SkitItem[] = []
+    for (const entry of pool) {
+      if (typeof entry === 'string') {
+        const frame = await timedFrame(entry, current.dirs)
+        if (frame !== null) items.push({ kind: 'single', frame })
+        continue
+      }
+      // A run: every clip that resolves is played, in config order. One that is gone costs only itself
+      // — the same reading as `arrive.files` — and a run left with nothing in it is not an item.
+      const frames: TimedFrame[] = []
+      for (const file of entry) {
+        const frame = await timedFrame(file, current.dirs)
+        if (frame !== null) frames.push(frame)
+      }
+      if (frames.length > 0) items.push({ kind: 'sequence', frames })
+    }
+    // The interjections: the singular name first, then the slot's own list, deduplicated. The singular
+    // name is added rather than replaced, so a slot that grew an `interjects` list never drops the
+    // interjection it already had, and one written before the list existed keeps working unchanged.
+    const candidates: string[] = []
+    for (const file of [current.skit.interject, ...current.skit.interjects]) {
+      if (file !== '' && !candidates.includes(file)) candidates.push(file)
+    }
+    const interjects: TimedFrame[] = []
+    for (const file of candidates) {
+      const frame = await timedFrame(file, current.dirs)
+      if (frame !== null) interjects.push(frame)
+    }
+    return { items, interjects }
   }
 
   /** The nap files that actually resolve, in config order. Re-resolved when the config changes. */
@@ -476,14 +736,22 @@ export function createMemePicker(configPath: string, random: () => number = Math
       const current = await loadConfig()
       return named(current.tool, current.dirs)
     },
-    async webfetch() {
+    async toolNamed(name) {
       const current = await loadConfig()
-      return named(current.webfetch, current.dirs)
+      const frame = current.tools[name]
+      // Not `named(current.tool)` as a fallback: the answer for an unlisted tool is "nothing special", and the
+      // page already has the shared face in hand. Reading the shared file again here would send the same bytes
+      // over IPC and make a listed tool indistinguishable from an unlisted one to a caller that only sees a URL.
+      // Page-side diagnostics cannot be read from outside the app, and a lookup that answers "nothing special"
+      // looks exactly like one that never happened — which is the question this answers. Always on, bounded by
+      // the fact that it is one line per tool call, and truncated so a long session cannot grow it without end.
+      noteToolLookup(configPath, name, frame !== undefined)
+      return frame === undefined ? null : named(frame, current.dirs)
     },
     async click() {
       const current = await loadConfig()
       if (!current.click.enabled) return null
-      return timedFrame(current.click.file, current.dirs)
+      return timedFrame(current.click.file, current.dirs, current.click.holdMs)
     },
     async arrive() {
       const current = await loadConfig()
@@ -497,6 +765,40 @@ export function createMemePicker(configPath: string, random: () => number = Math
       }
       return frames.length === 0 ? null : frames
     },
+    /**
+     * The docked arrival.
+     *
+     * Nothing here is special-cased for a missing file, which is the whole of the fallback: a slot
+     * that names nothing, names a file that is not on disk, or is missing from a profile written
+     * before the slot existed all answer `null`, and the page then plays nothing on a hover. The
+     * strip keeps its drag out of the dock either way — that path never touches this.
+     *
+     * The entrance is a {@link TimedFrame} because it plays once; the loop is a plain `src` because it
+     * runs until the pointer leaves. A slot that names no loop still answers for the entrance alone,
+     * so the page plays it and then drops back to the docked idle, exactly as it did before.
+     */
+    async dockArrive() {
+      const current = await loadConfig()
+      if (!current.dockArrive.enabled) return null
+      const file = await timedFrame(current.dockArrive.file, current.dirs)
+      if (file === null) return null
+      // The shared loop, when the pack names one. Resolved before either edge so both can refer to it.
+      const loop = current.dockArrive.loop === ''
+        ? null
+        : await named({ enabled: true, file: current.dockArrive.loop }, current.dirs)
+      const right: DockArriveFrames = { file, loop }
+      // The left edge's own picture, when the pack names one. A left clip that is named but cannot be
+      // read falls back to the shared one rather than taking the strip's greeting away: the clip is a
+      // gift, and a missing file is not a reason for the strip to stop answering.
+      if (current.dockArrive.left === '') return { left: right, right }
+      const leftFile = await timedFrame(current.dockArrive.left, current.dirs)
+      if (leftFile === null) return { left: right, right }
+      const leftLoopName = current.dockArrive.leftLoop === '' ? current.dockArrive.loop : current.dockArrive.leftLoop
+      const leftLoop = leftLoopName === ''
+        ? null
+        : await named({ enabled: true, file: leftLoopName }, current.dirs)
+      return { left: { file: leftFile, loop: leftLoop }, right }
+    },
     async poor() {
       const current = await loadConfig()
       if (!current.poor.enabled) return null
@@ -507,6 +809,55 @@ export function createMemePicker(configPath: string, random: () => number = Math
       const current = await loadConfig()
       if (!current.done.enabled) return null
       return timedFrame(current.done.file, current.dirs)
+    },
+    /**
+     * The failure face.
+     *
+     * A pack that names no file answers `null` and the ball shows nothing new on a failed run — the
+     * shipped default is off, because the file this face wants lives in somebody's meme pack and not
+     * in this package. A name that does not resolve behaves the same way, which is the fail-safe the
+     * whole slot mechanism already has.
+     */
+    async nod() {
+      const current = await loadConfig()
+      if (!current.nod.enabled) return null
+      return timedFrame(current.nod.file, current.dirs)
+    },
+    /** The cut-short face, or `null` while it is off or unreadable. */
+    async interrupted() {
+      const current = await loadConfig()
+      if (!current.interrupted.enabled) return null
+      return timedFrame(current.interrupted.file, current.dirs)
+    },
+    /** The waiting-for-approval face, or `null` while it is off or unreadable. */
+    async approval() {
+      const current = await loadConfig()
+      if (!current.approval.enabled) return null
+      return timedFrame(current.approval.file, current.dirs)
+    },
+    /** The out-of-room face, or `null` while it is off or unreadable. */
+    async maxtokens() {
+      const current = await loadConfig()
+      if (!current.maxtokens.enabled) return null
+      return timedFrame(current.maxtokens.file, current.dirs)
+    },
+    async fail() {
+      const current = await loadConfig()
+      if (!current.fail.enabled) return null
+      return timedFrame(current.fail.file, current.dirs)
+    },
+    /**
+     * The question face.
+     *
+     * Nothing here is special-cased for a missing file: `timedFrame` resolves the name through the
+     * pack, so an unreadable or absent question GIF answers `null` and the ball simply keeps the
+     * face it had. A pack that never names the slot is the same answer, which is what makes this
+     * one more named frame rather than a feature that can fail.
+     */
+    async ask() {
+      const current = await loadConfig()
+      if (!current.ask.enabled) return null
+      return timedFrame(current.ask.file, current.dirs)
     },
     async wake() {
       const current = await loadConfig()
@@ -550,15 +901,36 @@ export function createMemePicker(configPath: string, random: () => number = Math
       const found = await resolveYawn(current)
       return found === null ? null : readFrame(found.path)
     },
+    /**
+     * The idle skit: the pool of items it is drawn from, one of them played, and the mid-clip frame.
+     *
+     * The whole pool travels with the drawn item, because the rotation is the page's: only the page
+     * knows when a skit actually played, and therefore which item it must not repeat. One interjection
+     * is drawn here — it is the helper's own random and the page only ever needs one of them — and an
+     * interjection that *is* the clip it interrupts is dropped rather than handed over, so a single
+     * clip is never played twice in a row. The rest is deliberately forgiving: a pool whose files are
+     * all gone, or a config that names none, answers `null` and the ball simply keeps resting.
+     */
     async skit() {
       const current = await loadConfig()
       if (!current.skit.enabled) return null
-      const file = await timedFrame(current.skit.file, current.dirs)
-      if (file === null) return null
-      const interject = current.skit.interject === ''
-        ? null
-        : await timedFrame(current.skit.interject, current.dirs)
-      return { gapMs: current.skit.gapMs, file, times: current.skit.times, interject }
+      const pools = await skitPools(current)
+      const item = pickFrom(pools.items, random)
+      if (item === null) return null
+      // A scripted run is finished by its own last clip, so nothing is drawn to break it up: the
+      // interjection belongs to the repeated single clip it interrupts and would only lengthen a run
+      // that already has a beginning and an end.
+      const interject = item.kind === 'single' ? pickFrom(pools.interjects, random) : null
+      const lead = item.kind === 'single' ? item.frame : item.frames[0] as TimedFrame
+      return {
+        gapMs: current.skit.gapMs,
+        files: pools.items,
+        item,
+        times: current.skit.times,
+        // An interjection that is the clip being repeated would play that clip twice in a row, so it
+        // is dropped rather than handed to a page that would have to notice.
+        interject: interject !== null && interject.src === lead.src ? null : interject,
+      }
     },
     async next() {
       const current = await loadConfig()
@@ -587,11 +959,18 @@ async function readConfig(path: string): Promise<MemeConfig> {
     reply: FRAME_DEFAULTS,
     thinking: FRAME_DEFAULTS,
     tool: FRAME_DEFAULTS,
-    webfetch: FRAME_DEFAULTS,
-    click: FRAME_DEFAULTS,
+    tools: {},
+    click: CLICK_DEFAULTS,
     arrive: ARRIVE_DEFAULTS,
+    dockArrive: DOCK_ARRIVE_DEFAULTS,
     poor: POOR_DEFAULTS,
     done: FRAME_DEFAULTS,
+    nod: FRAME_DEFAULTS,
+    interrupted: FRAME_DEFAULTS,
+    approval: FRAME_DEFAULTS,
+    maxtokens: FRAME_DEFAULTS,
+    fail: FRAME_DEFAULTS,
+    ask: FRAME_DEFAULTS,
     wake: FRAME_DEFAULTS,
     drag: DRAG_DEFAULTS,
     drop: FRAME_DEFAULTS,
@@ -606,7 +985,6 @@ async function readConfig(path: string): Promise<MemeConfig> {
   } catch {
     return fallback
   }
-  if (typeof raw !== 'object' || raw === null) return fallback
   const record = raw as Record<string, unknown>
   return {
     enabled: record.enabled === true,
@@ -622,11 +1000,22 @@ async function readConfig(path: string): Promise<MemeConfig> {
     reply: readNamed(record.reply),
     thinking: readNamed(record.thinking),
     tool: readNamed(record.tool),
-    webfetch: readNamed(record.webfetch),
-    click: readNamed(record.click),
+    // Inside the slot it belongs to, not beside it: `tool` names the shared face and its `tools` names the
+    // per-name ones, and reading the mapping from *next to* `tool` — which is what this did at first — made
+    // every tool fall back to the shared face while the config looked perfectly correct. The sibling form is
+    // still accepted because it costs one `??`, and a key in the wrong place should not be a silent failure.
+    tools: readToolFaces(readToolFacesValue(record)),
+    click: readClick(record.click),
     arrive: readArrive(record.arrive),
+    dockArrive: readDockArrive(record.dockArrive),
     poor: readPoor(record.poor),
     done: readNamed(record.done),
+    nod: readNamed(record.nod),
+    interrupted: readNamed(record.interrupted),
+    approval: readNamed(record.approval),
+    maxtokens: readNamed(record.maxtokens),
+    fail: readNamed(record.fail),
+    ask: readNamed(record.ask),
     wake: readNamed(record.wake),
     drag: readDrag(record.drag),
     drop: readNamed(record.drop),
@@ -635,17 +1024,64 @@ async function readConfig(path: string): Promise<MemeConfig> {
   }
 }
 
-/** The idle skit: one repeated file, a repetition range, and the frame dropped in the middle. */
+/**
+ * The idle skit: the items it is drawn from, a repetition range, and the frame dropped in the middle.
+ *
+ * `file` and `interject` are read exactly as they always were — a config that names one of each is
+ * untouched by this slot having grown a list — and `files` / `interjects` are the same slot naming
+ * several. A list is added to the singular name rather than replacing it, so a pack may spell the
+ * same slot both ways and still get every clip it named: `file` is the whole pool when no list is
+ * given, and the first of the pool when one is.
+ *
+ * An item of `files` is a name or a run of names, which is how a slot spells "these two, in this
+ * order, once" beside the single clips it can also draw:
+ *
+ * `"files": ["饮料.gif", ["简单.gif", "困难.gif"], "跳舞.gif"]`
+ */
 function readSkit(value: unknown): SkitFrame {
   const frame = readNamed(value)
   const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  const files = readSkitEntries(record.files)
+  const interjects = readNames(record.interjects)
   const interject = typeof record.interject === 'string' ? record.interject.trim() : ''
+  // A slot that names a list turns itself on the way one that names a file does — the whole slot is
+  // off only when it names nothing, or says so. `readNamed` cannot see the lists, so it is asked here.
+  const enabled = record.enabled !== false && (frame.file !== '' || files.length > 0 || interjects.length > 0)
   return {
-    ...frame,
+    enabled,
+    // The lead of the pool: a slot that names one file is a pool of one, and the picker and the page
+    // then both have a pool to draw from.
+    file: files.length === 0 ? frame.file : readSkitLead(files),
     gapMs: readRange(record.gapMs, SKIT_DEFAULTS.gapMs, 5_000, 3_600_000),
     times: readRange(record.times, SKIT_DEFAULTS.times, 1, 12),
-    interject: frame.enabled ? interject : '',
+    files: enabled ? files : [],
+    interject: enabled ? interject : '',
+    interjects: enabled ? interjects : [],
   }
+}
+
+/** The pool of a skit, in config order. An entry that names nothing is dropped rather than kept empty. */
+function readSkitEntries(value: unknown): readonly SkitEntry[] {
+  if (!Array.isArray(value)) return []
+  const entries: SkitEntry[] = []
+  for (const entry of value) {
+    if (typeof entry === 'string') {
+      const file = entry.trim()
+      if (file !== '') entries.push(file)
+      continue
+    }
+    // A run of clips, played once each in the order written.
+    const run = readNames(entry)
+    if (run.length > 0) entries.push(run)
+  }
+  return entries
+}
+
+/** The first file name of a pool, whichever spelling its first item uses. */
+function readSkitLead(entries: readonly SkitEntry[]): string {
+  const first = entries[0]
+  if (first === undefined) return ''
+  return typeof first === 'string' ? first : first[0] as string
 }
 
 /** The yawn that opens the nap: a named file plus how many times it plays. */
@@ -662,9 +1098,7 @@ function readYawn(value: unknown): YawnFrame {
 function readSleep(value: unknown): SleepPlan {
   if (typeof value !== 'object' || value === null) return SLEEP_DEFAULTS
   const record = value as Record<string, unknown>
-  const files = Array.isArray(record.files)
-    ? record.files.filter((file): file is string => typeof file === 'string' && file.trim() !== '').map((file) => file.trim())
-    : []
+  const files = readNames(record.files)
   return {
     enabled: record.enabled !== false && files.length > 0,
     afterMs: readMs(record.afterMs, SLEEP_DEFAULTS.afterMs, 1_000, 86_400_000),
@@ -678,10 +1112,15 @@ function readSleep(value: unknown): SleepPlan {
 function readArrive(value: unknown): ArrivePlan {
   if (typeof value !== 'object' || value === null) return ARRIVE_DEFAULTS
   const record = value as Record<string, unknown>
-  const files = Array.isArray(record.files)
-    ? record.files.filter((file): file is string => typeof file === 'string' && file.trim() !== '').map((file) => file.trim())
-    : []
+  const files = readNames(record.files)
   return { enabled: record.enabled !== false && files.length > 0, files }
+}
+
+/** A list of file names, trimmed, without the entries that are blank or not strings at all. */
+function readNames(value: unknown): readonly string[] {
+  return Array.isArray(value)
+    ? value.filter((file): file is string => typeof file === 'string' && file.trim() !== '').map((file) => file.trim())
+    : []
 }
 
 /**
@@ -725,12 +1164,85 @@ function readDrag(value: unknown): DragFrame {
   return { ...frame, intro: frame.enabled ? intro : '' }
 }
 
+/** The docked arrival: a named entrance plus the optional loop worn after it finishes, per edge. */
+function readDockArrive(value: unknown): DockArriveFrame {
+  const frame = readNamed(value)
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  const text = (key: string): string => (typeof record[key] === 'string' ? (record[key] as string).trim() : '')
+  const loop = text('loop')
+  const left = text('left')
+  const leftLoop = text('leftLoop')
+  // A disabled slot has no clips at all, so none of the three names survives it.
+  if (!frame.enabled) return { ...frame, loop: '', left: '', leftLoop: '' }
+  return { ...frame, loop, left, leftLoop }
+}
+
 /** A named frame. Naming a file turns it on unless the entry is explicitly disabled. */
 function readNamed(value: unknown): NamedFrame {
   if (typeof value !== 'object' || value === null) return FRAME_DEFAULTS
   const record = value as Record<string, unknown>
   const file = typeof record.file === 'string' ? record.file.trim() : ''
   return { enabled: record.enabled !== false && file !== '', file }
+}
+
+/** Where the per-tool mapping lives, accepting both the slot-nested and the flat spelling. */
+function readToolFacesValue(record: Record<string, unknown>): unknown {
+  const tool = record.tool
+  if (typeof tool === 'object' && tool !== null && !Array.isArray(tool)) {
+    const nested = (tool as Record<string, unknown>).tools
+    if (nested !== undefined) return nested
+  }
+  return record.tools
+}
+
+/**
+ * Record one per-name tool lookup, and whether the pack had a face for it.
+ *
+ * Written beside the config it was decided from — the orb's own runtime folder, and the one place both halves
+ * already agree on. It answers the question the page cannot answer for itself: whether the ball asked about a
+ * tool's own face at all. A lookup that finds the pack listed nothing for a name and a lookup that never
+ * happened both leave the shared face on screen, so without this the difference is invisible exactly when it
+ * matters. Bounded, because this is one line per tool call rather than per token.
+ */
+function noteToolLookup(configPath: string, name: string, listed: boolean): void {
+  try {
+    const path = join(dirname(configPath), TOOL_LOG)
+    const existing = existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : []
+    const kept = existing.length >= TOOL_LOG_MAX_LINES ? existing.slice(-(TOOL_LOG_MAX_LINES - 1)) : existing
+    kept.push(`${new Date().toISOString()} asked=${JSON.stringify(name)} own-face=${listed}`)
+    writeFileSync(path, `${kept.join('\n')}\n`)
+  } catch {
+    // A readout that cannot be written is not a reason to change what the ball wears.
+  }
+}
+
+/** One face per tool name, for the tools the pack draws apart from the rest. */
+function readToolFaces(value: unknown): Readonly<Record<string, NamedFrame>> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const faces: Record<string, NamedFrame> = {}
+
+  for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
+    const tool = name.trim()
+    if (tool === '') continue
+    // Each entry is either a bare file name — the common case, and the one that reads best in a config — or a
+    // `{ "file": … }` object, which is what every other slot looks like and what a pack will reach for. Both
+    // are accepted rather than one, because the difference is a brace and the mistake would be silent.
+    const frame = readNamed(typeof entry === 'string' ? { file: entry } : entry)
+    if (frame.enabled) faces[tool] = frame
+  }
+  return faces
+}
+
+/** {@link readNamed} for the click reaction, which also carries the hold the pack asked for. */
+function readClick(value: unknown): ClickFrame {
+  const frame = readNamed(value)
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  // Read only when it is a positive number: a typo, or a negative, is not a reason to hold a face for no time
+  // at all, and the clip's own cut-before-its-loop-point length is the answer there.
+  const hold = typeof record.holdMs === 'number' && Number.isFinite(record.holdMs) && record.holdMs > 0
+    ? Math.min(Math.round(record.holdMs), 60_000)
+    : 0
+  return { ...frame, holdMs: hold }
 }
 
 /** One folder or a list of them, trimmed, without repeats. */
@@ -759,6 +1271,18 @@ function readRange(value: unknown, fallback: readonly [number, number], min: num
 
 function sameDirs(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((dir, index) => dir === right[index])
+}
+
+/**
+ * One of `list`, drawn with `random`, or `null` for an empty one.
+ *
+ * The index is clamped rather than trusted: `random` is injectable, and a test (or a caller) that
+ * hands back 1 has to get the last entry instead of `undefined`.
+ */
+function pickFrom<T>(list: readonly T[], random: () => number): T | null {
+  if (list.length === 0) return null
+  const index = Math.min(list.length - 1, Math.floor(random() * list.length))
+  return list[index] as T
 }
 
 async function collect(dir: string, depth: number, files: string[]): Promise<void> {

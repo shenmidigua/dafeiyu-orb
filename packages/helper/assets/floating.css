@@ -975,21 +975,57 @@ body.docked #wake-meter {
   cursor: grabbing;
 }
 
+/* The way back out of the dock, and therefore the one element whose box is not its picture.
+ *
+ * The window captures the mouse over exactly the rects the page reports (`syncHitTest`), and
+ * `DOCK_HIT_WIDTH` is the strip the main process is asked to hold — 6px of bar, an 8px glow and a
+ * 20px margin. The element used to be 6px wide, so that is what it reported, and the 28px of strip
+ * between the bar and the window's inward edge captured nothing: a press inside the strip the
+ * geometry had decided was hittable landed on `body`, and the window went click-through the moment
+ * the pointer left the bar — a pull measured 24px of travel it was never told about.
+ *
+ * So the box is the strip (34px) and the picture is drawn inside it by `::after`, flush with the
+ * screen edge. Nothing about the bar's appearance changes; what changes is that the page now
+ * reports a rect the geometry already believes in. */
 #dock-tab {
   position: absolute;
   top: 8px;
   display: none;
-  width: 6px;
+  box-sizing: border-box;
+  width: 34px;
   height: var(--ball);
   border: 0;
   border-radius: 999px;
   padding: 0;
+  background: none;
+  cursor: pointer;
+  /* The 28px of box that is not bar is a target with no picture, and anything it drew outside
+     itself would report as a rect the window does not capture over. */
+  overflow: hidden;
+}
+
+/* The 6px bar itself, in the last 6px of the 34px box, which is the screen edge it is docked to.
+   Boxed the way `#ball:focus-visible` below is, so the element that is now 34px wide does not put
+   a keyboard ring around a strip of empty desktop. */
+#dock-tab:focus-visible {
+  outline: 0;
+}
+
+/* The pill, the glow and the breath all live on the pseudo-element: the bar is the target, but the
+   strip behind it is what the pointer is allowed to press, and the picture must keep exactly the
+   6px it always had. */
+#dock-tab::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  border-radius: 999px;
   background: #75757F;
   box-shadow:
     0 0 0 6px rgb(117 117 127 / 7%),
     0 0 0 4px rgb(117 117 127 / 12.5%),
     0 0 0 2px rgb(117 117 127 / 19.6%);
-  cursor: pointer;
   animation: dock-tab-breath 1800ms ease-in-out infinite alternate;
 }
 
@@ -999,7 +1035,7 @@ body.docked #wake-meter {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  #dock-tab {
+  #dock-tab::after {
     animation: none;
     opacity: 1;
   }
@@ -1009,7 +1045,16 @@ body.docked-left #dock-tab {
   left: 0;
 }
 
+/* The box starts at the edge and grows inward, so the bar is the edge-most 6px either way. */
+body.docked-left #dock-tab::after {
+  left: 0;
+}
+
 body.docked-right #dock-tab {
+  right: 0;
+}
+
+body.docked-right #dock-tab::after {
   right: 0;
 }
 
@@ -1024,12 +1069,135 @@ body.docked #stop {
   pointer-events: none;
 }
 
+/* The peek: a hover on the strip has brought the ball half way out of the edge it is docked to, so
+   half of it is on screen. Hidden is the *docked* state, not the docked-and-showing one, and this
+   is the only thing that tells them apart — everything else about the docked layout is unchanged.
+
+   `pointer-events: none` is deliberately *not* overridden. The ball is being *shown*, not handed
+   over: it is still not the user's to click or drag, and the strip is still the one way out of the
+   dock. A hover that took the ball back would be the bug `enterUi` stopped being. */
+body.docked.docked-peek #ball {
+  visibility: visible;
+}
+
+/* The strip, on the other hand, has to *stay where it is*, and that needs saying.
+
+   Docked, the window is the strip: 34 x 304 flush with the display edge, and the bar is its
+   edge-most 6px. Peeked, the window is the overlay rect — the ball is drawn at `--ball-column` and
+   the window has to reach a panel's width either side of it — so the window's far edge leaves the
+   display, and a strip positioned against that edge goes with it. The hand hovering the strip is
+   the whole reason the peek exists, so the strip is pinned to the *display's* edge instead.
+
+   Which edge that is can be read off the ball, and only off the ball: the helper lands a *peeked*
+   ball half a ball's width past the display edge — `peekBallOrigin` in `geometry.ts` — and the ball
+   is at `--ball-column` in the window, so `--ball-column` plus half the ball *is* the display edge
+   within the window. The strip is `DOCK_HIT_WIDTH` (34px) wide, so on the right its box starts that
+   much to the left of it. Same row as the ball's, which is also why the bar keeps the y it had
+   while the ball was hidden. */
+body.docked.docked-peek #dock-tab {
+  top: var(--ball-row);
+}
+
+body.docked.docked-peek.docked-right #dock-tab {
+  right: auto;
+  left: calc(var(--ball-column) + var(--ball) / 2 - 34px);
+}
+
+body.docked.docked-peek.docked-left #dock-tab {
+  left: calc(var(--ball-column) + var(--ball) / 2);
+}
+
 #ball-gif {
   width: 100%;
   height: 100%;
   object-fit: cover;
   border-radius: 50%;
   pointer-events: none;
+}
+
+/* The docked strip's two clips are mirrored, and a mirrored clip carries its subject off to one side
+   of a square canvas — measured in the ball rather than in the file, `冒泡 1登场水平翻转.gif` sits
+   +21px and `登场水平翻转.gif` +28px right of the ball's own centre. Both are drawn that way, so the
+   fish reads as sitting to one side of the strip rather than in it.
+
+   `-44px` is past the midpoint of those two (which is 24), chosen by eye after the midpoint landed. One
+   number has to serve both, and the 7px of difference between them is taken as the residual rather
+   than as a jump: centring each clip exactly would mean nudging the entrance by 21 and the loop by 28,
+   and the handover between them would swing the fish sideways on the one frame where it is already
+   meant to be settling.
+
+   The three functions are written in the order that keeps the two numbers above worth having. A
+   transform list is applied as nested coordinate systems, left to right, so the two translations are in
+   the ball's own *unscaled* units and the scale is applied inside them: `translateX(-44px)
+   translateY(-10px) scale(0.9)` slides the picture 44px left and 10px up, then shrinks it, and both
+   shifts stay exactly those numbers whatever the scale becomes. Any other order lets the scale shrink
+   the shifts as well, and every judgement about where the fish sits would have to be measured again
+   every time the size changed.
+
+   `scale` is about the element's own centre, which is what CSS does by default, so the fish keeps its
+   place relative to the middle of the ball and merely gets smaller — it does not slide off to a corner.
+   `0.9` rather than the `0.8` this started at: at four fifths the fish read as too small against the
+   strip, and the two clips' different widths make a single scale a compromise anyway.
+
+   The hit area is deliberately left alone. The transform is on the image, not on `#ball`, so
+   `pointerOnUi`'s `ball.getBoundingClientRect()` still measures the full 288px square: a smaller-looking
+   fish is easier to put a hand on, not harder.
+
+   The clip's own background, and why it is left alone. These two are *mirrored* files, and the mirror
+   carried a dark grey plate across with them: measured in the frames, the right edge of each is an
+   opaque `rgb(45,45,45)` / `rgb(43,43,43)` while the left is fully transparent, so the subject sits on
+   a square slab rather than on nothing. `border-radius` used to crop that slab to a circle, which read
+   as a dark ring cutting into the fish — an edge the picture brought with it, drawn in the wrong place
+   by a rounding that was only ever meant to tidy a transparent margin.
+
+   So the crop goes, and it goes only here. `#ball-gif`'s own `border-radius: 50%` is left in place for
+   the free ball, whose clips are transparent to the corners and genuinely need it; the docked override
+   is the one that stops earning its keep. What shows instead is the slab's own square edge, which is
+   what the file actually contains. */
+body.docked #ball-gif {
+  border-radius: 0;
+  transform: translateX(-44px) translateY(-10px) scale(0.9);
+}
+
+/* The left edge's clips are the unmirrored pair, so the shift goes the other way.
+ *
+ * The transform above is a *mirrored* clip's own calibration, and the slab paragraph above is the reason
+ * it is negative: in `冒泡 1登场水平翻转.gif` the subject sits x 302..499 of a 500px canvas, so it has to be
+ * pulled left to be framed, and `-44px` is that pull. The left edge plays `冒泡 1登场.gif` and
+ * `冒泡 2登场.gif`, whose subjects sit x 0..191 and x 0..410 — the same negative pull pushes them *past* the
+ * screen edge instead. Measured on the page through `getBoundingClientRect()`, at `-44px` only 86 of the
+ * 144 px a peek can show carry any picture at all, which is the fish reading as most of the way off the
+ * screen.
+ *
+ * A peek shows the ball's edge-side half — 144 px of the 288 px box — and both left clips fill that band
+ * for every shift from `+28px` to `+124px`; `+44px` is the middle of that range and the previous shift
+ * with its sign flipped. `translateY` and `scale` are shared rather than repeated per edge: they answer
+ * the ball's row and the clip's own size, which are the same question on either side.
+ *
+ * This is why the two edges are stylesheet rules rather than part of the clip's name: what a clip needs is
+ * a property of how its picture was drawn, and one file cannot carry that. */
+body.docked-left #ball-gif {
+  transform: translateX(44px) translateY(-10px) scale(0.9);
+}
+
+/* A docked picture with nothing to draw yet is not drawn at all.
+
+   An `<img>` waiting on a source paints a box of its own: a small broken-image glyph in the top-left
+   corner, inside a white-edged rectangle. The round corners above used to crop that box into a circle,
+   where it passed for part of the ball; the square corners that let the clip's own slab through also
+   let this through, and it read for what it is — a flash of an empty frame, with an icon in it, on
+   every hover.
+
+   `.ball-drawn` is added by the element's own `load` event (`armBallPicture`), which is the only party
+   that knows when a decode has finished. Until then there is nothing honest to paint, so there is
+   nothing painted. `visibility` rather than `opacity`, because an element that is only invisible still
+   has its box: the hit test reads `getBoundingClientRect()`, and anything that removed the box from
+   layout would take the strip's hover with it.
+
+   The free ball is untouched by design. It is a round picture in a round box, its own radius crops the
+   placeholder, and it has never flashed. */
+body.docked:not(.ball-drawn) #ball-gif {
+  visibility: hidden;
 }
 
 #stop {
@@ -1178,4 +1346,37 @@ body:not(.running) #stop {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+/* ── voice wake UI, hidden on purpose ──────────────────────────────────────
+   The two labels that answer the wake word — `#wake-badge` (the one-line status
+   under the ball) and `#wake-meter` (the score card below it) — are taken off
+   screen here, without deleting anything. That is the only thing this rule does.
+
+   It is a switch, not a removal: the markup, the engine wiring, the score bar,
+   the dots, the wording and the tests are all untouched and still run, and the
+   wake word, the chime, the reaction frame, the auto-expand and the dictation
+   that follows are unchanged — only these two readouts are no longer painted.
+
+   It sits last in the sheet on purpose. `#wake-meter` sets `display: flex` in its
+   own rule above and the two `[hidden]` rules in the middle set `display: none`,
+   so at equal specificity (0-1-0) only source order decides which of the three
+   wins — and a switch that the next rule down the file can undo is not a switch.
+   Keeping this block at the end is what makes it hold for every state the page
+   wears, including `wake-recording` and `docked`.
+
+   Everything downstream of them stays as it was, which is why this is one rule
+   and not a page-side change: both elements are `position: absolute` labels that
+   the ball, the panel and the hit-test rects ignore (`syncHitTest` reports the
+   ball, the panel, the stop cap and the docked tab only — see shell.js), so they
+   hold no space and nothing moves when they go. The window rect is the same
+   742×544 whatever this says.
+
+   To show them again, delete this rule — nothing else has to be restored. Note
+   that the ball's hover tooltip keeps carrying the same wake status while the
+   badge is hidden (`syncWake` sets it from the same string), so the feature can
+   still be checked without these two. */
+#wake-badge,
+#wake-meter {
+  display: none;
 }

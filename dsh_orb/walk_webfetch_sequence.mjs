@@ -36,7 +36,7 @@ for (let i = open; i < source.length; i += 1) {
 const body = source.slice(head, end + 1)
 
 const build = new Function('deps', `
-  const { document, pageClosed, syncSleep, dragging, clickShown, arriveShown, wakeShown, doneShown, typingSrc,
+  const { document, pageClosed, syncSleep, dragging, clickShown, arriveShown, wakeShown, doneShown, failShown, askShown, typingSrc,
           replySrc, toolSrc, thinkingSrc, speakSrc, speakActive, voiceSrc, dictationPhase,
           dropShown, dropStep, webfetchSrc, agentState, agentTool, idleSrc, hoverSrc, introTimer,
           napShown, skitInfo, running, asking, tccGateVisible, attachedSelection, expanded,
@@ -62,6 +62,7 @@ function show(options = {}) {
     document: { querySelector: () => gif, body: { classList: { contains: () => false } } },
     pageClosed: () => false, syncSleep: () => {}, dragging: false,
     clickShown: undefined, arriveShown: undefined, wakeShown: undefined, doneShown: undefined,
+    failShown: undefined, askShown: undefined,
     typingSrc: undefined, replySrc: undefined, toolSrc, thinkingSrc: undefined,
     speakSrc: undefined, speakActive: false, voiceSrc: undefined, dictationPhase: 'idle',
     dropShown: undefined, dropStep: 0,
