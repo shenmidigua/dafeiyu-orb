@@ -1,0 +1,170 @@
+{
+  "_readme": [
+    "A reference copy of the orb config as it stands on one machine, kept so that a key that goes missing has",
+    "something to be compared against. The live file is ~/.dsh/dsh-orb/memes.json and is NOT in this repository.",
+    "",
+    "`dir` is the only value replaced; everything else is what the settings page wrote. Slots with no file are",
+    "switched off on purpose — `sleep`, for instance, has a five-minute `afterMs` and a three-step nap."
+  ],
+  "enabled": false,
+  "dir": "<pack directory>",
+  "gapMs": [
+    60000,
+    180000
+  ],
+  "holdMs": [
+    700,
+    1100
+  ],
+  "frames": [
+    3,
+    6
+  ],
+  "idle": {
+    "enabled": true,
+    "file": "PNGTuber 闲置.gif"
+  },
+  "typing": {
+    "enabled": true,
+    "file": "记录 1.gif"
+  },
+  "hover": {
+    "enabled": true,
+    "file": "期待 2.gif",
+    "intro": "打招呼 1.gif"
+  },
+  "voice": {
+    "enabled": true,
+    "file": "点头.gif"
+  },
+  "speak": {
+    "enabled": true,
+    "file": "PNGTuber 说话.gif"
+  },
+  "reply": {
+    "enabled": true,
+    "file": "打字(普通).gif"
+  },
+  "thinking": {
+    "enabled": true,
+    "file": "思考(认真地).gif"
+  },
+  "sleep": {
+    "afterMs": 300000,
+    "stepMs": 300000,
+    "yawn": {
+      "enabled": true,
+      "file": "打哈欠表情包2_透明.gif",
+      "times": 1
+    },
+    "files": [
+      "睡觉(准备阶段1).gif",
+      "睡觉(准备阶段2).gif",
+      "睡觉(普通).gif",
+      "睡觉 (UU).gif"
+    ]
+  },
+  "tool": {
+    "enabled": true,
+    "file": "画板.gif",
+    "tools": {
+      "pwsh": "打字(恼怒).gif",
+      "edit": "打字(普通).gif",
+      "read": "记录 1.gif",
+      "grep": "指.gif",
+      "read_image": "像素墨镜反光.gif",
+      "todo_write": "有主意了.gif",
+      "subagent": "扩音器.gif",
+      "wait": "加载(茶_咖啡杯).gif"
+    }
+  },
+  "skit": {
+    "enabled": true,
+    "gapMs": [
+      120000,
+      300000
+    ],
+    "times": [
+      3,
+      5
+    ],
+    "files": [
+      [
+        "带薪拉屎(简单模式).gif",
+        "带薪拉屎(困难模式).gif"
+      ],
+      "饮料(能量饮料1).gif",
+      "跳舞 1.gif"
+    ],
+    "interjects": []
+  },
+  "click": {
+    "enabled": true,
+    "file": "摸头.gif",
+    "holdMs": 1400
+  },
+  "done": {
+    "enabled": true,
+    "file": "摇铃.gif"
+  },
+  "fail": {
+    "enabled": true,
+    "file": "停止工作.gif"
+  },
+  "startle": {
+    "enabled": true,
+    "file": "惊吓.gif"
+  },
+  "wake": {
+    "enabled": true,
+    "file": "叹号.gif"
+  },
+  "ask": {
+    "enabled": true,
+    "file": "问号.gif"
+  },
+  "drag": {
+    "enabled": true,
+    "file": "悬空.gif",
+    "intro": "拎起.gif"
+  },
+  "drop": {
+    "enabled": true,
+    "file": "下落.gif"
+  },
+  "arrive": {
+    "enabled": true,
+    "files": [
+      "到达.gif",
+      "打招呼 1.gif"
+    ]
+  },
+  "dockArrive": {
+    "enabled": true,
+    "file": "冒泡 1登场水平翻转.gif",
+    "loop": "登场水平翻转.gif",
+    "left": "冒泡 1登场.gif",
+    "leftLoop": "冒泡 2登场.gif"
+  },
+  "poor": {
+    "enabled": true,
+    "below": 5,
+    "file": "吸氧.gif"
+  },
+  "nod": {
+    "enabled": true,
+    "file": "点头.gif"
+  },
+  "interrupted": {
+    "enabled": true,
+    "file": "惊吓.gif"
+  },
+  "approval": {
+    "enabled": true,
+    "file": "问号.gif"
+  },
+  "maxtokens": {
+    "enabled": true,
+    "file": "叹号.gif"
+  }
+}
