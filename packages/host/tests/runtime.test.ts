@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { OrbRuntime, type OrbContext } from '../src/orb.ts'
 import { ProfileStore } from '../src/preferences.ts'
+import { registerReplyStyle } from '../src/reply-style.ts'
 import type { TccRight, TccStatus } from '../src/tcc.ts'
 
 const home = mkdtempSync(join(tmpdir(), 'orb-runtime-'))
@@ -254,6 +255,26 @@ function textOf(message: Record<string, unknown>): string {
   return typeof message.text === 'string' ? message.text : ''
 }
 
+/**
+ * The reply-style section's text provider, registered the way `index.ts` does it.
+ *
+ * The runtime test drives the socket; the section is what turns the switch into prompt text, so the
+ * two halves have to be joined here rather than asserted apart.
+ */
+function replySection(store: ProfileStore): (session: unknown) => string {
+  let provider: ((context: { agent?: { session?: unknown } }) => string) | undefined
+  registerReplyStyle({
+    systemPrompt: {
+      section(section: { text: (context: { agent?: { session?: unknown } }) => string }) {
+        provider = section.text
+        return () => {}
+      },
+    },
+  }, store)
+  if (provider === undefined) throw new Error('the reply-style section was not registered')
+  return (session) => provider?.({ agent: { session } }) ?? ''
+}
+
 describe('ball control socket', { concurrency: 1 }, () => {
   it('lists only Computer Use chats in dsh_orb and replays one when opened', async () => {
     const harness = boot()
@@ -390,14 +411,22 @@ describe('ball control socket', { concurrency: 1 }, () => {
       await new Promise((resolve) => setTimeout(resolve, 30))
       assert.equal(harness.calls.create.length, creates)
 
-      client.send({ type: 'set-millifraction', enabled: true })
+      // The shipped coordinate encoding is platform-dependent (on for Windows, off elsewhere), so
+      // this flips away from whatever the profile holds: a *change* opens a new chat, because the
+      // encoding is pinned per session.
+      const initialFraction = harness.store.millifractionEnabled()
+      client.send({ type: 'set-millifraction', enabled: !initialFraction })
       await waitFor(() => harness.calls.create.length === creates + 1)
-      assert.equal(harness.store.millifractionEnabled(), true)
-      assert.equal(harness.store.coordinateMode(), 'millifraction')
+      assert.equal(harness.store.millifractionEnabled(), !initialFraction)
+      assert.equal(harness.store.coordinateMode(), initialFraction ? 'pixel' : 'millifraction')
       assert.equal(harness.calls.create.at(-1)?.sessionId, undefined)
       assert.equal(harness.calls.create.at(-1)?.agentPreset, 'computer-use')
+      const flipped = harness.calls.create.length
+      client.send({ type: 'set-millifraction', enabled: initialFraction })
+      await waitFor(() => harness.calls.create.length === flipped + 1)
+      assert.equal(harness.store.millifractionEnabled(), initialFraction)
       const afterFraction = harness.calls.create.length
-      client.send({ type: 'set-millifraction', enabled: true })
+      client.send({ type: 'set-millifraction', enabled: initialFraction })
       await new Promise((resolve) => setTimeout(resolve, 40))
       assert.equal(harness.calls.create.length, afterFraction)
 
@@ -412,8 +441,50 @@ describe('ball control socket', { concurrency: 1 }, () => {
       }
       assert.equal(chrome.overlay.model, 'deepseek-pro')
       assert.equal(chrome.background.model, 'background-model')
-      assert.equal(chrome.millifractionEnabled, true)
+      assert.equal(chrome.millifractionEnabled, initialFraction)
       assert.equal(chrome.catalog.groups[0]?.id, 'deepseek-official')
+    } finally {
+      client.socket.end()
+      harness.runtime.halt()
+    }
+  })
+
+  it('flips terse replies from the ball menu, writes the profile, and gates the prompt', async () => {
+    const harness = boot()
+    const client = await connect(harness.runtime)
+    try {
+      const chromeMessages = () => client.messages.filter((message) => message.type === 'chrome')
+      const lastReply = () => (chromeMessages().at(-1) as { reply?: { enabled?: boolean; maxReplyChars?: number } }).reply
+
+      // A profile with no `orb-reply.json` reads as "on, eighty characters", and the menu is told so.
+      const before = chromeMessages().length
+      client.send({ type: 'menu' })
+      await waitFor(() => chromeMessages().length > before)
+      assert.deepEqual(lastReply(), { enabled: true, maxReplyChars: 80 })
+
+      // Exactly the message `menu.ts` sends from the row's click handler when the user unchecks it.
+      client.send({ type: 'set-reply', enabled: false })
+      await waitFor(() => harness.store.reply().enabled === false)
+      assert.deepEqual(
+        JSON.parse(readFileSync(join(harness.profile, 'orb-reply.json'), 'utf8')) as unknown,
+        { enabled: false, maxReplyChars: 80 },
+      )
+      // The checked state comes back on the chrome broadcast, which is what draws the tick.
+      await waitFor(() => lastReply()?.enabled === false)
+
+      const section = replySection(harness.store)
+      const ballSession = { header: { agentPreset: 'computer-use', cwd: join(orb, 'terse-off') } }
+      const windowSession = { header: { agentPreset: 'computer-use', cwd: join(home, 'profile-away') } }
+      assert.equal(section(ballSession), '', 'the switch is off, so the contract is gone from the ball')
+      assert.equal(section(windowSession), '', 'the main window never gets the contract')
+
+      // One more click, and the next answer is already constrained — no restart in between.
+      client.send({ type: 'set-reply', enabled: true })
+      await waitFor(() => harness.store.reply().enabled === true)
+      assert.match(section(ballSession), /极简回复/)
+      assert.match(section(ballSession), /80 字/)
+      assert.equal(section(windowSession), '')
+      assert.equal(JSON.parse(readFileSync(join(harness.profile, 'orb-reply.json'), 'utf8')).enabled, true)
     } finally {
       client.socket.end()
       harness.runtime.halt()

@@ -42,8 +42,11 @@
 const REQUEST_TIMEOUT_MS = 180000
 /** Below this, a reply is probably a fragment and reading it aloud would just be noise. */
 const MIN_CHARS = 4
-/** Refuse text past this length rather than synthesising for minutes. */
-const MAX_CHARS = 600
+// There is deliberately no cap on a whole reply. There used to be one (600 characters) and it cut
+// silently: a long answer was spoken up to the cap and then stopped, in the middle of a sentence,
+// with the speaker reporting a normal finish — indistinguishable from the playback faults this file
+// also has to survive. Length costs time, not correctness: the queue below fetches one sentence at a
+// time, so the only bound that matters is on a single request, not on the reply.
 /**
  * Bounds on one request. Below `min` two sentences are merged, because a round trip for two words
  * wastes more time than the join costs and the joins start to be audible. Above `max` a sentence is
@@ -94,8 +97,18 @@ export function sentencesForSpeech(text, { min = MIN_SENTENCE_CHARS, max = MAX_S
   const flush = () => {
     let rest = pending
     while (rest.length > max) {
-      sentences.push(rest.slice(0, max))
-      rest = rest.slice(max)
+      // Cut at the last soft break in the second half of the window, so a run with no sentence
+      // punctuation is still split where a reader would pause. Hard-cutting at `max` lands mid-word
+      // and each clip then sounds as if it were truncated — the same complaint as a stopped reading,
+      // even though the queue is still healthy.
+      const window = rest.slice(0, max)
+      const soft = Math.max(
+        window.lastIndexOf('，'), window.lastIndexOf('、'), window.lastIndexOf(','),
+        window.lastIndexOf('：'), window.lastIndexOf(':'), window.lastIndexOf(' '),
+      )
+      const cut = soft >= Math.floor(max / 2) ? soft + 1 : max
+      sentences.push(rest.slice(0, cut))
+      rest = rest.slice(cut)
     }
     if (rest.trim() !== '') sentences.push(rest)
     pending = ''
@@ -159,6 +172,13 @@ export class Speaker {
     this.lastDetail = ''
     /** Progress worth showing while something is being waited on, e.g. the service starting up. */
     this.notice = ''
+    /**
+     * How many replies have been read to the end. A counter rather than a flag because the page
+     * needs the *edge* — the moment the last sentence of this reply ended — and a flag cannot say
+     * which of two replies it belongs to. Only {@link settle} moves it, so a cancelled reading
+     * never counts as a finished one.
+     */
+    this.finished = 0
   }
 
   /** Point at a different service. A no-op when unchanged, so callers can push on every sync. */
@@ -201,6 +221,7 @@ export class Speaker {
       error: this.lastError,
       detail: this.lastDetail,
       notice: this.notice,
+      finished: this.finished,
     }
   }
 
@@ -259,18 +280,13 @@ export class Speaker {
     this.lastDetail = ''
     this.notice = ''
 
-    // Tool transcripts and code dumps should not become spoken text even when they arrive as an
-    // assistant block; the caller filters by kind, this is the backstop.
-    if (text.length > MAX_CHARS) {
-      this.onState({ ...this.state(), truncated: true })
-    }
-
     this.speaking = true
     this.emit()
     // `run` reports problems as state rather than as exceptions, so anything that reaches the handler
     // is a bug in this file — and an unhandled rejection would leave the button showing a stop square
-    // for a reply nobody is reading.
-    this.run(sentencesForSpeech(text.slice(0, MAX_CHARS)), generation).catch((error) => {
+    // for a reply nobody is reading. The whole text is handed over: `sentencesForSpeech` bounds what
+    // one request may contain, and the queue's own generation check is what can stop a reading early.
+    this.run(sentencesForSpeech(text), generation).catch((error) => {
       this.fail('playback', String((error && error.message) || error))
       this.settle(generation)
     })
@@ -301,43 +317,49 @@ export class Speaker {
       return inFlight.get(index)
     }
 
-    // A sentence the service would not produce is not a reason to abandon the ones after it. That is
-    // what used to happen, and it is why a reply could stop dead half way through with the remaining
-    // sentences never spoken and nothing on screen but the reason the service gave. Two in a row is
-    // a different story: at that point the service is down rather than one clip being unlucky, and
-    // asking for the rest only multiplies the wait before the same message appears.
-    let failures = 0
+    // A sentence the service would not produce, or one the player refused, is not a reason to
+    // abandon the ones after it. That is what used to happen: a single clip that did not play ended
+    // the queue, so a reply stopped dead half way through, the remaining sentences were never even
+    // requested, and nothing on screen said why. Every sentence now gets its turn; only a newer
+    // reply taking over (the generation moving on) ends the loop early. A sentence that fails marks
+    // the reading incomplete, so it is not later counted as read to its end.
+    let incomplete = false
     try {
       for (let index = 0; index < sentences.length; index += 1) {
         const blob = await request(index)
         if (blob === null) {                        // cancelled, superseded, or already reported
           if (generation !== this.generation) return
-          failures += 1
-          if (failures >= 2) return
+          incomplete = true
           continue
         }
-        failures = 0
         request(index + 1)                          // while the next one plays, not before this one
         const played = await this.playAndWait(blob, generation)
-        if (!played) return
+        if (!played && generation !== this.generation) return
+        if (!played) incomplete = true
       }
     } finally {
       // Whatever happened — the last sentence, a cancellation, a service that gave up half way —
       // the button has to go back to a play triangle. `fail` no longer does this itself precisely
       // because a failed sentence is survivable now.
-      this.settle(generation)
+      this.settle(generation, !incomplete)
     }
   }
 
   /**
    * Put the speaker back in its resting state, unless a newer reply has taken over in the meantime
    * (in which case that one owns the state and clearing it here would blank its button).
+   * @param {number} generation the reading this call belongs to
+   * @param {boolean} [completed] whether every sentence of it played to its end
    */
-  settle(generation) {
+  settle(generation, completed = false) {
     if (generation !== this.generation) return
     if (!this.speaking && this.currentKey === '') return
     this.speaking = false
     this.currentKey = ''
+    // Only a reading that reached the end with every clip played counts as finished. One that
+    // stopped short — cancelled, superseded, or a sentence the service or the player refused — has
+    // not read the reply out, and the caller must not treat it as though it had.
+    if (completed) this.finished += 1
     this.emit()
   }
 
@@ -419,7 +441,8 @@ export class Speaker {
    * Play one sentence and resolve when it has finished.
    *
    * Resolves `true` when it ended on its own and `false` when it did not — cancelled, or a playback
-   * error, which is reported through {@link fail} rather than thrown, so the queue stops cleanly.
+   * error, which is reported through {@link fail} rather than thrown, so the queue can move on to
+   * the next sentence instead of treating one bad clip as the end of the reply.
    */
   playAndWait(blob, generation) {
     return new Promise((resolve) => {

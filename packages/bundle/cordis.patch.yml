@@ -13,7 +13,10 @@
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
+              # No `suffix` here, and no `{{cwd}}`. The persona section registers only `provider` and
+              # `model`, so a `{{cwd}}` template fails every turn in this preset with `unknown prompt
+              # variable "{{cwd}}" in section "deployment:persona-suffix"`. The host prompt already
+              # carries a `Current working directory:` line, so dropping it loses nothing.
               prefix: >-
                 You are a desktop GUI agent powered by the {{model}} model.
                 You operate the screen and decide each stretch yourself.

@@ -12,6 +12,7 @@ function host(profile: string) {
   const routes: { kind: string; path: string }[] = []
   const provided: string[] = []
   const listeners: { name: string; prepend?: boolean }[] = []
+  const sections: { name: string; order: number }[] = []
   let dispose: (() => void) | undefined
   const logs: string[] = []
   const ctx = {
@@ -36,6 +37,12 @@ function host(profile: string) {
     },
     workspaceController: { create: async () => ({ workspace: { workspaceId: 'ws' } }) },
     sessions: { get: () => undefined },
+    systemPrompt: {
+      section(section: { name: string; order: number }) {
+        sections.push({ name: section.name, order: section.order })
+        return () => {}
+      },
+    },
     effect(run: () => void | (() => void)) { dispose = run() ?? undefined },
     get(service: string) {
       if (service === 'profileContext') return { dir: profile }
@@ -47,7 +54,7 @@ function host(profile: string) {
       return () => {}
     },
   }
-  return { ctx, routes, provided, listeners, logs, stop: () => dispose?.() }
+  return { ctx, routes, provided, listeners, sections, logs, stop: () => dispose?.() }
 }
 
 describe('orb-host plugin', () => {
@@ -64,7 +71,8 @@ describe('orb-host plugin', () => {
       console.error = original
     }
     assert.equal(name, 'orb-host')
-    assert.deepEqual(inject, ['webServer', 'connection', 'sessionController', 'workspaceController', 'sessions', 'agentDefaultModel'])
+    assert.deepEqual(inject, ['webServer', 'connection', 'sessionController', 'workspaceController', 'sessions', 'agentDefaultModel', 'systemPrompt'])
+    assert.deepEqual(started.sections.map((section) => section.name), ['orb:reply-style'])
     assert.deepEqual(started.routes, [{ kind: 'prefix', path: '/.dsh-orb' }])
     assert.deepEqual(started.provided, ['computerUseOverlayGuard', 'orbCodeAgentModel', 'orbCoordinateMode'])
     assert.equal(started.listeners.some((item) => item.name === 'user-questions/request' && item.prepend === true), true)

@@ -8,6 +8,9 @@ import {
 import { upgradeCodeBlocks } from './highlight.js'
 import { WakeEngine, WAVE_BARS, CONSECUTIVE_WINDOWS } from './wake.js'
 import { Speaker } from './speech.js'
+import { ContinuousVoice, VOICE_WAITING } from './voice-turn.js'
+import { isClosingPhrase } from './voice-closing.js'
+import { CHIME_DEFAULTS, chimeWanted, hourlyLine, nextHourAt, normalizeChime } from './chime.js'
 import {
   icon, THINK, CHEVRON_DOWN, CHEVRON_UP, SEARCH, GLOBE, BROWSE, EDIT, CODE, API, SPARKLE, COPY, CHECK, SPEAKER, STOP, stateSpinner,
 } from './icons.js'
@@ -245,6 +248,27 @@ const TURN_END_MIN_HOLD_MS = 2200
 /** Grace after the wake chime before the recorder starts taking frames. */
 const DICTATION_DELAY_MS = 350
 /**
+ * Grace after the acknowledgement clip before the main window's microphone opens.
+ *
+ * Not `DICTATION_DELAY_MS`: that one covers a WebAudio chime played by this page, whose envelope
+ * the recorder here would otherwise score as the user. The clip is a file played through an
+ * `Audio` element, and its silence is already gone at both ends, so `ended` arrives within a few
+ * tens of milliseconds of the last syllable. All this needs to cover is the output buffer and the
+ * tail of "在" — 120 ms — because everything longer is the user waiting for their own microphone.
+ */
+const MAIN_VOICE_GAP_MS = 120
+/** Gap between the end of a spoken reply and the microphone reopening for the next voice turn. */
+const CONTINUOUS_TURN_DELAY_MS = 250
+/**
+ * Grace after the continuous "ding" before the recorder takes frames.
+ *
+ * Shorter than the wake-word grace because the cue is a single 80 ms note: its envelope is over
+ * well inside this, and every millisecond here is a millisecond of the user's first word that
+ * lands before the recorder starts. The wake chime is longer and follows different audio, so it
+ * keeps its own 350 ms.
+ */
+const CONTINUOUS_TONE_GAP_MS = 180
+/**
  * Shortest visible hold for a cue whose clip ends on its own last frame, milliseconds.
  *
  * Such a clip can be parked on that final pose for as long as the ball likes, which is what
@@ -277,6 +301,13 @@ const ONE_SHOT_CUT_MS = 70
 const ASK_HOLD_MS = 6000
 /** How long to wait for the host's transcript before telling the user it went missing. */
 const DICTATION_TIMEOUT_MS = 90000
+/**
+ * How long the "as you wish" line stays up after the user's own words ended the exchange.
+ *
+ * Long enough to be read on a glance, short enough that the resting state comes back — a line that
+ * never cleared would leave the ball looking like it was still saying something.
+ */
+const CLOSING_ACK_MS = 2400
 /**
  * Cadence the live level waveform repaints at, matching the official voice-input row.
  * Only the repaint is throttled: the history behind it advances one entry per audio frame,
@@ -341,17 +372,27 @@ const DOCK_ARRIVE_DWELL_MS = 0
 /**
  * Whether hovering the docked strip pulls the ball out.
  *
- * Off while the pull-out is being retired. A hover on the strip then does nothing: the ball stays in its strip
- * wearing whatever it was wearing, and the click that pulls it out — `beginDockDrag`, a separate gesture with its
- * own listener — is untouched. Both halves of the gesture read this, so nothing is left half-shown: the peek that
- * grows the window, and the arrival clip that greets it.
+ * Back on. It was switched off while the broken-image box on hover was being chased — the gesture had
+ * been retired rather than fixed, so a hover on the strip did nothing at all and the box could not
+ * appear. The box's cause turned out to be one line in `openDockPeek`, which emptied the picture with
+ * `removeAttribute('src')`: Chromium answers that with its broken-image placeholder rather than with
+ * nothing. With that line now using `BLANK_FRAME`, the reason to keep the gesture off is gone, so the
+ * switch returns to `true` and the ball comes back out.
+ *
+ * The retirement notes are kept below, because the argument is still the argument: a hand crossing the
+ * strip on its way somewhere else is not a hover, and if the gesture is ever retired for real this is
+ * the switch that does it.
+ *
+ * Both halves of the gesture read this, so nothing is left half-shown: the peek that grows the window,
+ * and the arrival clip that greets it. The click that pulls it out — `beginDockDrag`, a separate gesture
+ * with its own listener — was never affected by this either way.
  *
  * One switch rather than a deletion on purpose. The gesture has a dozen constants and a round trip through the
  * helper behind it, so "pause it, then decide" is a line here, while "take it out" is a change to the geometry,
  * the hit-testing, the content sizing and the tests — and the reason to retire it is a judgement about whether
  * the frame is wanted, which is exactly the kind of thing that gets re-decided.
  */
-const DOCK_HOVER_ENABLED = false
+const DOCK_HOVER_ENABLED = true
 /**
  * How much wider than the docked strip the arrival counts as hovered, in CSS pixels.
  *
@@ -481,6 +522,9 @@ const zh = {
   wakeDetected: '已听到唤醒词',
   wakeRecording: '正在听你说…',
   wakeTranscribing: '正在识别…',
+  // 唤醒应答只有一段音频 clip（`playWakeFrame`），屏幕上原本什么都不写，气泡看着像“没反应”。
+  // 这一行就是那段 clip 的字幕，也是气泡被唤醒后第一句有内容的话。
+  wakeAck: '我在。',
   wakeLoading: '语音唤醒加载中…',
   wakeFailed: '语音唤醒不可用：{why}',
   wakeOff: '语音唤醒已关闭',
@@ -490,6 +534,10 @@ const zh = {
   dictationLost: '识别超时了，再说一次吧。',
   dictationFailed: '语音输入失败：{why}',
   dictationNeedsWake: '先开启语音唤醒（右键球）再试语音输入。',
+  continuousEmpty: '没听到你说话，已回到语音唤醒。',
+  // Said when the user's own words ended the exchange ("先这样", "没你事了"). Kept as short as the
+  // request it answers: the microphone is already closing, so this is an acknowledgement, not a reply.
+  voiceClosing: '行，先这样。',
   // Read-aloud failures used to be silent, which made a dead service indistinguishable from a
   // button that does nothing. Each of these names one way that can happen.
   // The wording used to promise "the first run loads the model, about half a minute". Nothing loads
@@ -549,6 +597,8 @@ const en = {
   wakeDetected: 'Wake word heard',
   wakeRecording: 'Listening to you…',
   wakeTranscribing: 'Transcribing…',
+  // The caption for the acknowledgement clip — see the note on the Chinese table.
+  wakeAck: 'Here.',
   wakeLoading: 'Starting wake word…',
   wakeFailed: 'Wake word unavailable: {why}',
   wakeOff: 'Wake word off',
@@ -558,6 +608,8 @@ const en = {
   dictationLost: 'Transcription timed out — please say it again.',
   dictationFailed: 'Voice input failed: {why}',
   dictationNeedsWake: 'Turn the wake word on first (right-click the ball).',
+  continuousEmpty: 'Heard nothing — back to the wake word.',
+  voiceClosing: 'Okay, stopping here.',
   speechStarting: 'Starting the read-aloud service…',
   speechOffline: 'The read-aloud service is not running, and starting it did not work.',
   speechTimeout: 'Read-aloud timed out — the service may still be busy with the previous reply.',
@@ -700,6 +752,7 @@ function main() {
   const questionCancel = document.querySelector('#question-cancel')
   const historyList = document.querySelector('#history-list')
   const status = document.querySelector('#status')
+  const bubbleLog = document.querySelector('#bubble-log')
   const voiceWave = document.querySelector('#voice-wave')
   const prompt = document.querySelector('#prompt')
   const composer = document.querySelector('#composer')
@@ -1067,6 +1120,23 @@ function main() {
   // One dictation at a time: the recorder lives on the engine's microphone.
   let dictationBusy = false
   let dictationTimer
+  /**
+   * The continuous conversation, when the profile has it on. One instance for the page: it only
+   * tracks "whose turn is it", while the timers, the recorder and the tones stay here.
+   */
+  const continuousVoice = new ContinuousVoice()
+  /**
+   * The dictation in flight belongs to a continuous exchange — either the wake-word turn that
+   * starts one, or a later turn whose microphone opened by itself. Its transcript is sent even
+   * when `autoSend` is off, because a reply is what the next listening turn follows.
+   */
+  let dictationVoice = false
+  /** The submit in flight was raised by a transcript, not by the user pressing send. */
+  let autoSubmitting = false
+  /** Holds the closing acknowledgement on screen; see `closeVoiceTurn()`. */
+  let closingTimer
+  /** The speaker's completion count as last seen, so the finishing edge runs exactly once. */
+  let speechFinished = 0
   // What the user's sentence is doing right now: `recording` while the engine holds the
   // microphone for one utterance, `transcribing` while the host turns it into text.
   // `undefined` means no dictation is in flight. The engine cannot say this — it stops
@@ -1169,6 +1239,110 @@ function main() {
 
   function pageClosed() {
     return globalThis.document?.body == null
+  }
+
+  // ── the ball speaks first ──────────────────────────────────────────────────
+  //
+  // Everything the ball has said so far was an answer. This is the shape a remark of its own has
+  // to take, and the shape every later one copies: a trigger on the wall clock rather than on a
+  // message, a line written here rather than by a model, and one gate deciding whether speaking
+  // is welcome at this second.
+  //
+  // An hourly chime is the smallest honest version of that. It is checkable — if the ball says
+  // three and the phone says three, it has earned the right to say the next thing too — and when
+  // it is wrong it costs nothing, because a time nobody needed is not information anyone acts on.
+  //
+  // The switch, the quiet window and the wording live in `chime.js`: the host owns the settings
+  // (`orb-chime.json`), the menu flips them, and this page only runs the timer. A hardcoded window
+  // here would be a second source of truth for a number the user can edit.
+  let chime = { ...CHIME_DEFAULTS }
+  /** True while the next chime is armed, so re-arming on every settings change cannot stack timers. */
+  let chimeTimer
+
+  /**
+   * Speak the time for an hour, if the settings and the moment allow it.
+   *
+   * The gate is the page's: a reply being read, a dictation in flight, or a voice turn waiting
+   * would all be talked over, and a chime is never worth interrupting something the user asked
+   * for. That answer, plus the hour and the settings, is the whole of `chimeWanted`.
+   */
+  function chimeNow(hour, at) {
+    const wanted = chimeWanted({
+      hour,
+      settings: chime,
+      now: Date.now(),
+      at,
+      canSpeak: maySpeakUp(),
+    })
+    if (wanted) speaker.speak(hourlyLine(hour), 'hourly')
+  }
+
+  /**
+   * Speak one line now, as the confirmation that the switch just went on.
+   *
+   * Turning the feature on has to be audible — a checkbox whose only other evidence is the next
+   * hour's chime is a switch the user cannot check. This is deliberately not gated on the quiet
+   * window: the user asked for it at this second.
+   */
+  function previewChime() {
+    if (!speaker.enabled) return
+    speaker.speak(hourlyLine(new Date().getHours()), 'hourly')
+  }
+
+  /**
+   * Whether the ball may start talking on its own right now.
+   *
+   * Three things make it a no. The service is off. Something is already being read — a new
+   * `speak` cancels the old one, so a chime here would cut a reply in half. And a microphone is
+   * busy: `active` covers every state of a voice exchange — armed after a dictated message,
+   * waiting on the next turn, or with the recorder due to open — and in all three the chime would
+   * either be recorded by the microphone or hand the exchange a turn it never asked for. That is
+   * one hour skipped, which is the whole cost of losing this chime.
+   */
+  function maySpeakUp() {
+    if (!speaker.enabled) return false
+    if (speaker.state().speaking) return false
+    if (dictationPhase !== undefined) return false
+    if (continuousVoice.active) return false
+    return true
+  }
+
+  /**
+   * Arm the chime for the next whole hour, and for every one after it.
+   *
+   * The next fire time is recomputed from the wall clock each round instead of adding an hour, so
+   * a late timer, a machine that slept through midnight, or a clock that was changed cannot leave
+   * the chime drifting away from the hours it is supposed to mark. Re-arming clears the previous
+   * timer, so a settings change mid-hour cannot end up with two of them.
+   */
+  function scheduleHourly() {
+    if (chimeTimer !== undefined) clearTimeout(chimeTimer)
+    const now = Date.now()
+    const at = nextHourAt(now)
+    const next = new Date(at)
+    chimeTimer = setTimeout(() => {
+      chimeTimer = undefined
+      // Re-armed before anything can throw: a line that fails to speak must not cost the next
+      // hour its chime.
+      scheduleHourly()
+      chimeNow(next.getHours(), at)
+    }, Math.max(250, at - now))
+  }
+
+  /**
+   * Apply the host's chime settings, and let the switch be heard the moment it goes on.
+   *
+   * The preview is the only confirmation the user gets without waiting for an hour, so it hangs
+   * off the off→on edge here rather than off the menu row: the page is the side that owns the
+   * speaker, and the settings arrive from the host whichever way the switch was flipped.
+   * @param {unknown} settings `{ enabled, quietFrom, quietTo }` from the profile
+   */
+  function applyChime(settings) {
+    const wasEnabled = chime.enabled
+    chime = normalizeChime(settings)
+    // The timer itself never changes just because the window did — it re-reads `chime` when it
+    // fires — so nothing is rescheduled here. Only the first `true` has to be announced.
+    if (chime.enabled && !wasEnabled) previewChime()
   }
 
   /**
@@ -1324,11 +1498,217 @@ function main() {
   }
 
   /** Apply one engine report: state, wording, and the one cosmetic that follows a wake. */
+  /**
+   * How many messages the bubble keeps.
+   *
+   * The log is a window on the last few exchanges, not an archive: the ball's card is the size of
+   * a phone notification, and the point of scrolling back is to re-read what was just said.
+   */
+  const BUBBLE_LOG_ROWS = 12
+
+  /** How much of one message the bubble keeps: the newest end, once it stops being readable. */
+  const BUBBLE_LOG_CHARS = 1200
+
+  /**
+   * How long a momentary state ("正在听你说…") stays when nothing replaces it.
+   *
+   * Long enough to read a sentence the ball said while the pointer was elsewhere, short enough that
+   * the row goes away by itself — a status that never clears is a card that always looks mid-sentence.
+   */
+  const BUBBLE_STATUS_MS = 6000
+
+  /**
+   * How long a settled answer keeps its `speakReply` twin from being drawn.
+   *
+   * The sentence can reach the bubble twice — once as the cross-session stream this page followed
+   * word by word, once as the finished reply — and the second copy would sit under the first saying
+   * the same thing. Five seconds is longer than the gap between those two events and far shorter
+   * than the time it takes to say the same sentence again on purpose.
+   */
+  const BUBBLE_TWIN_MS = 5000
+
+  /**
+   * The conversation, as two columns of bubbles.
+   *
+   * The conversation itself happens in the main window, so the ball's own transcript is usually
+   * empty — which is exactly what made the bubble look like it did nothing. What makes it worth
+   * opening is seeing both sides: the greeting the clip says before the microphone opens ("我在"),
+   * the sentence the user just dictated, the answer being written over there or read aloud here.
+   *
+   * `bubbleStream` is the answer being written, `bubbleStreamRow` the bubble it is growing in; the
+   * two `bubbleStreamText`/`bubbleStreamAt` fields remember the last settled answer so a finished
+   * reply that arrives through a second channel is not drawn twice.
+   */
+  let bubbleLogTimer
+  let bubbleStatusRow
+  let bubbleStreamRow
+  let bubbleStream = ''
+  let bubbleStreamText = ''
+  let bubbleStreamAt = 0
+
+  /** One line of text: rendered replies carry newlines, indentation and runs of spaces. */
+  function oneLine(text) {
+    return String(text ?? '').replace(/\s+/g, ' ').trim()
+  }
+
+  /** The newest end of a message too long for one bubble, marked as cut. */
+  function clipBubble(text) {
+    return text.length > BUBBLE_LOG_CHARS ? `…${text.slice(-BUBBLE_LOG_CHARS)}` : text
+  }
+
+  /** Scroll the log to its own end, so the newest message is the one in reach. */
+  function followBubbleLog() {
+    bubbleLog.scrollTop = bubbleLog.scrollHeight
+  }
+
+  /** Drop the oldest messages; the log is a window, not an archive. */
+  function trimBubbleLog() {
+    while (bubbleLog.childElementCount > BUBBLE_LOG_ROWS) bubbleLog.firstElementChild.remove()
+  }
+
+  /** Append an empty bubble of one role and return the node its text goes into. */
+  function createBubble(role) {
+    const row = document.createElement('div')
+    row.className = 'bubble-msg'
+    row.dataset.role = role
+    const text = document.createElement('div')
+    text.className = 'bubble-text'
+    row.append(text)
+    bubbleLog.append(row)
+    trimBubbleLog()
+    bubbleLog.hidden = false
+    return { row, text }
+  }
+
+  /** Take the momentary state row down, with the timer that would have taken it down anyway. */
+  function dropBubbleStatus() {
+    clearTimeout(bubbleLogTimer)
+    bubbleLogTimer = undefined
+    if (bubbleStatusRow === undefined) return
+    bubbleStatusRow.row.remove()
+    bubbleStatusRow = undefined
+    // An empty log is not a log: `hidden` is what keeps the card from showing a blank strip that
+    // looks like it failed to say something.
+    bubbleLog.hidden = bubbleLog.childElementCount === 0
+  }
+
+  /**
+   * One momentary state, kept as the last row of the log and replaced by the next one.
+   *
+   * `hold` 0 means "until something replaces it": a recording and a recognition both have no end
+   * this page can time, so a timer would blank them mid-sentence.
+   */
+  function showBubbleStatus(text, hold = BUBBLE_STATUS_MS) {
+    const body = oneLine(text)
+    if (body === '') return
+    clearTimeout(bubbleLogTimer)
+    bubbleLogTimer = undefined
+    if (bubbleStatusRow === undefined) bubbleStatusRow = createBubble('system')
+    bubbleStatusRow.text.textContent = body
+    // Last: a state that arrived before a message would otherwise read as history.
+    bubbleLog.append(bubbleStatusRow.row)
+    if (hold > 0) bubbleLogTimer = setTimeout(() => { dropBubbleStatus() }, hold)
+    followBubbleLog()
+    openBubbleForLine()
+  }
+
+  /**
+   * One message in the bubble: `me` on the right, `ball` on the left.
+   *
+   * Every message does two things beyond drawing itself — it takes the momentary state row down,
+   * because a state that outlives the words it was about is a lie, and it opens the card (see
+   * `openBubbleForLine`), because a message nobody can see is not a feature.
+   */
+  function pushBubble(role, text) {
+    // A message is a new bubble, so whatever answer was still growing stops growing here. This is
+    // also what lets the twin check below see the sentence the stream just finished with.
+    settleBubbleStream()
+    const body = clipBubble(oneLine(text))
+    if (body === '') return
+    // The same finished answer can arrive twice: see `BUBBLE_TWIN_MS`.
+    if (role === 'ball' && body === bubbleStreamText && Date.now() - bubbleStreamAt < BUBBLE_TWIN_MS) {
+      bubbleStreamText = ''
+      bubbleStreamAt = 0
+      return
+    }
+    dropBubbleStatus()
+    createBubble(role).text.textContent = body
+    followBubbleLog()
+    openBubbleForLine()
+  }
+
+  /** Empty the log — a new conversation is not the old one with more lines under it. */
+  function clearBubbleLog() {
+    dropBubbleStatus()
+    bubbleStreamRow = undefined
+    bubbleStream = ''
+    bubbleStreamText = ''
+    bubbleStreamAt = 0
+    bubbleLog.replaceChildren()
+    bubbleLog.hidden = true
+  }
+
+  /**
+   * Open the bubble for a message that just arrived, when opening is the user's business at all.
+   *
+   * A pinned page, an open question and a docked ball all keep their own state: the card answered
+   * the question, and a docked ball is deliberately behind its strip — pulling it out for a
+   * message would be the ball interrupting rather than answering. `setExpanded` un-docks the page
+   * itself, so that check has to come first.
+   *
+   * `wake.autoExpand()` is the profile's own answer to "may the card open by itself" and is obeyed
+   * here too: a profile that turned it off gets the message on the card it opens by hand, not a
+   * card that pops up every time the ball speaks.
+   */
+  function openBubbleForLine() {
+    if (expanded || asking() || docked !== undefined) return
+    if (!wake.autoExpand()) return
+    void setExpanded(true)
+  }
+
+  /**
+   * One chunk of an answer being written elsewhere — the main window is where the user talks now.
+   *
+   * The host coalesces those deltas before sending them (see `announceOtherText` in `host/src/orb.ts`),
+   * so this is a handful of updates per second rather than one per token. The bubble grows in place:
+   * one message, replaced with its own tail as the words arrive — a stream that pushed a bubble per
+   * chunk would be a wall of half sentences.
+   */
+  function appendBubbleStream(text) {
+    if (typeof text !== 'string' || text === '') return
+    dropBubbleStatus()
+    bubbleStream = `${bubbleStream}${text}`
+    if (bubbleStreamRow === undefined) bubbleStreamRow = createBubble('ball')
+    bubbleStreamRow.text.textContent = clipBubble(oneLine(bubbleStream))
+    followBubbleLog()
+    bubbleLog.hidden = false
+    if (!expanded) openBubbleForLine()
+  }
+
+  /** The answer being written elsewhere has stopped: the bubble it grew in stays, as a message. */
+  function settleBubbleStream() {
+    if (bubbleStream === '') {
+      bubbleStreamRow = undefined
+      return
+    }
+    bubbleStreamText = clipBubble(oneLine(bubbleStream))
+    bubbleStreamAt = Date.now()
+    bubbleStream = ''
+    bubbleStreamRow = undefined
+  }
+
+
   function applyWakeStatus(status) {
     if (status === null || typeof status !== 'object') return
     wakeState = typeof status.state === 'string' ? status.state : wakeState
     wakeDetail = typeof status.detail === 'string' ? status.detail : ''
     if (typeof status.keyword === 'string' && status.keyword !== '') wakeKeyword = status.keyword
+    // The engine may have been started by `syncFromHelper()` rather than by `startWake()`, so the
+    // profile switch is applied on every report instead of only on the menu path.
+    continuousVoice.configure({ enabled: continuousEnabled() })
+    // An engine that is gone or broken cannot hand a microphone back. Ending the exchange here
+    // is what keeps a reply that finishes later from trying to open one.
+    if (wakeState === 'error' || wakeState === 'disabled') continuousVoice.cancel()
     syncWake()
     if (wakeState !== 'detected') return
     // Before anything else, so the reading that fired is on the meter in the same frame as the
@@ -1339,11 +1719,83 @@ function main() {
     // The acknowledgement comes first: it has to be on screen before the panel opens and
     // before the recorder takes over, because it is the only sign that the ball heard its
     // name rather than merely the sound of someone talking to it.
+    //
+    // Out of the strip before it, and that ordering is the whole of the wake reaching a docked ball.
+    // `wakeShowBall` frees the page's docked state synchronously — see its own note — so the call on
+    // this line is all that stands between a ball behind the strip and `playWakeFrame` below painting
+    // the greeting onto an element that is not on screen. Nothing is awaited here for that reason: the
+    // face has to land on this frame, not on the far side of the helper's slide.
+    void wakeShowBall()
     playWakeFrame()
+    // The clip says "我在" out loud and the panel said nothing at all, so a woken ball looked mute
+    // on screen. The bubble gets the same sentence the clip is saying, as the ball's own message:
+    // the point of the card is that the user can see what the ball just said.
+    pushBubble('ball', messages.wakeAck)
+    // Where the turn goes next. `main` is the default and the one the composer's own switch is
+    // for: the host is handed the wake, it raises the main window, and that window's page presses
+    // the microphone it already has — its recorder, its transcription, its own waveform. The ball
+    // stays out of the way: no panel, no second recorder on the same microphone.
+    //
+    // `panel` is the older path, kept for a profile that chose it in `orb-wake.json`; it opens the
+    // black panel and records here, which is what the panel has always done. A helper without the
+    // hand-off channel cannot do `main` at all, so it falls back to the panel rather than to
+    // silence.
+    if (wake.dictationTarget() !== 'panel' && typeof api.mainVoiceStart === 'function') {
+      // A wake turn begins a voice exchange: the reply it produces is read out here, and the end
+      // of that reading is what hands the microphone back. Armed only when a reply will actually
+      // be read — with read-aloud off there is no completion edge for the exchange to follow.
+      if (continuousEnabled() && speaker.enabled && speaker.autoPlay) continuousVoice.dictated()
+      // After the acknowledgement, not before it. The main window records in its own process, so
+      // its microphone would hear "我在" through the speakers and put it in the transcript; waiting
+      // for the clip to end is what keeps the greeting out of the user's own sentence. With no clip
+      // to play, whenVoiceDone settles at once and the microphone opens on the same breath — except
+      // for the small gap below, because the clip's last sample and the microphone's first frame
+      // are not the same instant either.
+      void wake.whenVoiceDone(2_000).then(() => {
+        setTimeout(() => { api.mainVoiceStart() }, MAIN_VOICE_GAP_MS)
+      })
+      return
+    }
     // A detection that the user cannot see is not a feature. Opening the panel shows
     // the badge and puts the composer in reach, which is where the next step starts.
     if (wake.autoExpand() && !expanded && !pinned && !running && !asking()) void setExpanded(true)
-    void startDictation()
+    // OFF BY REQUEST: the ball no longer records the turn it just heard. The main window's
+    // composer records it instead, with the microphone it already has and the switch beside it, so
+    // a second recorder here would only fight for the same device. Restore this line to bring the
+    // panel's own dictation back.
+    // void startDictation({ wake: true })
+  }
+
+  /**
+   * Bring the ball back out of its strip, because it has just been woken.
+   *
+   * A docked ball is not on screen: it is behind the strip, and `syncGif` leaves it alone while it is
+   * there — the early return above the idle branch is the whole of the docked contract, so the
+   * acknowledgement clip `playWakeFrame` asks for would be played on an element nobody can see, and the
+   * panel would open around a ball that is not there. "It heard you" that the user cannot see is not an
+   * acknowledgement, so the ball comes out of the strip first and the rest of the wake follows it.
+   *
+   * This is {@link unsnapDocked}, which is the same call a programmatic release uses, and it is the right
+   * one here: the helper slides the ball in from the edge at the row it was hidden on, which is the
+   * position the strip took it from. Nothing about the wake is a gesture, so there is no hand to follow
+   * and no reason to use the smoother pull-out booking.
+   *
+   * It is deliberately not awaited by the caller. The first thing `unsnapDocked` does is `applyDocked(undefined)`,
+   * synchronously and before its own first `await`, so calling this and then asking for the wake face in
+   * the same breath paints that face on a ball the page already believes is free — while the helper is
+   * still sliding the window. Waiting for the slide instead would hold the acknowledgement back by the
+   * length of the animation, which is the one moment it is supposed to be immediate.
+   *
+   * `suppressExpand` is cleared on the way out, and that is not tidiness. `unsnapDocked` sets it to stop a
+   * hand that is *already on the ball* from opening the panel as the ball arrives under it, and nothing
+   * clears it except a pointer leaving the UI — so a flag set by a wake, which has no pointer anywhere
+   * near it, would still be set the next time the user really did hover the ball, and that hover would do
+   * nothing at all.
+   */
+  async function wakeShowBall() {
+    if (docked === undefined) return
+    await unsnapDocked()
+    suppressExpand = false
   }
 
   /**
@@ -1525,22 +1977,87 @@ function main() {
     syncGif()
   }
 
+  /** Whether the profile wants the microphone handed back after a reply is read. */
+  function continuousEnabled() {
+    return wake.config?.continuous?.enabled !== false
+  }
+
   /**
-   * After a wake: record one utterance on the microphone the engine already holds and ask
-   * the host to transcribe it. The transcript fills the composer (and is sent only when the
-   * profile asks for that), so the wake word plus one sentence is a complete hands-free turn.
+   * Hand the microphone back for the next turn, once the turn and its reading are both over.
+   *
+   * The delay is the gap between the last sample the speaker played and the recorder's first
+   * frame, and it is a timer rather than a direct call because the speaker's state arrives
+   * synchronously from `settle()` — the audio element may still be draining the tail of the last
+   * sentence, and a microphone opened into that tail would record the agent's own voice.
+   *
+   * If the turn is still writing when this fires, the exchange waits instead of opening: the
+   * reply read so far may be a mid-turn narration block, and the next block would be recorded as
+   * the user's answer. {@link setRunning} and the speaker's own finished edge are what wake it.
    */
-  async function startDictation() {
+  function scheduleVoiceTurn() {
+    setTimeout(() => {
+      if (!continuousVoice.wantsOpen) return
+      if (running || asking() || speaker.state().speaking) {
+        continuousVoice.wait()
+        return
+      }
+      // No microphone to hand back — either another dictation is already using it, or the wake
+      // engine is not running. Neither is a state to wait in: the exchange is over.
+      if (dictationBusy || wake.running !== true) {
+        continuousVoice.cancel()
+        return
+      }
+      // The microphone belongs to the main window now, so handing it back is a hand-off rather
+      // than a recorder opened here: the same call the wake word makes, on the same limits, with
+      // nobody having to say the word again. Re-armed as a dictated turn first, so the reply this
+      // turn produces comes back through this same scheduler — the exchange does not end just
+      // because one of its turns did.
+      if (wake.dictationTarget() !== 'panel' && typeof api.mainVoiceStart === 'function') {
+        continuousVoice.dictated()
+        setTimeout(() => { api.mainVoiceStart() }, MAIN_VOICE_GAP_MS)
+        return
+      }
+      // A page that cannot hand off (a helper older than the channel, or the panel target) has no
+      // microphone to give back, so the exchange ends here instead of waiting on nothing.
+      continuousVoice.cancel()
+    }, CONTINUOUS_TURN_DELAY_MS)
+  }
+
+  /**
+   * After a wake — or after a reply was read, for a continuous turn — record one utterance on
+   * the microphone the engine already holds and ask the host to transcribe it.
+   *
+   * The transcript fills the composer, and is sent when the profile asks for that or when this
+   * dictation belongs to a continuous exchange: a voice turn whose transcript only sat in the
+   * draft would produce no reply to read, and the loop would stop at its first turn.
+   * @param {{ continuous?: boolean, wake?: boolean }} [options] — `continuous` opens the
+   *   microphone on the reply's own account; `wake` is the detection turn, which starts a
+   *   continuous exchange when the profile has one on.
+   */
+  async function startDictation(options) {
+    const continuous = options?.continuous === true
+    const wakeTurn = options?.wake === true
     const settings = wake.config?.dictation
-    if (settings === undefined || settings.enabled !== true) return
-    if (dictationBusy || typeof api.dictate !== 'function') return
+    const voiceTurn = continuousEnabled() && (continuous || wakeTurn)
+    if (settings === undefined || settings.enabled !== true) {
+      if (continuous) continuousVoice.cancel()
+      return
+    }
+    if (dictationBusy || typeof api.dictate !== 'function') {
+      if (continuous) continuousVoice.cancel()
+      return
+    }
     // The recorder lives on the wake engine's microphone: without a live engine there is
-    // nothing to record, so say that instead of opening a microphone that never starts.
+    // nothing to record, so say that instead of opening a microphone that never starts. A
+    // continuous turn says nothing instead: the user did not ask for a recording, it is only
+    // the microphone coming back, and a warning line about a feature already turned off is noise.
     if (wake.running !== true) {
-      status.textContent = messages.dictationNeedsWake
+      if (!continuous) status.textContent = messages.dictationNeedsWake
+      if (continuous || voiceTurn) continuousVoice.cancel()
       return
     }
     dictationBusy = true
+    dictationVoice = voiceTurn
     clearTimeout(dictationTimer)
     // Handing the recording to the host is the only outcome that keeps the ball busy, because
     // it is the only one the host answers (`applyTranscript` releases the recorder then).
@@ -1549,34 +2066,68 @@ function main() {
     // recording, no error, not even the closing tone — until the page is reloaded.
     let handedOff = false
     try {
-      // The detection chime is a WebAudio tone on the same output; let it die out first.
-      await wait(DICTATION_DELAY_MS)
-      if (wake.running !== true) return
+      // The detection chime is a WebAudio tone on the same output; let it die out first. A
+      // continuous turn has its own opening note, played here so that it, too, is over before the
+      // recorder starts — a cue piling into the first frame could be scored as the user speaking.
+      if (continuous) wake.playOpenTone()
+      await wait(continuous ? CONTINUOUS_TONE_GAP_MS : DICTATION_DELAY_MS)
+      if (wake.running !== true) {
+        dictationVoice = false
+        if (continuous) continuousVoice.cancel()
+        return
+      }
+      // A reply can start playing inside the delay, when the queue had another block ready. The
+      // scheduler's own check is older than this gap by now, and recording over the ball's voice
+      // would send its next sentence back as the user's turn. That reading's end is the next cue.
+      if (speaker.state().speaking || running || asking()) {
+        if (continuous) continuousVoice.wait()
+        return
+      }
       status.textContent = messages.dictating
+      // The recorder is open but the words are not here yet: the bubble says so, and keeps saying it
+      // until the host answers (`hold` 0 — a recording has no end this page can time).
+      showBubbleStatus(messages.dictating, 0)
       setDictationPhase('recording')
-      const wav = await wake.dictate({ silenceMs: settings.silenceMs, maxSeconds: settings.maxSeconds })
+      const wav = await wake.dictate({
+        silenceMs: settings.silenceMs,
+        maxSeconds: settings.maxSeconds,
+        ...(continuous
+          ? { noSpeechMs: continuousNoSpeechMs(), cue: 'continuous' }
+          : {}),
+      })
       if (wav === undefined) {
-        // The engine gave up without hearing anything and has already sounded that cue, so
-        // the line says the same thing instead of going blank and looking like a dead ball.
-        status.textContent = messages.dictationEmpty
+        // The engine gave up without hearing anything and has already sounded its cue, so the
+        // line says the same thing instead of going blank and looking like a dead ball. For a
+        // continuous turn that cue is the single "shut" note, and the wake word waits again.
+        status.textContent = continuous ? messages.continuousEmpty : messages.dictationEmpty
+        dictationVoice = false
+        if (continuous || voiceTurn) continuousVoice.cancel()
         return
       }
       // Turning the switch off mid-utterance also ends the recording: do not transcribe it.
       if (wake.running !== true) {
         status.textContent = ''
+        dictationVoice = false
+        if (continuous) continuousVoice.cancel()
         return
       }
       // The microphone is released by now; only the host's answer is still outstanding.
+      showBubbleStatus(messages.wakeTranscribing, 0)
       setDictationPhase('transcribing')
       await api.dictate({ audioBase64: base64Of(wav) })
       handedOff = true
       // A host that never answers must not leave the ball stuck on "recognizing".
       dictationTimer = setTimeout(() => {
+        dictationVoice = false
+        if (voiceTurn) continuousVoice.cancel()
         endDictation()
         status.textContent = messages.dictationLost
       }, DICTATION_TIMEOUT_MS)
     } catch (error) {
       status.textContent = messages.dictationFailed.replace('{why}', error instanceof Error ? error.message : String(error))
+      dictationVoice = false
+      // A recorder that failed is not a conversation that can continue.
+      if (continuous || voiceTurn) continuousVoice.cancel()
     } finally {
       if (!handedOff) endDictation()
     }
@@ -1585,31 +2136,95 @@ function main() {
   /** Put one finished transcript into the composer, or send it when the profile asks. */
   function applyTranscript(payload) {
     if (payload === null || typeof payload !== 'object') return
+    const voiceTurn = dictationVoice
+    dictationVoice = false
     if (dictationBusy) clearTimeout(dictationTimer)
     // The host has answered, so the ball is back to waiting for the wake word — whether the
     // answer was a sentence, an empty one, or a reason it could not be recognized.
     endDictation()
     if (typeof payload.error === 'string' && payload.error !== '') {
       status.textContent = messages.dictationFailed.replace('{why}', payload.error)
+      showBubbleStatus(status.textContent)
+      if (voiceTurn) continuousVoice.cancel()
       return
     }
     const text = typeof payload.text === 'string' ? payload.text.trim() : ''
     if (text === '') {
       status.textContent = messages.dictationEmpty
+      showBubbleStatus(messages.dictationEmpty)
+      if (voiceTurn) continuousVoice.cancel()
+      return
+    }
+    // The user ended the exchange in words. The transcript is never sent, so no reply is generated
+    // and nothing is read aloud that would hand the microphone straight back; the ball says one
+    // short line and the wake word is the only thing left that can arm it again. Checked before the
+    // composer so the phrase does not appear as a draft the user has to clear.
+    if (isClosingPhrase(text)) {
+      closeVoiceTurn()
       return
     }
     status.textContent = ''
+    // The recognized sentence is the one thing the user just said, and the composer it used to land
+    // in is hidden with the chat chrome — so the bubble is the only place it can be read. It goes on
+    // the right, as the user's own message, because that is what it is: the other half of the chat.
+    pushBubble('me', text)
     // The transcript lands in the composer, so the panel has to be open to see it.
     if (!expanded) void setExpanded(true)
     insertPlainText(prompt, text)
     syncComposerHeight()
-    const send = wake.config?.dictation?.autoSend === true
+    // A voice turn is always sent: its reply is the cue for the next listening turn, and a
+    // transcript left in the draft would be a conversation that never starts.
+    const send = wake.config?.dictation?.autoSend === true || voiceTurn
     if (!send) {
       prompt.focus()
+      if (voiceTurn) continuousVoice.cancel()
       return
     }
-    if (typeof composer.requestSubmit === 'function') composer.requestSubmit()
-    else composer.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    autoSubmitting = true
+    try {
+      if (typeof composer.requestSubmit === 'function') composer.requestSubmit()
+      else composer.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    } finally {
+      // `submitComposer` reads this synchronously before its first await, so clearing it here
+      // cannot turn a voice send into a typed one.
+      autoSubmitting = false
+    }
+  }
+
+  /**
+   * The user's own words ended the exchange ("先这样", "没你事了"): say one short line and put the
+   * microphone back on the wake word.
+   *
+   * `continuousVoice.cancel()` is what actually ends the loop — every path that would reopen the
+   * recorder reads `wantsOpen` from it, so the reply that is never read cannot hand the microphone
+   * back. The click of the mic closing is the engine's own shut cue, the same note a continuous turn
+   * that heard nothing gets, so "back to the wake word" sounds the same however it happens.
+   *
+   * The acknowledgement is a line and a tone, not speech. Two reasons, both from this file's own
+   * rules: read-aloud may be off entirely, and a spoken syllable is played out of the speakers the
+   * open microphone sits beside — the engine deliberately says every cue with WebAudio for exactly
+   * that reason (`playNotes` in `wake.js`), and a sentence here would be the ball scoring its own
+   * voice right after the user asked it to stop listening. The line clears itself, so the resting
+   * state comes back instead of a status that stays.
+   */
+  function closeVoiceTurn() {
+    continuousVoice.cancel()
+    wake.playShutTone()
+    status.textContent = messages.voiceClosing
+    clearTimeout(closingTimer)
+    closingTimer = setTimeout(() => {
+      closingTimer = undefined
+      if (status.textContent === messages.voiceClosing) status.textContent = ''
+    }, CLOSING_ACK_MS)
+  }
+
+  /** The quiet window a continuous turn waits for speech before it gives up, milliseconds. */
+  function continuousNoSpeechMs() {
+    const seconds = wake.config?.continuous?.noSpeechSeconds
+    const value = typeof seconds === 'number' && Number.isFinite(seconds)
+      ? Math.min(30, Math.max(2, seconds))
+      : 6
+    return Math.round(value * 1000)
   }
 
   async function startWake() {
@@ -1622,6 +2237,7 @@ function main() {
       return
     }
     wake.configure(config)
+    continuousVoice.configure({ enabled: continuousEnabled() })
     void wake.enable()
   }
 
@@ -2822,90 +3438,36 @@ function main() {
   }
 
   /**
-   * Hide the ball's picture while it has no picture, and show it the moment it has one.
+   * The picture that means "no picture".
    *
-   * An `<img>` waiting on a source paints a box of its own: a small broken-image glyph in the top-left
-   * corner, inside a white-edged rectangle. Docked, the clip's square corners let that box read for
-   * exactly what it is — the user saw a flash of an empty frame, with an icon in it, on every hover.
+   * A 1x1 fully transparent GIF, and it exists for one reason: an `<img>` with *no* source at all is
+   * not the same thing to Chromium as an `<img>` whose source is invisible. Removing the source makes
+   * the engine paint its broken-image placeholder — a white-edged rectangle with a small picture glyph
+   * in its top-left corner — and that box is what the user saw flash on every hover of the docked strip.
    *
-   * Decoding ahead of time does not prevent it, and it is worth being clear about why, because it was
-   * tried first and did not work: a swap starts a fresh decode every time, and the box is what an
-   * `<img>` paints *during* one. A warmed cache shortens that window; it cannot close it.
+   * That is measured rather than argued. Rendering the real `floating.css`, the real ball and the real
+   * docked-peek state in Chromium, then capturing the one element both ways, gives two clean answers:
    *
-   * So the element is hidden for exactly the interval in which it has a source it cannot yet draw, and
-   * the only way to know that interval is to watch the assignment that starts it. `src` is therefore
-   * shadowed on this one element: the setter marks the picture as not drawn *before* handing the value
-   * on, and the element's own `load` — the only party that knows a decode has finished — marks it drawn
-   * again. The getter is untouched, so every reader in the page (`syncGif`'s comparisons, the tests'
-   * `shown()`) sees the same string it always did.
+   *   `removeAttribute('src')`  →  the white box with the glyph in it
+   *   `src = BLANK_FRAME`       →  nothing at all, which is what the peek is asking for
    *
-   * Nothing here waits on anything and nothing here is awaited: a caller of `syncGif` gets its `src`
-   * assignment done synchronously as before, which is what keeps the swap free of races. Only the
-   * drawing of the element is gated, and an element that is merely invisible still has its box, so
-   * `pointerOnUi`'s `getBoundingClientRect()` — and the strip's hover with it — is unaffected.
+   * Both states report `complete: true` and the same box, so nothing about the element's geometry is a
+   * clue here; only the painted result differs. The transparent pixel is also a picture that is already
+   * decoded — it is one byte of colour — so using it cannot introduce a decode wait of its own.
    *
-   * Two ways to change the picture, and both have to go through the gate. Assigning `src` is the one
-   * every face in `syncGif` uses; *removing* the attribute is the one the docked peek uses to strip the
-   * idle loop off a ball coming out of the dock, and it is not a `src` assignment at all — so shadowing
-   * the property alone left it ungated. Measured in Chromium, that is the flash: `removeAttribute('src')`
-   * leaves `complete` true and `naturalWidth` 0, and it fires **no** event. Nothing puts `ball-drawn` back
-   * to false, the rule below never hides the element, and the engine paints the broken-image box — the
-   * white rectangle with the little picture glyph in its top-left corner — for the whole 120 ms
-   * `DOCK_ARRIVE_DWELL_MS` between the peek appearing and the entrance landing. `src` is therefore only
-   * one of the two attributes watched, and the pair is the whole of "this element has no picture".
-   *
-   * A source that fails takes the `error` path and leaves the ball undrawn, which is the honest answer:
-   * there is nothing to show, and a box saying so is worse than an absence.
+   * The peek's intent is unchanged by this. It still means "the ball is out here with nothing on it
+   * until the arrival lands", and that is what it now gets, instead of an error box saying the same
+   * thing in the engine's own vocabulary.
    */
-  function armBallPicture() {
-    const ball = document.querySelector('#ball-gif')
-    if (ball === null || typeof ball.addEventListener !== 'function') return
-    const setDrawn = (drawn) => {
-      if (drawn) document.body.classList.add('ball-drawn')
-      else document.body.classList.remove('ball-drawn')
-    }
-    setDrawn(ball.complete === true && ball.naturalWidth > 0)
-    ball.addEventListener('load', () => setDrawn(true))
-    ball.addEventListener('error', () => setDrawn(false))
-    // `HTMLImageElement.prototype.src` is where the real accessor lives, so the shadow delegates to it
-    // rather than reimplementing the URL resolution — a relative path has to keep resolving against the
-    // document, which is not this function's business to know.
-    const proto = Object.getPrototypeOf(ball)
-    const real = Object.getOwnPropertyDescriptor(proto, 'src')
-    if (real === undefined || real.set === undefined) return
-    // The other half of the same gate, for the other way the picture is taken away. `removeAttribute`
-    // is shadowed on this one element only, and it marks the picture undrawn *before* the attribute
-    // goes: the box exists from the moment the source does, and a hide queued behind the removal would
-    // be a hide one frame too late. Nothing else about the call changes — it delegates to the real
-    // method, so `hasAttribute('src')` still answers false afterwards and every reader sees the
-    // element it always did.
-    const realRemove = ball.removeAttribute
-    ball.removeAttribute = function removeAttribute(name) {
-      if (name === 'src') setDrawn(false)
-      return realRemove.call(this, name)
-    }
-    Object.defineProperty(ball, 'src', {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return real.get.call(ball)
-      },
-      set(value) {
-        // Before the assignment, not after: the placeholder exists from the moment the source changes,
-        // and a hide queued behind it would be a hide one frame too late.
-        setDrawn(false)
-        real.set.call(ball, value)
-      },
-    })
-  }
+  const BLANK_FRAME = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
 
   /**
    * Hand a source to a decoder now, so whatever puts it on screen later has nothing to wait for.
    *
-   * This does not stop the flash on its own and is not the fix for it — see {@link armBallPicture} for
-   * what is. It is kept because it is what makes the hidden window *short*: a frame already decoded
-   * answers from cache instead of decoding again, so the ball is undrawn for a repaint rather than for
-   * a whole clip.
+   * This is not the fix for the docked flash — {@link BLANK_FRAME} is — and it is worth being precise
+   * about what it does buy, because it was reached for first and did not do the job on its own. A frame
+   * already decoded answers from cache instead of decoding again, so a swap is a repaint rather than a
+   * whole clip's decode.
    *
    * The ball is one `<img>` that changes its whole picture constantly, and a `data:` clip is already
    * downloaded by the time anything asks for it, so what is left is Chromium's decode. Warming decodes
@@ -3087,13 +3649,22 @@ function main() {
     // Claimed before the await, so a second hover during the round trip joins this one instead of
     // starting a second peek on the same strip.
     dockPeeked = true
-    // Stripped, not repainted, and *before* the round trip rather than after it.
+    // Emptied, not repainted, and *before* the round trip rather than after it.
     //
     // The ball is on screen now carrying whatever it wore before the dock — the idle loop — and
-    // `#ball-gif` has no background of its own, so taking the source off leaves the half ball blank
-    // until the dwell puts the arrival on it. That is the whole of the docked contract between the
-    // peek appearing and the entrance starting: nothing to look at, and nothing from the state the
-    // ball was in before the strip took it.
+    // `#ball-gif` has no background of its own, so emptying it leaves the half ball blank until the
+    // dwell puts the arrival on it. That is the whole of the docked contract between the peek appearing
+    // and the entrance starting: nothing to look at, and nothing from the state the ball was in before
+    // the strip took it.
+    //
+    // Emptied with `BLANK_FRAME` rather than by removing the source, and that distinction is the whole
+    // of the flash the user reported. This line used to take the source attribute off entirely, on the
+    // reading that an `<img>` with no source draws nothing. It does not: Chromium draws its broken-image
+    // placeholder — a white-edged box with a small picture glyph in the top-left corner — which is
+    // precisely the box that appeared for the length of the dwell on every hover. Captured both ways in
+    // the real docked-peek state, an absent source gives that box and a transparent pixel gives nothing.
+    // See {@link BLANK_FRAME} for the measurement. The intent is unchanged: the ball is out here with
+    // nothing on it until the arrival lands.
     //
     // A repaint here would be worse than useless. Docked, `syncGif` leaves the element alone (see the
     // note above the idle branch), and the only thing below it would do is `freezeGif` — which
@@ -3102,15 +3673,15 @@ function main() {
     //
     // Where the line sits is the other half of that contract, and it is not cosmetic. `beginDockArrive`
     // does not await this function: it arms `DOCK_ARRIVE_DWELL_MS` in the same breath, so the dwell and
-    // this round trip are a race. Stripped *after* the await, a round trip slower than the dwell lands
+    // this round trip are a race. Emptied *after* the await, a round trip slower than the dwell lands
     // the arrival on the ball first and this line then takes that arrival off again — and nothing puts
     // it back, because `syncGif`'s `dock-arrive-N` branch finds the mode and the source already equal to
     // what it was about to assign and skips the swap. The ball would be left with no picture for the
-    // rest of the hover, which is the empty frame this slot keeps growing back. Stripped *before* it,
-    // there is nothing left for the order of the two halves to decide: the element is empty from the
+    // rest of the hover, which is the empty frame this slot keeps growing back. Emptied *before* it,
+    // there is nothing left for the order of the two halves to decide: the element is blank from the
     // first frame of the peek, whatever the helper takes to answer.
     const gif = document.querySelector('#ball-gif')
-    if (gif !== null) gif.removeAttribute('src')
+    if (gif !== null) gif.src = BLANK_FRAME
     // Re-checked after the await, because the round trip is long enough for the pointer to have left
     // the strip or started pulling the ball out. Either of those closes the peek; this only has to
     // notice, rather than paint over the top of it.
@@ -3817,6 +4388,36 @@ function main() {
   }
 
   /**
+   * Assistant replies this turn has written, oldest first, and the replies already read aloud.
+   *
+   * The speaking edge in {@link speakWhenFinished} is the normal path, and on a one-block reply it
+   * is enough. A turn that calls a tool breaks that shape: its answer is a *later* step's block, and
+   * the host settles that block through the same coalescing path every other block takes — so the
+   * page can hear only the settled message, never the `running: true` one, and an edge that did not
+   * arrive cannot fire. The list is the second chance, scoped to the turn: see {@link speakTurnReply}.
+   */
+  const turnReplies = []
+  /**
+   * Block key → the exact text handed to the speaker for it.
+   *
+   * A set would be enough if a block's text were final the moment its `running` flag falls, but it
+   * is not always: the host coalesces per-token updates on a 60 ms timer, and a settled snapshot can
+   * arrive while the answer is still being written. Reading that snapshot aloud and then ignoring
+   * the longer text is what made a long reply stop in the middle of a sentence. Keeping the text
+   * lets {@link speakReply} read only the part that has not been spoken yet.
+   */
+  const spokenText = new Map()
+  /**
+   * Block key → the pending "is this text final yet" timer.
+   *
+   * One beat behind the finished edge, because the host's coalescing can hand the page a settled
+   * snapshot whose text is still growing. The delay is shorter than any sentence, so the first
+   * syllable is never noticeably late.
+   */
+  const SPEECH_SETTLE_MS = 250
+  const speechSettle = new Map()
+
+  /**
    * The turn started, ended, or ended badly.
    *
    * `failed` is the host's word for *why* it ended: it reads the `turn/end` reason itself and says
@@ -3831,6 +4432,9 @@ function main() {
     // load, so reading `running === false` alone would ring the bell every time the ball starts.
     const wasRunning = running
     running = next
+    // A turn begins with an empty reply list: the ending below reads only what *this* turn wrote,
+    // so a turn made of nothing but tool calls has nothing to read out.
+    if (next && !wasRunning) turnReplies.length = 0
     if (pageClosed()) return
     document.body.classList.toggle('running', running)
     stop.hidden = !expanded || !running
@@ -3850,8 +4454,20 @@ function main() {
     // A turn ended. Only one that ran to its own end is a finished task: stopping the agent
     // yourself is not something to celebrate, and a run that threw is not a finished task at all —
     // it gets the failure face instead of the bell, whether or not this page saw it start.
+    if (interrupted || failed) {
+      // The user stopped the run, or it died. Either way the voice conversation is over until
+      // the next deliberate start; the microphone must not come back on its own after this.
+      continuousVoice.turnEnded({ interrupted, failed })
+    } else if (continuousVoice.turnEnded() === 'opening') {
+      // A reply read in the middle of this turn held the microphone back; now it is free.
+      scheduleVoiceTurn()
+    }
     if (failed && !interrupted) playFailFrame()
     else if (wasRunning && !interrupted) playDoneFrame()
+    // A turn that has run out of blocks without its answer ever reaching the speaker is read out
+    // here, before the transcript goes quiet. Skipped when the user stopped the run: a reply they
+    // cancelled is not one to read back to them.
+    if (wasRunning && !interrupted) speakTurnReply()
     if (interrupted) {
       for (const node of blocks.values()) {
         if (node.dataset.kind === 'tool' && node.dataset.state === 'running') {
@@ -3959,6 +4575,21 @@ function main() {
     // responding exactly when it started, so the ball's rect is held for the duration.
     if (pointer !== undefined || dragging) regions.push({ x: window.screenX, y: window.screenY, width: window.innerWidth, height: window.innerHeight })
     api.setHitTest(regions)
+  }
+
+  /**
+   * Report the card's rect again whenever its height changes.
+   *
+   * The bubble has no fixed height any more — it is as tall as the words in it (see the
+   * `--bubble-min-height` / `--bubble-max-height` note in `floating.css`), so a reply that arrives
+   * while the card is open makes it taller after `setExpanded` already reported the old rect. The
+   * window is click-through everywhere the hit-test does not cover, so a stale rect would let the
+   * bottom half of a growing reply fall through to whatever is behind the ball: the reads land,
+   * the text does not scroll, and nothing looks broken enough to explain why.
+   */
+  if (typeof ResizeObserver === 'function') {
+    const panelSize = new ResizeObserver(() => syncHitTest())
+    panelSize.observe(panel)
   }
 
   function applyDocked(side) {
@@ -4070,6 +4701,11 @@ function main() {
       applyDocked(undefined)
       applyDirection(state)
       panel.hidden = false
+      // The card is a reply bubble now (see floating.css): a couple of hundred pixels show the last
+      // few lines, and a restored conversation starts at `scrollTop` 0 — which would open the bubble
+      // on the oldest message in the history instead of the thing the ball just said. Anchoring to
+      // the bottom on every open is the whole of what makes "the latest reply" the visible one.
+      transcript.scrollTop = transcript.scrollHeight
       expanded = true
       document.body.classList.add('expanded')
       stop.hidden = !running
@@ -4467,8 +5103,14 @@ function main() {
     button.append(icon(SPEAKER))
     button.addEventListener('click', (event) => {
       event.stopPropagation()
-      if (speaker.isSpeaking(key)) speaker.cancel()
-      else speaker.speak(getText(), key)
+      if (speaker.isSpeaking(key)) {
+        speaker.cancel()
+        // The user stopped the reading on purpose, so this is the end of the voice exchange:
+        // the microphone must not come back when a later reply happens to finish.
+        continuousVoice.cancel()
+      } else {
+        speaker.speak(getText(), key)
+      }
     })
     speechButtons.set(key, button)
     // A reply restored from history arrives already finished, so the button is correct only after
@@ -4532,8 +5174,36 @@ function main() {
       // The first reply of a session can start before `refreshFrames` has made its round, so ask
       // for the frame now rather than wearing nothing for the opening sentence.
       if (speakActive && speakSrc === undefined) void loadSpeakFrame()
+      // The queue being quiet is a different event from the reading of one reply ending: a reply
+      // can have lines queued behind it (another block, an announcement) and the microphone must
+      // not open in the gap between them. This is the only edge that knows the *whole* queue is
+      // empty, which is why the finished-reply edge alone cannot hand a turn back.
+      if (!speakActive && !running && !asking() && continuousVoice.state === VOICE_WAITING) {
+        // `waiting` means the reply has been read but the microphone was held back by what was
+        // still queued. Empty now, so the exchange is due; a turn still writing stays waiting for
+        // `turnEnded`, and a failed reading has already disarmed it below.
+        continuousVoice.spoken({ running: false, error: typeof state.error === 'string' ? state.error : '' })
+        if (continuousVoice.wantsOpen) scheduleVoiceTurn()
+      }
       syncGif()
     }
+
+    // A reply read to its end is the cue to hand the microphone back, when the exchange began
+    // with a dictated message. `finished` only moves on a normal settle and `error` is empty only
+    // when the service did its job, so a cancelled or failed reading does not reopen the recorder.
+    if (state.finished !== speechFinished) {
+      speechFinished = state.finished
+      const next = continuousVoice.spoken({
+        running: running || asking(),
+        error: typeof state.error === 'string' ? state.error : '',
+      })
+      if (next === 'opening') scheduleVoiceTurn()
+    }
+
+    // A reading that fails produces no completion edge, so a turn armed for it would wait
+    // forever and then open on some later, unrelated playback. The failure is the end of the
+    // exchange: the user has a reason on screen, and the wake word waits again.
+    if (typeof state.error === 'string' && state.error !== '') continuousVoice.cancel()
 
     for (const [key, button] of speechButtons) {
       if (state.enabled === false) {
@@ -5149,22 +5819,95 @@ function main() {
    * be re-sent unchanged (usage updates, history reloads) and speaking it again would be wrong.
    */
   const speechRunningBefore = new Map()
+
+  /** Remember one assistant block as belonging to the turn in progress. */
+  function rememberTurnReply(key) {
+    if (turnReplies.includes(key)) return
+    turnReplies.push(key)
+    if (turnReplies.length > 50) turnReplies.shift()
+  }
+
+  /**
+   * Hand one finished reply to the speaker, unless all of this reply already was.
+   *
+   * Two things make this more than a one-shot call. The host coalesces per-token updates on a 60 ms
+   * timer, so the "finished" snapshot can still be a prefix of the answer; waiting one short beat and
+   * re-reading the latest block text costs nothing and turns a half sentence into the whole reply.
+   * And if the text grows *after* a reading started, the part that arrived late is spoken as its own
+   * reading, so the listen never stops at the snapshot boundary. `autoPlay` off means the button is
+   * the only way in, and the speaker's own `enabled` check is the backstop.
+   */
+  function speakReply(block) {
+    const key = block.key
+    clearTimeout(speechSettle.get(key))
+    const timer = setTimeout(() => {
+      speechSettle.delete(key)
+      const latest = blockData.get(key) ?? block
+      const text = typeof latest.text === 'string' ? latest.text : ''
+      if (text.trim() === '') return
+      // The reply goes into the bubble whether or not it is read out: with read-aloud off the
+      // card is still the only place this conversation's answer can be seen, and this hook is the
+      // one moment every finished answer passes through.
+      pushBubble('ball', text)
+      if (!speaker.autoPlay) return
+      const spoken = spokenText.get(key)
+      if (spoken === text) return
+      if (spoken !== undefined && text.startsWith(spoken)) {
+        // The earlier reading was handed a prefix: say the rest and remember the full text.
+        const rest = text.slice(spoken.length).trim()
+        spokenText.set(key, text)
+        if (rest !== '') speaker.speak(rest, key)
+        return
+      }
+      if (spoken !== undefined) return
+      spokenText.set(key, text)
+      if (spokenText.size > 400) spokenText.delete(spokenText.keys().next().value)
+      speaker.speak(text, key)
+    }, SPEECH_SETTLE_MS)
+    speechSettle.set(key, timer)
+  }
+
   function speakWhenFinished(block) {
     if (block?.kind !== 'assistant') return
     const was = speechRunningBefore.get(block.key)
     speechRunningBefore.set(block.key, block.running === true)
+    // A settled block whose text grew after a partial reading: the rest still has to be said.
+    if (was !== true) {
+      if (block.running !== true && spokenText.has(block.key)) speakReply(block)
+      return
+    }
     // Only the true→false edge counts, and only for a key seen running first — otherwise a block
     // that arrives already finished (a page reload) would be read out on every reload.
-    if (was !== true) return
-    // `autoPlay` off means the button is the only way in; the speaker's own `enabled` check is the
-    // backstop, so a settings change mid-reply cannot slip a sentence past the switch.
-    if (!speaker.autoPlay) return
-    speaker.speak(block.text, block.key)
+    if (block.running === true) return
+    speakReply(block)
+  }
+
+  /**
+   * Read out the answer of a turn that is ending, when no completion edge did.
+   *
+   * This is what keeps a tool-calling turn audible. Its answer is a later step's block, and a step
+   * can settle before the page ever sees it running: the host publishes running updates through a
+   * 60 ms coalescing timer and always publishes the settled state immediately (`block()` in
+   * `packages/host/src/orb.ts`), so a short answer that streams and settles inside one window
+   * reaches the page already finished and {@link speakWhenFinished} sees no edge. Walking the
+   * turn's own replies backwards answers exactly that case, and `spokenText` keeps a reply the
+   * edge already read from being read twice.
+   */
+  function speakTurnReply() {
+    for (let index = turnReplies.length - 1; index >= 0; index -= 1) {
+      const block = blockData.get(turnReplies[index])
+      if (block === undefined || block.kind !== 'assistant') continue
+      // Only tool calls, no text: nothing to read. A block without prose is not an answer.
+      if (typeof block.text !== 'string' || block.text.trim() === '') continue
+      speakReply(block)
+      return
+    }
   }
 
   function upsertBlock(block) {
     if (typeof block?.key !== 'string' || typeof block.text !== 'string') return
     blockData.set(block.key, block)
+    if (block.kind === 'assistant') rememberTurnReply(block.key)
     let node = blocks.get(block.key)
     if (node === undefined) {
       if (block.kind === 'user') {
@@ -5307,6 +6050,9 @@ function main() {
     blocks.clear()
     blockData.clear()
     transcript.replaceChildren()
+    // The bubble is the visible half of that transcript now, so a new conversation starts it empty
+    // as well — otherwise the card would be the old chat with new lines underneath.
+    clearBubbleLog()
     pending = undefined
     syncQuestion()
   }
@@ -6156,11 +6902,23 @@ function main() {
     void submitComposer()
   })
   async function submitComposer() {
+    // Read before the first await: `applyTranscript` clears the flag as soon as `requestSubmit`
+    // returns, and everything below that decides whether this is a voice turn must not race it.
+    const voiceSubmit = autoSubmitting
     const text = promptText(prompt).trim()
     if (text === '') return
     if (text.length > PROMPT_LIMIT) {
       status.textContent = messages.tooLong
+      if (!voiceSubmit) continuousVoice.cancel()
       return
+    }
+    // A typed message ends any continuous voice exchange: its reply is going to be read too, and
+    // the microphone must not reopen on a conversation the user chose to type. The dictation in
+    // flight, if any, also stops belonging to the exchange — its transcript may still arrive, but
+    // it must not re-arm a conversation that has moved to the keyboard.
+    if (!voiceSubmit) {
+      dictationVoice = false
+      continuousVoice.cancel()
     }
     const ready = await refreshTccGate({ forceShow: true })
     if (!ready) {
@@ -6176,6 +6934,10 @@ function main() {
     setHistoryOpen(false)
     setPermissionOpen(false)
     api.send(payload)
+    // Only after the send: a message that never left would otherwise arm a reply that never comes.
+    // And only when a reply will actually be read: with the feature off there is no completion
+    // edge to hand the microphone back, so an armed turn would wait for an event that cannot come.
+    if (voiceSubmit && speaker.enabled && speaker.autoPlay) continuousVoice.dictated()
   }
   prompt.addEventListener('input', syncComposerHeight)
   // Typing in the ball's own composer shows the typing frame for a few seconds.
@@ -6277,6 +7039,9 @@ function main() {
       if (outcome === 'streamed') {
         otherStreamAt.clear()
         otherTool = ''
+        // The answer being written over there has stopped: the line it left behind fades on its own
+        // instead of staying up as if the ball were still writing.
+        settleBubbleStream()
         syncGif()
         return
       }
@@ -6290,12 +7055,27 @@ function main() {
       // message arrived.
       if (outcome === 'user') {
         playNodFrame()
+        // The user's own sentence, as the main window sent it. This is the message the dictation
+        // used to write into the composer — which is hidden with the rest of the chat chrome — so
+        // the bubble is where "我听到你说的是这句" can actually be read. It closes the answer that
+        // was being written, the same way a new turn does anywhere else.
+        settleBubbleStream()
+        if (typeof payload?.text === 'string' && payload.text.trim() !== '') {
+          pushBubble('me', payload.text)
+        }
+        return
+      }
+      // A chunk of the answer being written in the main window. The host coalesces it (see
+      // `announceOtherText`), so this is a few updates per second and the bubble reads like a subtitle.
+      if (outcome === 'text') {
+        appendBubbleStream(payload?.text)
         return
       }
       // A turn ended somewhere else, with a reason. Four of the six endings arrive this way; the two that are not
       // turn endings — the question and the approval — ride the same message, because to the ball they are all
       // "something happened over there worth a face".
       if (outcome === 'ended') {
+        settleBubbleStream()
         void playTurnEndFrame(typeof payload?.category === 'string' ? payload.category : '')
         return
       }
@@ -6374,10 +7154,18 @@ function main() {
       if (settings === null || typeof settings !== 'object') return
       const wasEnabled = speaker.enabled
       speaker.configure(settings)
+      // Continuous conversation is fed by automatic reading: no reading, no cue to hand the
+      // microphone back, and a stored turn that waits for one would outlive the feature.
+      if (speaker.enabled === false || speaker.autoPlay === false) continuousVoice.cancel()
       // Turning the feature on has to reach replies that are already on screen; the buttons are
       // created with their message, so existing ones would otherwise stay bare until the next reply.
       if (speaker.enabled && !wasEnabled) addSpeakButtons()
     })
+  }
+  // The hourly chime: switch, quiet window, and the sample the off→on edge plays. Pushed rather
+  // than fetched because the menu owns the switch and flips it while this page is running.
+  if (typeof api.onChime === 'function') {
+    api.onChime((settings) => { applyChime(settings) })
   }
   transcript.addEventListener('click', (event) => {
     const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null
@@ -6395,7 +7183,6 @@ function main() {
     pending.error = typeof payload.text === 'string' ? payload.text : messages.incomplete
     renderQuestion()
   })
-  armBallPicture()
   syncGif()
   void startMemes()
   // The helper's menu owns the switch; these events mirror it into this page.
@@ -6403,7 +7190,19 @@ function main() {
     api.onWake((payload) => {
       const type = payload !== null && typeof payload === 'object' ? payload.type : ''
       if (type === 'enabled') void startWake()
-      else if (type === 'disabled') void wake.disable()
+      else if (type === 'disabled') {
+        // Switching the wake word off ends the voice conversation with it: there is no
+        // microphone to hand back, so the next reply must not try.
+        continuousVoice.cancel()
+        void wake.disable()
+      } else if (type === 'tuning') {
+        // The settings page moved the "finished speaking" pause (or another recorder field). Applied
+        // to the engine that already holds the microphone, so the *next* utterance ends on it — the
+        // recorder reads its window per dictation, not per launch.
+        if (payload.dictation !== null && typeof payload.dictation === 'object') {
+          wake.configure({ dictation: payload.dictation })
+        }
+      }
     })
   }
   if (typeof api.onTranscript === 'function') api.onTranscript((payload) => { applyTranscript(payload) })
@@ -6415,6 +7214,7 @@ function main() {
   }
   buildWaveform()
   buildWakeMeter()
+  scheduleHourly()
   void wake.syncFromHelper()
 }
 

@@ -1180,25 +1180,12 @@ body.docked-left #ball-gif {
   transform: translateX(44px) translateY(-10px) scale(0.9);
 }
 
-/* A docked picture with nothing to draw yet is not drawn at all.
-
-   An `<img>` waiting on a source paints a box of its own: a small broken-image glyph in the top-left
-   corner, inside a white-edged rectangle. The round corners above used to crop that box into a circle,
-   where it passed for part of the ball; the square corners that let the clip's own slab through also
-   let this through, and it read for what it is — a flash of an empty frame, with an icon in it, on
-   every hover.
-
-   `.ball-drawn` is added by the element's own `load` event (`armBallPicture`), which is the only party
-   that knows when a decode has finished. Until then there is nothing honest to paint, so there is
-   nothing painted. `visibility` rather than `opacity`, because an element that is only invisible still
-   has its box: the hit test reads `getBoundingClientRect()`, and anything that removed the box from
-   layout would take the strip's hover with it.
-
-   The free ball is untouched by design. It is a round picture in a round box, its own radius crops the
-   placeholder, and it has never flashed. */
-body.docked:not(.ball-drawn) #ball-gif {
-  visibility: hidden;
-}
+/* A `visibility: hidden` gate used to live here, keyed off a `.ball-drawn` class that `armBallPicture`
+   added on `load`. It was meant to hide the broken-image box during a source change, and it was removed
+   for two reasons. It did not fix the box — the box was reported again, unchanged, with it installed —
+   and it broke the strip: the ball stopped showing on hover at all, because a swap that does not fire
+   `load` leaves the class off and the picture invisible for good. A rule that hides the thing it is
+   meant to protect is not a candidate fix, whatever else it does. */
 
 #stop {
   /* Opposite 72px cap of the input pill from #ball; 14px is (72-44)/2. */
@@ -1378,5 +1365,203 @@ body:not(.running) #stop {
    still be checked without these two. */
 #wake-badge,
 #wake-meter {
+  display: none;
+}
+
+/* ── the panel is a reply bubble, not a chat box (2026-11-20) ───────────────
+   The ball's conversation moved to the main window, so the card beside it is no
+   longer a place to hold a conversation. What is left is the one thing the ball
+   still has to say: its latest reply. Hovering shows a small card with that
+   reply; nothing else about the ball changes — it still drags, still docks, still
+   takes the right-click menu, still speaks replies and still says the time on
+   the hour.
+
+   Why this is a stylesheet change and not deleted markup: `shell.js` addresses
+   every one of those children by id at startup (`transcript`, `composer`,
+   `status`, `question`, `history`…), and a missing node is a TypeError that takes
+   the whole page down with it — the ball included. So the markup stays and only
+   the painting changes. The composer, the toolbar, history, the permission chip,
+   the selection chip and the macOS TCC sheet are all still wired, still built and
+   still fed; they are simply not shown, which is also why none of them can fall
+   out of date.
+
+   Geometry note, and the reason this uses `--bubble-*` rather than the existing
+   `--panel-width`/`--panel-height`: those two are the contract with the main
+   process. `BALL_ROW` is *derived* from the panel's height and `BALL_COLUMN` from
+   its width, and `geometry.test.ts` holds the stylesheet to both numbers, so the
+   ball's place inside the window is the one thing that must not move. A 190px
+   card is drawn inside the same 520px column the window was built around.
+
+   One exception, deliberately: an agent's question still needs an answerable card
+   (options, a text field, a cancel), and that is the only place it can be
+   answered. `body.asking` — set by `shell.js` exactly while a question is pending
+   — brings the full-size card back for as long as the question is up. Everything
+   else about this state is untouched. */
+:root {
+  --bubble-width: 320px;
+  /* The card has no fixed height any more (2026-11-20): it is as tall as the words in it. A
+     one-line "我在。" is a 76px strip, a two-paragraph answer grows with every line, and past
+     `--bubble-max-height` the transcript scrolls instead of the card pushing off the screen. The
+     bounds are the two ends of "as tall as the text"; `--bubble-asking-height` is the one card that
+     must stay a fixed size, because its options have to be reachable. */
+  --bubble-min-height: 76px;
+  --bubble-max-height: 420px;
+  --bubble-asking-height: 520px;
+}
+
+#panel {
+  width: var(--bubble-width);
+  height: auto;
+  min-height: var(--bubble-min-height);
+  max-height: var(--bubble-max-height);
+  padding: 14px 16px;
+  border-radius: 20px;
+}
+
+/* Re-derived from the smaller card, so its edge still sits one gap away from the
+   ball. `expand-right` needs no rule: the card starts at the ball's column and the
+   window is a panel's width wider than it now. */
+body.expand-left #panel {
+  left: calc(var(--ball-column) - var(--panel-gap) - var(--bubble-width));
+}
+
+body.expand-up #panel {
+  /* Anchored by its bottom edge instead of by a computed top: the height is the content's, so
+     `top: ball-bottom - height` is not a number the stylesheet can know. The window's height is
+     `BALL_ROW + PANEL_SIZE.height + CHROME_INSET`, which puts the ball's bottom edge exactly
+     `BALL_ROW` above the window's — hence the same variable, now read as a bottom offset. */
+  top: auto;
+  bottom: var(--ball-row);
+}
+
+body.expand-down #panel {
+  padding: 14px 16px;
+}
+
+body.has-selection-chip.expand-up #panel,
+body.has-selection-chip.expand-down #panel {
+  padding: 14px 16px;
+}
+
+/* The pill drawn under the composer is gone with the composer. */
+#panel::after {
+  display: none;
+}
+
+/* The chat chrome. Hidden rather than removed — see the note above. */
+#history,
+#new-conversation,
+#permission,
+#history-list,
+#tcc-gate,
+#selection-chip,
+#composer {
+  display: none;
+}
+
+/* The conversation is drawn as chat bubbles now (`#bubble-log` below), and the prose transcript
+   is what those bubbles are a re-arrangement of: same words, two columns, no tool cards. It stays
+   in the page — 60-odd `querySelector`s and the whole `stage()` path write to it, and the question
+   card's layout was measured against it — it is simply not painted. Hiding it is what makes the
+   card look like a chat window rather than like a narrow column of an editor. */
+#transcript {
+  display: none;
+}
+
+body.expand-down #transcript,
+body.expand-up #transcript {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* The one fixed-height card left: an agent's question needs its options on screen, and a card
+   that grew with the question's text could put the buttons out of reach. */
+body.asking #panel {
+  --bubble-width: 420px;
+  height: var(--bubble-asking-height);
+  max-height: none;
+  padding: 16px;
+}
+
+
+
+/* ── the log: two columns of chat bubbles (2026-11-20) ───────────────────────
+   The card repeats the conversation that happens in the main window — the ball's own transcript
+   is usually empty, which is what made the bubble look like it did nothing. What makes a bubble
+   worth opening is *seeing both sides of it*: the sentence just dictated, the greeting said
+   before the microphone opened, the answer written or read aloud. So this is not a caption: the
+   user's words sit in a bubble on the right, the ball's on the left, the momentary states
+   ("正在听你说…") in a small grey row of their own — the shape everyone already reads as chat.
+   Nothing here is fixed-height: the card is as tall as its messages, the log scrolls once the
+   card hits `--bubble-max-height`. */
+#bubble-log {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 0;
+  scrollbar-width: thin;
+}
+
+#bubble-log[hidden] {
+  display: none;
+}
+
+/* One message: a full-width row whose bubble is pushed to one side. */
+.bubble-msg {
+  display: flex;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.bubble-msg[data-role="me"] {
+  justify-content: flex-end;
+}
+
+.bubble-msg[data-role="system"] {
+  justify-content: center;
+}
+
+.bubble-text {
+  max-width: 86%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border-radius: 14px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--dsw-specific-bubble, rgba(0, 0, 0, 0.05));
+  color: var(--dsw-alias-label-primary, #23252b);
+}
+
+/* The corner nearest its speaker is squared off — the cheapest "tail" a chat has, and the only
+   cue the two sides need at this size. */
+.bubble-msg:not([data-role="system"]) .bubble-text {
+  border-bottom-left-radius: 5px;
+}
+
+.bubble-msg[data-role="me"] .bubble-text {
+  border-bottom-left-radius: 14px;
+  border-bottom-right-radius: 5px;
+  background: #4c82f7;
+  color: #fff;
+}
+
+.bubble-msg[data-role="system"] .bubble-text {
+  max-width: 100%;
+  background: transparent;
+  border-radius: 0;
+  padding: 0 2px;
+  font-size: 12.5px;
+  color: var(--pin, #8a8f98);
+}
+
+/* A question is the one thing on this card that has to be answered, and it gets the full
+   420×520 (see `body.asking` above). A chat from a moment ago would only squeeze the options,
+   so it steps aside while the question is up. */
+body.asking #bubble-log {
   display: none;
 }

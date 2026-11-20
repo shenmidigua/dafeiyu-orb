@@ -5,15 +5,20 @@
  */
 
 import { timingSafeEqual } from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { readFile, stat } from 'node:fs/promises'
+import { appendFileSync, createReadStream } from 'node:fs'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { AVATAR_PRESETS, avatarPresetPath, isAvatarPresetId } from './avatar-presets.ts'
 import { normalizeCatalog, type ModelCatalog } from './catalog.ts'
 import {
+  DICTATION_NO_SPEECH_MS,
   isAgentModelSelection,
   isSpeechEndpoint,
   MAX_AVATAR_BYTES,
+  MAX_SILENCE_MS,
+  MIN_SILENCE_MS,
   sniffAvatarMime,
   type AgentModelSelection,
   type ProfileStore,
@@ -45,6 +50,32 @@ interface RouteContext {
   }
 }
 
+/**
+ * One wake-word hand-off, consumed by the main window's page.
+ *
+ * The page is the one that presses the main window's microphone button; this is the whole of
+ * what the host tells it. The numbers are the black panel's own limits (`orb-wake.json`) and
+ * `send` is its own rule, so the main-window path does not grow a second set of thresholds.
+ */
+export interface MainVoiceCommand {
+  readonly start: true
+  /** How long the microphone waits for the first word before it closes itself. */
+  readonly noSpeechMs: number
+  /** The pause after speech that ends the turn. */
+  readonly silenceMs: number
+  /** The hard ceiling, seconds. */
+  readonly maxSeconds: number
+  /** Whether the transcript is sent, or only left in the main window's draft. */
+  readonly send: boolean
+  /**
+   * Whether the exchange continues after the reply: the page opens the microphone again on its
+   * own, the way the ball does, so the next sentence needs no wake word.
+   */
+  readonly continuous: boolean
+  /** The pause between a finished reply and that re-opening, milliseconds. */
+  readonly followUpMs: number
+}
+
 /** Side effects that have to reach the live ball. */
 export interface OrbControl {
   helperAuthorized(token: string): boolean
@@ -58,6 +89,29 @@ export interface OrbControl {
   setWakeEnabled(enabled: boolean): Promise<void>,
   /** The settings page changed the read-aloud switches or the service endpoint. */
   setSpeech(settings: SpeechSettings): Promise<void>
+  /**
+   * The settings page moved the "finished speaking" pause, in milliseconds.
+   *
+   * The store writes `orb-wake.json` and the ball is told on the `chrome` broadcast, so the next
+   * utterance already ends on the new value — no relaunch of the helper, which would drop the panel
+   * the user is looking at.
+   */
+  setWakeSilence(silenceMs: number): Promise<void>
+  /**
+   * The wake-word hand-off waiting for the main window's page, or `null` when there is none.
+   *
+   * The page polls this from the main window. Whoever calls it consumes the hand-off, so a page
+   * reload between turns cannot press the microphone a second time.
+   */
+  takeMainVoice(): MainVoiceCommand | null
+  /**
+   * Transcribe one utterance the main window's page recorded itself.
+   *
+   * The composer's microphone button runs the ball's recorder — it opens the device, measures the
+   * level and decides when the sentence ended — and posts the finished WAV here, so the words are
+   * produced by the same service as the ball's. Returns the reason on failure rather than throwing.
+   */
+  transcribe(audio: Buffer): Promise<{ ok: true; text: string } | { ok: false; reason: string }>
   helperStatus?(): string
 }
 
@@ -66,6 +120,8 @@ interface RouteDeps {
   readonly store: ProfileStore
   readonly tcc: TccMonitor
   readonly control: OrbControl
+  /** Where the main window's diagnosis beacon lands. Defaults to the plugin's own folder. */
+  readonly reportPath?: string
 }
 
 /** Mount `/.dsh-orb` and return the disposer. */
@@ -73,7 +129,21 @@ export function registerOrbRoutes(deps: RouteDeps): () => void {
   return deps.ctx.webServer.register({
     kind: 'prefix',
     path: PREFIX,
-    handler: (req, res) => handle(deps, req, res),
+    // The handler is async, and a rejection used to go nowhere: the request would hang until the
+    // page gave up, and the composer's microphone — which posts its WAV here and waits for the
+    // words — would stay busy forever. Every route now answers, even the ones that threw.
+    handler: async (req, res) => {
+      try {
+        await handle(deps, req, res)
+      } catch {
+        try {
+          if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: '内部错误' }))
+        } catch {
+          // The socket is already gone; there is nobody left to tell.
+        }
+      }
+    },
   })
 }
 
@@ -104,8 +174,35 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
     sendJson(res, 200, await snapshot(deps))
     return
   }
+  if (method === 'GET' && path === `${PREFIX}/main-voice`) {
+    // Polled by the main window's page while it is open. `{ start: false }` is the ordinary
+    // answer; a hand-off is returned once and then consumed, so a reload cannot press the
+    // microphone a second time. See `MainVoiceCommand` and `Orb.takeMainVoice`.
+    sendJson(res, 200, deps.control.takeMainVoice() ?? { start: false })
+    return
+  }
   if (method === 'GET' && path === `${PREFIX}/models`) {
     sendJson(res, 200, await catalog(deps))
+    return
+  }
+  if (method === 'GET' && path === `${PREFIX}/wake`) {
+    // The main window's composer switch reads this when it mounts, so a reload shows the switch the
+    // helper is actually listening on rather than a default. The rest of the wake block stays on
+    // `GET /settings`; this is the one field the composer changes.
+    sendJson(res, 200, { enabled: deps.store.wake().enabled })
+    return
+  }
+  if (method === 'GET' && path === `${PREFIX}/dictation`) {
+    // What the composer's own microphone button records with: the same numbers the black panel
+    // writes, so the two recorders cannot drift apart. Read once per press rather than cached, so
+    // moving the pause slider in settings takes effect on the next sentence.
+    const wake = deps.store.wake()
+    sendJson(res, 200, {
+      silenceMs: wake.dictation.silenceMs,
+      maxSeconds: wake.dictation.maxSeconds,
+      autoSend: wake.dictation.autoSend,
+      noSpeechMs: DICTATION_NO_SPEECH_MS,
+    })
     return
   }
   if (method === 'GET' && path === `${PREFIX}/tcc`) {
@@ -127,6 +224,61 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
   }
   if (!orbSupported()) {
     sendJson(res, 403, { error: 'unsupported' })
+    return
+  }
+  if (method === 'POST' && path === `${PREFIX}/transcribe`) {
+    // The composer's microphone button recorded the sentence itself and posts the WAV. One
+    // utterance is a few hundred kilobytes at 16 kHz mono; the cap is the transcriber's own
+    // `MAX_AUDIO_BYTES` with room for the RIFF header, and a body past it is a client bug rather
+    // than a long sentence.
+    let audio: Buffer
+    try {
+      audio = await readBody(req, 8 * 1024 * 1024)
+    } catch {
+      sendJson(res, 413, { error: '录音太长' })
+      return
+    }
+    let result: Awaited<ReturnType<OrbControl['transcribe']>>
+    try {
+      result = await deps.control.transcribe(audio)
+    } catch {
+      // The transcriber is a service on this machine; when it is not up, the words are the one
+      // thing missing and the page needs a reason to say so rather than a request that never ends.
+      sendJson(res, 500, { error: '语音识别服务没有响应' })
+      return
+    }
+    sendJson(res, 200, result.ok ? { text: result.text } : { error: result.reason })
+    return
+  }
+  if (method === 'POST' && path === `${PREFIX}/client-report`) {
+    // A beacon from the main window's page. The composer switch is a slot occupant this plugin
+    // registers, and a missing switch has two very different causes: the page never ran this
+    // plugin's client code, or the slot never rendered it. Writing down what the page saw tells
+    // the two apart without attaching a debugger to a running window.
+    const report = await readJson(req)
+    const file = deps.reportPath ?? join(homedir(), '.dsh', 'dsh-orb', 'client-report.json')
+    try {
+      await mkdir(dirname(file), { recursive: true })
+      await writeFile(file, `${JSON.stringify(report, null, 1)}\n`, 'utf8')
+    } catch {
+      // Diagnostics must never fail the page that sent them.
+    }
+    // The newest report overwrites the file, which is what a one-shot beacon wants; the voice
+    // hand-off sends a line per step, so it also goes to the rolling log where the earlier steps
+    // survive. A test passes its own `reportPath` and must not touch the real log.
+    if (deps.reportPath === undefined) {
+      try {
+        const seen = report as Record<string, unknown> | null
+        const note = seen !== null && typeof seen === 'object' && typeof seen.note === 'string'
+          ? seen.note
+          : JSON.stringify(report)
+        appendFileSync(join(homedir(), '.dsh', 'dsh-orb', 'stream.log'),
+          `${new Date().toISOString()} page: ${note}\n`)
+      } catch {
+        // Same rule as above: a readout is not worth failing a request over.
+      }
+    }
+    sendJson(res, 200, { ok: true })
     return
   }
   if (method === 'POST' && path === `${PREFIX}/overlay-model`) {
@@ -187,6 +339,26 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
       return
     }
     await deps.control.setSpeech(next)
+    sendJson(res, 200, await snapshot(deps))
+    return
+  }
+  if (method === 'POST' && path === `${PREFIX}/wake`) {
+    const enabled = enabledFrom(await readJson(req))
+    if (enabled === undefined) {
+      sendJson(res, 400, { error: 'invalid-wake' })
+      return
+    }
+    await deps.control.setWakeEnabled(enabled)
+    sendJson(res, 200, { enabled })
+    return
+  }
+  if (method === 'POST' && path === `${PREFIX}/wake/silence`) {
+    const silenceMs = silenceFrom(await readJson(req))
+    if (silenceMs === undefined) {
+      sendJson(res, 400, { error: 'invalid-silence' })
+      return
+    }
+    await deps.control.setWakeSilence(silenceMs)
     sendJson(res, 200, await snapshot(deps))
     return
   }
@@ -251,6 +423,8 @@ async function snapshot(deps: RouteDeps): Promise<{
   selectionEnabled: boolean
   millifractionEnabled: boolean
   speech: SpeechSettings
+  /** The voice-recognition block: the settings page's slider renders `silenceMs` as seconds. */
+  dictation: { enabled: boolean; silenceMs: number; maxSeconds: number; autoSend: boolean }
   tcc: TccStatus
   helperError: string
   selectionAvailable: boolean
@@ -272,6 +446,7 @@ async function snapshot(deps: RouteDeps): Promise<{
     selectionEnabled: deps.store.selectionEnabled(),
     millifractionEnabled: deps.store.millifractionEnabled(),
     speech: deps.store.speech(),
+    dictation: deps.store.wake().dictation,
     tcc: deps.tcc.status(),
     helperError: deps.control.helperStatus?.() ?? '',
     selectionAvailable: selectionRuntimeAvailable(),
@@ -462,6 +637,27 @@ function speechUpdate(value: unknown, current: SpeechSettings): SpeechSettings |
     next.endpoint = record.endpoint
   }
   return next
+}
+
+/**
+ * The "finished speaking" pause out of the slider's request, in milliseconds.
+ *
+ * A number, or nothing: the page converts its seconds to milliseconds before sending, so a string
+ * or a missing field is a caller that has it wrong rather than something to coerce. An out-of-band
+ * number is clamped rather than rejected, because the two ends of the slider are exactly the two
+ * clamped bounds and a value just outside them is a rounding edge, not a mistake worth losing.
+ * A non-finite number is a mistake, and is refused.
+ */
+function silenceFrom(value: unknown): number | undefined {
+  const silenceMs = asRecord(value)?.silenceMs
+  if (typeof silenceMs !== 'number' || !Number.isFinite(silenceMs)) return undefined
+  return Math.min(MAX_SILENCE_MS, Math.max(MIN_SILENCE_MS, Math.round(silenceMs)))
+}
+
+/** The composer switch's body: `{ enabled: boolean }` and nothing else. */
+function enabledFrom(value: unknown): boolean | undefined {
+  const enabled = asRecord(value)?.enabled
+  return typeof enabled === 'boolean' ? enabled : undefined
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

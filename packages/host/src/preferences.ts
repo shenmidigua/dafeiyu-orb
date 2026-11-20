@@ -14,6 +14,8 @@ const SELECTION_FILE = 'selection-toolbar.json'
 const BALL_FILE = 'ball-enabled.json'
 const WAKE_FILE = 'orb-wake.json'
 const SPEECH_FILE = 'orb-speech.json'
+const REPLY_FILE = 'orb-reply.json'
+const CHIME_FILE = 'orb-chime.json'
 const AVATAR_FILE = 'orb-avatar'
 const AVATAR_META_FILE = 'orb-avatar.json'
 
@@ -53,6 +55,22 @@ export interface WakeSettings {
   readonly autoExpandOnWake: boolean
   /** What happens after a detection: the ball listens once and transcribes the utterance. */
   readonly dictation: DictationSettings
+  /** Whether a reply read to its end reopens the microphone for another voice turn. */
+  readonly continuous: ContinuousSettings
+}
+
+/**
+ * Continuous conversation: wake the ball once, then talk turn after turn.
+ *
+ * It hangs off the wake word because the microphone does: a reply is read, its end is the cue,
+ * and the same recorder opens again. Off is available for a user who wants one turn per wake
+ * word; on is the default because that is the experience the ball is for.
+ */
+export interface ContinuousSettings {
+  /** Whether the microphone comes back after a spoken reply. */
+  readonly enabled: boolean
+  /** How long a reopened microphone waits for speech before it returns to the wake word, seconds. */
+  readonly noSpeechSeconds: number
 }
 
 /**
@@ -62,13 +80,52 @@ export interface WakeSettings {
 export interface DictationSettings {
   /** Whether the ball records after a detection. */
   readonly enabled: boolean
-  /** Silence that ends the recording, milliseconds. */
+  /**
+   * Silence that ends the recording, milliseconds — the "you finished speaking" pause.
+   *
+   * Owned by the settings page's slider, which shows it as seconds (1–10, default 2.2) and converts
+   * once on the way out; the file and the recorder stay in milliseconds.
+   */
   readonly silenceMs: number
   /** Hard cap on one utterance, seconds. */
   readonly maxSeconds: number
   /** `true` sends the transcript straight to the session, `false` only fills the draft. */
   readonly autoSend: boolean
+  /**
+   * Where a wake sends the turn.
+   *
+   * `main` presses the microphone in the main DSH window's composer — the same recorder the user
+   * would click, which is what "wake the chat box" means. `panel` keeps the turn inside the ball's
+   * black panel. A profile that never chose keeps `main`: the main window is where the user reads
+   * and types, and the ball only has to hear the wake word.
+   */
+  readonly target: DictationTarget
 }
+
+/** The two places a wake-word turn can be recorded. */
+export type DictationTarget = 'main' | 'panel'
+
+/**
+ * The "you finished speaking" pause, in milliseconds.
+ *
+ * Stored in `orb-wake.json` as `dictation.silenceMs`, because that is the unit the recorder works in
+ * and the file is shared with a hand edit. The settings page shows it as seconds, 1–10 with a step of
+ * a tenth; these bounds are the file's own, loose enough for a hand-edited value and tight enough
+ * that a typo cannot turn the recorder into one that never opens or one that never closes.
+ */
+export const MIN_SILENCE_MS = 300
+export const MAX_SILENCE_MS = 10_000
+export const DEFAULT_SILENCE_MS = 2_500
+/**
+ * How long a recorder may wait for the first word before it closes itself, milliseconds.
+ *
+ * Mirrors `DICTATION_NO_SPEECH_MS` in `packages/helper/assets/wake.js`, the limit the ball's own
+ * recorder runs on. Every recorder this plugin starts uses this one number: the ball through the
+ * shared profile, the main window's hand-off, and the composer's microphone button. It lives here
+ * rather than in `orb.ts` so the route that hands the number to the page can import it without
+ * pulling in the whole host.
+ */
+export const DICTATION_NO_SPEECH_MS = 6_000
 
 /** What a missing or unreadable `orb-wake.json` means. */
 export const WAKE_DEFAULTS: WakeSettings = {
@@ -79,9 +136,14 @@ export const WAKE_DEFAULTS: WakeSettings = {
   autoExpandOnWake: true,
   dictation: {
     enabled: true,
-    silenceMs: 1200,
+    silenceMs: DEFAULT_SILENCE_MS,
     maxSeconds: 15,
     autoSend: false,
+    target: 'main',
+  },
+  continuous: {
+    enabled: true,
+    noSpeechSeconds: 6,
   },
 }
 
@@ -127,6 +189,71 @@ export function isSpeechEndpoint(value: unknown): value is string {
     return false
   }
 }
+
+/**
+ * Reply-style settings for the ball, stored in `orb-reply.json`.
+ *
+ * The ball is a voice loop: the user hears the answer and glances at the panel, so a long
+ * structured reply — a table, ten links, a list of caveats — is worse than a wrong-length
+ * sentence. The contract lives in the system prompt (see `./reply-style.ts`); these are the
+ * two numbers the user may want to move.
+ */
+export interface ReplyStyleSettings {
+  /** Whether the ball's agent gets the terse-reply contract at all. On unless turned off. */
+  readonly enabled: boolean
+  /** Hard cap on the spoken body, in characters. */
+  readonly maxReplyChars: number
+}
+
+/**
+ * What a missing or unreadable `orb-reply.json` means: minimal replies on, eighty characters.
+ *
+ * On by default on purpose — the file exists to turn the behaviour OFF for a user who types at
+ * the ball instead of talking to it, not to opt in to something a voice user has to discover.
+ */
+export const REPLY_DEFAULTS: ReplyStyleSettings = {
+  enabled: true,
+  maxReplyChars: 80,
+}
+
+/** The cap is a length hint, not a formatting rule: below twenty the answer carries no fact. */
+export const MIN_REPLY_CHARS = 20
+
+/** Above two thousand the contract stops being minimal and the prompt line just reads odd. */
+export const MAX_REPLY_CHARS = 2_000
+
+/**
+ * The hourly chime, stored in `orb-chime.json`.
+ *
+ * The ball speaking on its own is the one thing it does without being asked, so it is also the one
+ * that has to be switchable off from where the user hears it. `enabled` is the ball's menu;
+ * `quietFrom`/`quietTo` are the hours it stays silent, a wrap-around window (`22 → 6`). The wording
+ * itself lives in `packages/helper/assets/chime.js`, because the page owns the voice and the timer.
+ */
+export interface ChimeSettings {
+  /** Whether the ball speaks the time on the hour. */
+  readonly enabled: boolean
+  /** First silent hour, 0–24. Equal to `quietTo` means silence nowhere. */
+  readonly quietFrom: number
+  /** Hour silence ends, 0–24, exclusive. */
+  readonly quietTo: number
+}
+
+/**
+ * What a missing `orb-chime.json` means: on, with night silent.
+ *
+ * On because the ball is already something the user opted into and a chime nobody heard cannot be
+ * judged; night silent because a 4 AM chime is the fastest way to get the whole feature switched
+ * off. Same numbers as `CHIME_DEFAULTS` in the helper's `assets/chime.js`.
+ */
+export const CHIME_DEFAULTS: ChimeSettings = {
+  enabled: true,
+  quietFrom: 0,
+  quietTo: 7,
+}
+
+/** The hour band the quiet window is clamped to; 24 is midnight-the-end, never an hour that strikes. */
+export const CHIME_HOUR_MAX = 24
 
 const DEFAULT_MODEL: AgentModelSelection = {
   provider: 'deepseek-official',
@@ -269,16 +396,42 @@ export class ProfileStore {
    * The ball's menu flips only this flag; every other field stays as configured.
    *
    * The file is re-read first, because it is not this process's alone. The user edits
-   * `orb-wake.json` by hand (the dictation fields have no UI at all), a settings page can hold
-   * its own copy, and the whole file is rewritten on every save — so writing the snapshot taken
-   * at construction would quietly revert whatever landed on disk in the meantime. Only `enabled`
-   * is this call's to change; everything else comes from the file as it stands, revalidated by
-   * the same `readWake` that produced the original, so a hand-edited out-of-range value is
-   * clamped rather than trusted.
+   * `orb-wake.json` by hand, the settings page holds its own copy (it owns the silence slider; the
+   * other dictation fields still have no UI), and the whole file is rewritten on every save — so
+   * writing the snapshot taken at construction would quietly revert whatever landed on disk in the
+   * meantime. Only `enabled` is this call's to change; everything else comes from the file as it
+   * stands, revalidated by the same `readWake` that produced the original, so a hand-edited
+   * out-of-range value is clamped rather than trusted.
    */
   setWakeEnabled(enabled: boolean): void {
     this.wakeValue = { ...readWake(this.dir), enabled }
     writeWake(this.dir, this.wakeValue)
+  }
+
+  /**
+   * Move the "you finished speaking" pause, from the settings page's slider.
+   *
+   * Same shape as {@link setWakeEnabled}, and for the same reason: the file is re-read before the
+   * write, because the ball's menu flips `enabled` on its own and a text editor can change anything
+   * in it, and only this one field is this call's to change. The value is clamped to the band
+   * `readWake` uses, so a slider dragged to either end cannot store something the reader would then
+   * silently replace.
+   *
+   * The milliseconds stay milliseconds: the page converts its seconds once, at the edge, so there is
+   * exactly one place where the unit can be got wrong.
+   * @param silenceMs - the pause in milliseconds, from `0.3` to `10` seconds worth.
+   */
+  setDictationSilence(silenceMs: number): void {
+    const current = readWake(this.dir)
+    const next: WakeSettings = {
+      ...current,
+      dictation: {
+        ...current.dictation,
+        silenceMs: readBounded(silenceMs, current.dictation.silenceMs, MIN_SILENCE_MS, MAX_SILENCE_MS),
+      },
+    }
+    this.wakeValue = next
+    writeWake(this.dir, next)
   }
 
   /** Read-aloud settings. Missing file means off, pointing at the service's default port. */
@@ -292,6 +445,71 @@ export class ProfileStore {
       enabled: settings.enabled,
       autoPlay: settings.autoPlay,
       endpoint: settings.endpoint,
+    })
+  }
+
+  /**
+   * The terse-reply settings.
+   *
+   * Read from disk on every call rather than from the construction snapshot: the ball's own menu
+   * rewrites this file and a text editor can too, and a user who flips the switch should hear the
+   * difference on the next answer instead of after a restart. One small read per prompt assembly is
+   * nothing next to a model call.
+   */
+  reply(): ReplyStyleSettings {
+    return readReply(this.dir)
+  }
+
+  /**
+   * Write the reply switch from the ball's menu.
+   *
+   * Same shape as {@link setWakeEnabled}: the file is re-read first, because it is not this
+   * process's alone (a user may edit it by hand at any time) and the whole file is rewritten on
+   * every save — writing the construction snapshot would quietly revert whatever landed on disk in
+   * the meantime. Only the fields given are this call's to change; the rest comes from the file as
+   * it stands, revalidated by the same `readReply` that produced the read side.
+   * @param next - the fields to change. Omitted fields keep their current value.
+   */
+  setReply(next: Partial<ReplyStyleSettings>): void {
+    const current = readReply(this.dir)
+    const merged: ReplyStyleSettings = {
+      enabled: next.enabled ?? current.enabled,
+      maxReplyChars: next.maxReplyChars ?? current.maxReplyChars,
+    }
+    writeJson(join(this.dir, REPLY_FILE), {
+      enabled: merged.enabled,
+      maxReplyChars: merged.maxReplyChars,
+    })
+  }
+
+  /**
+   * Hourly-chime settings, read from disk on every call.
+   *
+   * Same reason as {@link reply}: the ball's menu rewrites the file while this process runs, and a
+   * hand edit should apply to the next hour without a restart.
+   */
+  chime(): ChimeSettings {
+    return readChime(this.dir)
+  }
+
+  /**
+   * Change the chime settings, re-reading the file first.
+   *
+   * The menu flips only `enabled`, and the whole file is rewritten on every save — so writing a
+   * snapshot taken at construction would quietly revert a hand-edited quiet window. Only the given
+   * fields change; the rest comes from the file as it stands, revalidated by {@link readChime}.
+   */
+  setChime(next: Partial<ChimeSettings>): void {
+    const current = readChime(this.dir)
+    const merged: ChimeSettings = {
+      enabled: next.enabled ?? current.enabled,
+      quietFrom: next.quietFrom ?? current.quietFrom,
+      quietTo: next.quietTo ?? current.quietTo,
+    }
+    writeJson(join(this.dir, CHIME_FILE), {
+      enabled: merged.enabled,
+      quietFrom: merged.quietFrom,
+      quietTo: merged.quietTo,
     })
   }
 
@@ -441,6 +659,17 @@ function readWake(dir: string): WakeSettings {
       ? value.autoExpandOnWake
       : WAKE_DEFAULTS.autoExpandOnWake,
     dictation: readDictation(value?.dictation),
+    continuous: readContinuous(value?.continuous),
+  }
+}
+
+/** The continuous block: on unless explicitly turned off, with the quiet window clamped. */
+function readContinuous(value: unknown): ContinuousSettings {
+  const defaults = WAKE_DEFAULTS.continuous
+  const block = record(value)
+  return {
+    enabled: typeof block?.enabled === 'boolean' ? block.enabled : defaults.enabled,
+    noSpeechSeconds: readBounded(block?.noSpeechSeconds, defaults.noSpeechSeconds, 2, 30),
   }
 }
 
@@ -450,9 +679,12 @@ function readDictation(value: unknown): DictationSettings {
   const block = record(value)
   return {
     enabled: typeof block?.enabled === 'boolean' ? block.enabled : defaults.enabled,
-    silenceMs: readBounded(block?.silenceMs, defaults.silenceMs, 300, 10_000),
+    silenceMs: readBounded(block?.silenceMs, defaults.silenceMs, MIN_SILENCE_MS, MAX_SILENCE_MS),
     maxSeconds: readBounded(block?.maxSeconds, defaults.maxSeconds, 2, 120),
     autoSend: typeof block?.autoSend === 'boolean' ? block.autoSend : defaults.autoSend,
+    // Anything but the two known words keeps the default, so a hand-edited file cannot point the
+    // wake at a target that does not exist.
+    target: block?.target === 'panel' ? 'panel' : defaults.target,
   }
 }
 
@@ -484,6 +716,36 @@ function readSpeech(dir: string): SpeechSettings {
   }
 }
 
+/**
+ * Reply-style settings, each field falling back to the default on its own.
+ *
+ * Missing file means on: the terse contract is the shipped behaviour, and only an explicit
+ * `"enabled": false` turns it off.
+ */
+function readReply(dir: string): ReplyStyleSettings {
+  const value = record(readJson(join(dir, REPLY_FILE)))
+  return {
+    enabled: typeof value?.enabled === 'boolean' ? value.enabled : REPLY_DEFAULTS.enabled,
+    maxReplyChars: readBounded(value?.maxReplyChars, REPLY_DEFAULTS.maxReplyChars, MIN_REPLY_CHARS, MAX_REPLY_CHARS),
+  }
+}
+
+/**
+ * Chime settings, each field falling back on its own.
+ *
+ * Missing file means on with night silent, so a profile that has never opened the menu still gets
+ * the feature the ball was installed for. The hour band is clamped rather than trusted: a hand-edited
+ * `31` would otherwise be a window that silences nothing while looking like it silences everything.
+ */
+function readChime(dir: string): ChimeSettings {
+  const value = record(readJson(join(dir, CHIME_FILE)))
+  return {
+    enabled: typeof value?.enabled === 'boolean' ? value.enabled : CHIME_DEFAULTS.enabled,
+    quietFrom: readBounded(value?.quietFrom, CHIME_DEFAULTS.quietFrom, 0, CHIME_HOUR_MAX),
+    quietTo: readBounded(value?.quietTo, CHIME_DEFAULTS.quietTo, 0, CHIME_HOUR_MAX),
+  }
+}
+
 function writeWake(dir: string, settings: WakeSettings): void {
   writeJson(join(dir, WAKE_FILE), {
     enabled: settings.enabled,
@@ -496,6 +758,11 @@ function writeWake(dir: string, settings: WakeSettings): void {
       silenceMs: settings.dictation.silenceMs,
       maxSeconds: settings.dictation.maxSeconds,
       autoSend: settings.dictation.autoSend,
+      target: settings.dictation.target,
+    },
+    continuous: {
+      enabled: settings.continuous.enabled,
+      noSpeechSeconds: settings.continuous.noSpeechSeconds,
     },
   })
 }

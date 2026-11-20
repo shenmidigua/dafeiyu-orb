@@ -334,14 +334,16 @@ describe('turn usage pill', () => {
  * genuine completion from the host replaying state (or from a turn the user stopped) is the
  * transition itself — which is exactly the part a source assertion cannot check.
  * @param turns - `{ running, interrupted? }` in arrival order.
- * @returns how many times the frame was played.
+ * @returns how many times the frame was played, and how often the turn-ending read was asked for.
  */
-function ringsFor(turns: { running: boolean; interrupted?: boolean }[]): number {
+function turnEndSummary(turns: { running: boolean; interrupted?: boolean }[]): { rings: number; speaks: number } {
   let rings = 0
+  let speaks = 0
   const stop = { hidden: false }
   const document = { body: { classList: { toggle: () => {} } } }
   const factory = new Function('deps', `
-    const { document, stop, expanded, pageClosed, syncGif, playDoneFrame, blocks, ensureProcess, setProcessOpen, refreshProcessLabel, startProcessClock, stopProcessClock, freezeProcess } = deps
+    const { document, stop, expanded, pageClosed, syncGif, playDoneFrame, speakTurnReply, blocks, ensureProcess, setProcessOpen, refreshProcessLabel, startProcessClock, stopProcessClock, freezeProcess, continuousVoice, scheduleVoiceTurn } = deps
+    const turnReplies = []
     let running = false
     let processGroup
     ${pageFunction(readFileSync(join(here, '../assets/shell.js'), 'utf8'), 'setRunning')}
@@ -354,6 +356,7 @@ function ringsFor(turns: { running: boolean; interrupted?: boolean }[]): number 
     pageClosed: () => false,
     syncGif: () => {},
     playDoneFrame: () => { rings += 1 },
+    speakTurnReply: () => { speaks += 1 },
     blocks: new Map(),
     ensureProcess: () => ({ live: true }),
     setProcessOpen: () => {},
@@ -361,9 +364,17 @@ function ringsFor(turns: { running: boolean; interrupted?: boolean }[]): number 
     startProcessClock: () => {},
     stopProcessClock: () => {},
     freezeProcess: () => {},
+    // The voice exchange is not what this fixture is about; a turn ending must simply not throw.
+    continuousVoice: { turnEnded: () => 'idle', cancel: () => {} },
+    scheduleVoiceTurn: () => {},
   })
   for (const turn of turns) setRunning(turn.running, turn.interrupted === true)
-  return rings
+  return { rings, speaks }
+}
+
+/** The bell count alone, for the assertions that predate the turn-ending read. */
+function ringsFor(turns: { running: boolean; interrupted?: boolean }[]): number {
+  return turnEndSummary(turns).rings
 }
 
 describe('finished-task frame', () => {
@@ -385,6 +396,20 @@ describe('finished-task frame', () => {
 
   it('plays again for the next turn', () => {
     assert.equal(ringsFor([{ running: true }, { running: false }, { running: true }, { running: false }]), 2)
+  })
+})
+
+describe('the turn-ending read', () => {
+  it('is asked for on the turn that ran to its own end', () => {
+    assert.equal(turnEndSummary([{ running: true }, { running: false }]).speaks, 1)
+  })
+
+  it('is not asked for on a replayed turn, which was never heard running', () => {
+    assert.equal(turnEndSummary([{ running: false }]).speaks, 0)
+  })
+
+  it('is not asked for a turn the user stopped', () => {
+    assert.equal(turnEndSummary([{ running: true }, { running: false, interrupted: true }]).speaks, 0)
   })
 })
 
@@ -776,7 +801,7 @@ describe('ball page module', () => {
     // stops mid-flight — so the release has to be a single `finally` that cannot miss one.
     assert.match(body, /\} finally \{\s*\n\s*if \(!handedOff\) endDictation\(\)/, 'a `finally` releases the recorder for every non-hand-off exit')
     assert.match(body, /let handedOff = false/, 'the hand-off is tracked explicitly')
-    assert.match(body, /if \(dictationBusy \|\| typeof api\.dictate !== 'function'\) return/, 'the one-at-a-time guard stays')
+    assert.match(body, /if \(dictationBusy \|\| typeof api\.dictate !== 'function'\) \{/, 'the one-at-a-time guard stays')
   })
 
   it('says what an empty utterance did instead of going blank', () => {
@@ -784,7 +809,7 @@ describe('ball page module', () => {
     const body = pageFunction(shell, 'startDictation')
     // The engine has already sounded the give-up cue by then; a blank line next to that tone
     // teaches the user nothing, and used to hide the stuck recorder behind it.
-    assert.match(body, /if \(wav === undefined\) \{\s*\n(?:\s*\/\/[^\n]*\n)+\s*status\.textContent = messages\.dictationEmpty/, 'the nothing-heard path names itself')
+    assert.match(body, /if \(wav === undefined\) \{[\s\S]*?status\.textContent = continuous \? messages\.continuousEmpty : messages\.dictationEmpty/, 'the nothing-heard path names itself')
   })
 
   it('wires the on-demand read-aloud service end to end', () => {

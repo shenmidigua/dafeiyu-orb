@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -83,6 +83,7 @@ describe('settings routes', () => {
       async setBallEnabled(enabled) { store.setBallEnabled(enabled) },
       async setWakeEnabled(enabled) { store.setWakeEnabled(enabled) },
       async setSpeech(settings) { store.setSpeech(settings) },
+      async setWakeSilence(silenceMs) { store.setDictationSilence(silenceMs); calls.push(['silence', silenceMs]) },
     }
     let handler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined
     const dispose = registerOrbRoutes({
@@ -211,6 +212,44 @@ describe('settings routes', () => {
     await handler(request('POST', '/.dsh-orb/speech', JSON.stringify({ enabled: 'yes' }), { 'x-dsh-user': 'ok' }), speechWrongType)
     assert.equal(speechWrongType.status, 400)
     assert.equal(store.speech().enabled, true)
+
+    // The "finished speaking" pause: milliseconds over the wire, the shipped 2.5 s until moved.
+    assert.equal(JSON.parse(settings.body.toString('utf8')).dictation.silenceMs, 2500)
+    const silence = response()
+    await handler(request('POST', '/.dsh-orb/wake/silence', JSON.stringify({ silenceMs: 3500 }), { 'x-dsh-user': 'ok' }), silence)
+    assert.equal(silence.status, 200)
+    assert.equal(JSON.parse(silence.body.toString('utf8')).dictation.silenceMs, 3500)
+    assert.equal(store.wake().dictation.silenceMs, 3500)
+    // It is in the file the helper reads at launch, not only in memory.
+    const wakeFile = JSON.parse(readFileSync(join(profile, 'orb-wake.json'), 'utf8')) as {
+      dictation: { silenceMs: number; maxSeconds: number }
+    }
+    assert.equal(wakeFile.dictation.silenceMs, 3500)
+    assert.equal(wakeFile.dictation.maxSeconds, 15, 'the other dictation fields survive the write')
+    // The ball hears about it on the same broadcast as everything else.
+    assert.deepEqual(calls.filter((call) => Array.isArray(call)).at(-1), ['silence', 3500])
+
+    // Out of band is clamped to the slider's own ends, not refused.
+    const silenceLow = response()
+    await handler(request('POST', '/.dsh-orb/wake/silence', JSON.stringify({ silenceMs: 10 }), { 'x-dsh-user': 'ok' }), silenceLow)
+    assert.equal(JSON.parse(silenceLow.body.toString('utf8')).dictation.silenceMs, 300)
+    const silenceHigh = response()
+    await handler(request('POST', '/.dsh-orb/wake/silence', JSON.stringify({ silenceMs: 60_000 }), { 'x-dsh-user': 'ok' }), silenceHigh)
+    assert.equal(JSON.parse(silenceHigh.body.toString('utf8')).dictation.silenceMs, 10_000)
+
+    // A wrong type or a missing field is a caller with the units wrong, not something to guess at.
+    for (const body of ['{ "silenceMs": "3.5" }', '{}', '{ "silenceMs": null }']) {
+      const bad = response()
+      await handler(request('POST', '/.dsh-orb/wake/silence', body, { 'x-dsh-user': 'ok' }), bad)
+      assert.equal(bad.status, 400, body)
+      assert.equal(JSON.parse(bad.body.toString('utf8')).error, 'invalid-silence')
+    }
+    assert.equal(store.wake().dictation.silenceMs, 10_000)
+
+    // Put the pause back to the shipped value so later assertions read the ordinary profile.
+    const silenceReset = response()
+    await handler(request('POST', '/.dsh-orb/wake/silence', JSON.stringify({ silenceMs: 2200 }), { 'x-dsh-user': 'ok' }), silenceReset)
+    assert.equal(store.wake().dictation.silenceMs, 2200)
 
     const uploaded = response()
     await handler(request('POST', '/.dsh-orb/avatar', png, { 'x-dsh-user': 'ok' }), uploaded)

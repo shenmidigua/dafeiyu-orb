@@ -118,13 +118,20 @@ describe('ball menu', () => {
     }), [{ label: '没有可用的模型。', enabled: false }])
   })
 
-  it('lists open, both models, coordinates, wake, voice input, and disable', () => {
+  it('lists open, both models, coordinates, terse replies, the chime, wake, voice input, and disable', () => {
     const actions: string[] = []
     const template = contextMenuTemplate({
       catalog,
       overlay: { provider: 'deepseek-official', model: 'plain' },
       background: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'max' },
       millifractionEnabled: false,
+      replyEnabled: false,
+      replyMaxChars: 80,
+      // The chime needs a voice: with read-aloud on, the row is live and names its silent hours.
+      chimeEnabled: true,
+      chimeQuietFrom: 0,
+      chimeQuietTo: 7,
+      speechEnabled: true,
       wakeEnabled: false,
       wakeAvailable: true,
       wakeWord: 'Hey Jarvis',
@@ -135,6 +142,8 @@ describe('ball menu', () => {
       setOverlay: () => { actions.push('overlay') },
       setBackground: () => { actions.push('background') },
       setMillifraction: (enabled) => { actions.push(`fraction:${enabled}`) },
+      setReply: (enabled) => { actions.push(`reply:${enabled}`) },
+      setChime: (enabled) => { actions.push(`chime:${enabled}`) },
       setWake: (enabled) => { actions.push(`wake:${enabled}`) },
       dictate: () => { actions.push('dictate') },
       disable: () => { actions.push('disable') },
@@ -144,6 +153,8 @@ describe('ball menu', () => {
       '悬浮球 Agent 模型',
       '后台 Agent 模型',
       '千分比坐标',
+      '极简回复（≤80 字）',
+      '整点报时（0–7 点静音）',
       '语音唤醒（Hey Jarvis）',
       '语音输入（现在说一句）',
       'separator',
@@ -152,21 +163,35 @@ describe('ball menu', () => {
     assert.equal(template[0]?.enabled, true)
     template[0]?.click?.({ checked: false })
     template[3]?.click?.({ checked: true })
+    // The reply row is a checkbox whose label states the cap it enforces.
+    assert.equal(template[4]?.type, 'checkbox')
+    assert.equal(template[4]?.checked, false)
     template[4]?.click?.({ checked: true })
-    // Voice input needs the wake engine running, so the row follows that state.
-    assert.equal(template[5]?.enabled, true)
+    // The chime row carries its quiet window in the label, because that number lives nowhere else.
+    assert.equal(template[5]?.type, 'checkbox')
+    assert.equal(template[5]?.checked, true)
     template[5]?.click?.({ checked: false })
+    template[6]?.click?.({ checked: true })
+    // Voice input needs the wake engine running, so the row follows that state.
+    assert.equal(template[7]?.enabled, true)
     template[7]?.click?.({ checked: false })
+    template[9]?.click?.({ checked: false })
     const background = template[2]?.submenu?.find((item) => item.label === '✓ Flash')
     assert.equal(background?.submenu?.find((item) => item.label === 'Max')?.checked, true)
     background?.submenu?.[0]?.click?.({ checked: true })
-    assert.deepEqual(actions, ['open', 'fraction:true', 'wake:true', 'dictate', 'disable', 'background'])
+    assert.deepEqual(actions, ['open', 'fraction:true', 'reply:true', 'chime:false', 'wake:true', 'dictate', 'disable', 'background'])
     // With the engine off the row explains itself instead of recording nothing.
     const noEngine = contextMenuTemplate({
       catalog,
       overlay: { provider: 'deepseek-official', model: 'plain' },
       background: { provider: 'deepseek-official', model: 'plain' },
       millifractionEnabled: false,
+      replyEnabled: true,
+      replyMaxChars: 80,
+      chimeEnabled: false,
+      chimeQuietFrom: 0,
+      chimeQuietTo: 7,
+      speechEnabled: true,
       wakeEnabled: false,
       wakeAvailable: true,
       wakeWord: 'Hey Jarvis',
@@ -177,17 +202,27 @@ describe('ball menu', () => {
       setOverlay: () => {},
       setBackground: () => {},
       setMillifraction: () => {},
+      setReply: () => {},
+      setChime: () => {},
       setWake: () => {},
       dictate: () => { actions.push('should-not-run') },
       disable: () => {},
     })
-    assert.equal(noEngine[5]?.label, '语音输入（需先开启语音唤醒）')
-    assert.equal(noEngine[5]?.enabled, false)
+    assert.equal(noEngine[7]?.label, '语音输入（需先开启语音唤醒）')
+    assert.equal(noEngine[7]?.enabled, false)
+    assert.equal(noEngine[4]?.checked, true)
+    assert.equal(noEngine[5]?.checked, false)
     const english = contextMenuTemplate({
       catalog: { groups: [] },
       overlay: { provider: 'deepseek-official', model: 'plain' },
       background: { provider: 'deepseek-official', model: 'plain' },
       millifractionEnabled: false,
+      replyEnabled: true,
+      replyMaxChars: 80,
+      chimeEnabled: true,
+      chimeQuietFrom: 22,
+      chimeQuietTo: 6,
+      speechEnabled: true,
       wakeEnabled: false,
       wakeAvailable: true,
       wakeWord: 'Hey Jarvis',
@@ -197,12 +232,18 @@ describe('ball menu', () => {
       setOverlay() {},
       setBackground() {},
       setMillifraction() {},
+      setReply() {},
+      setChime() {},
       setWake() {},
       disable() {},
     })
     assert.equal(english[0]?.label, 'Open Main Window')
     assert.equal(english[0]?.enabled, false)
-    assert.equal(english[4]?.label, 'Voice wake word (Hey Jarvis)')
+    assert.equal(english[4]?.label, 'Minimal replies (≤80 chars)')
+    // The window wraps midnight here: the label has to say so, or the user reads 22–6 as a range
+    // that is silent in the afternoon.
+    assert.equal(english[5]?.label, 'Hourly chime (quiet 22–6)')
+    assert.equal(english[6]?.label, 'Voice wake word (Hey Jarvis)')
     assert.equal(english.at(-1)?.label, 'Disable floating ball')
   })
 
@@ -214,6 +255,9 @@ describe('ball menu', () => {
       overlay: { provider: 'deepseek-official', model: 'plain' },
       background: { provider: 'deepseek-official', model: 'plain' },
       millifractionEnabled: false,
+      replyEnabled: true,
+      // The row names whatever cap the profile actually holds, not the shipped eighty.
+      replyMaxChars: 120,
       wakeEnabled: true,
       wakeAvailable: true,
       wakeWord: '大肥鱼大肥鱼',
@@ -224,12 +268,14 @@ describe('ball menu', () => {
       setOverlay() {},
       setBackground() {},
       setMillifraction() {},
+      setReply() {},
       setWake() {},
       dictate() {},
       disable() {},
     })
     const row = template.find((item) => item.label?.startsWith('语音唤醒'))
     assert.equal(row?.label, '语音唤醒（大肥鱼大肥鱼）')
+    assert.equal(template.find((item) => item.label?.startsWith('极简回复'))?.label, '极简回复（≤120 字）')
   })
 
   it('disables the wake row when no model directory was found', () => {
@@ -238,6 +284,8 @@ describe('ball menu', () => {
       overlay: { provider: 'deepseek-official', model: 'plain' },
       background: { provider: 'deepseek-official', model: 'plain' },
       millifractionEnabled: false,
+      replyEnabled: true,
+      replyMaxChars: 80,
       wakeEnabled: false,
       wakeAvailable: false,
       wakeWord: 'Hey Jarvis',
@@ -247,6 +295,7 @@ describe('ball menu', () => {
       setOverlay() {},
       setBackground() {},
       setMillifraction() {},
+      setReply() {},
       setWake() {},
       disable() {},
     })
@@ -254,6 +303,84 @@ describe('ball menu', () => {
     assert.equal(row?.label, '语音唤醒（未找到本地模型）')
     assert.equal(row?.enabled, false)
     assert.equal(row?.checked, false)
+  })
+
+  it('keeps the chime row honest about its voice and its silent hours', () => {
+    // Two states the label has to carry, because both are otherwise invisible: without a read-aloud
+    // service there is nothing to speak the time, and with `quietFrom === quietTo` there is no silent
+    // hour at all — a label that printed "0–0 点静音" would read as silence around midnight.
+    const build = (chime: { enabled: boolean; quietFrom: number; quietTo: number }, speech: boolean) =>
+      contextMenuTemplate({
+        catalog: { groups: [] },
+        overlay: { provider: 'deepseek-official', model: 'plain' },
+        background: { provider: 'deepseek-official', model: 'plain' },
+        millifractionEnabled: false,
+        replyEnabled: true,
+        replyMaxChars: 80,
+        chimeEnabled: chime.enabled,
+        chimeQuietFrom: chime.quietFrom,
+        chimeQuietTo: chime.quietTo,
+        speechEnabled: speech,
+        wakeEnabled: false,
+        wakeAvailable: false,
+        wakeWord: 'Hey Jarvis',
+        openMain: true,
+      }, true, {
+        openMain() {},
+        setOverlay() {},
+        setBackground() {},
+        setMillifraction() {},
+        setReply() {},
+        setChime() {},
+        setWake() {},
+        disable() {},
+      }).find((item) => item.label?.startsWith('整点报时'))
+    const live = build({ enabled: true, quietFrom: 0, quietTo: 7 }, true)
+    assert.equal(live?.label, '整点报时（0–7 点静音）')
+    assert.equal(live?.type, 'checkbox')
+    assert.equal(live?.checked, true)
+    assert.equal(live?.enabled, true)
+    const noSilence = build({ enabled: false, quietFrom: 3, quietTo: 3 }, true)
+    assert.equal(noSilence?.label, '整点报时')
+    assert.equal(noSilence?.checked, false)
+    const noVoice = build({ enabled: true, quietFrom: 0, quietTo: 7 }, false)
+    assert.equal(noVoice?.label, '整点报时（需先开启朗读）')
+    assert.equal(noVoice?.enabled, false)
+  })
+
+  it('toggles terse replies from the menu, stating the cap it enforces', () => {
+    // The whole point of the row is that a user who will not open `orb-reply.json` can still turn
+    // the contract off; both directions have to reach the action with the clicked state.
+    const clicked: boolean[] = []
+    const build = (enabled: boolean) => contextMenuTemplate({
+      catalog: { groups: [] },
+      overlay: { provider: 'deepseek-official', model: 'plain' },
+      background: { provider: 'deepseek-official', model: 'plain' },
+      millifractionEnabled: true,
+      replyEnabled: enabled,
+      replyMaxChars: 60,
+      wakeEnabled: false,
+      wakeAvailable: false,
+      wakeWord: 'Hey Jarvis',
+      openMain: true,
+    }, true, {
+      openMain() {},
+      setOverlay() {},
+      setBackground() {},
+      setMillifraction() {},
+      setReply: (value) => { clicked.push(value) },
+      setWake() {},
+      disable() {},
+    })
+    const on = build(true).find((item) => item.label?.startsWith('极简回复'))
+    assert.equal(on?.label, '极简回复（≤60 字）')
+    assert.equal(on?.type, 'checkbox')
+    assert.equal(on?.checked, true)
+    on?.click?.({ checked: false })
+    const off = build(false).find((item) => item.label?.startsWith('极简回复'))
+    assert.equal(off?.checked, false)
+    off?.click?.({ checked: true })
+    assert.deepEqual(clicked, [false, true])
   })
 
   it('keeps every wake hook the ball page uses present in its markup and stylesheet', () => {

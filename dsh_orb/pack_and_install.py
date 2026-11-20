@@ -21,6 +21,7 @@ import tarfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT = os.path.dirname(HERE)
 STAGE = os.path.join(os.path.expanduser("~"), ".dsh", "dsh_orb", "buildstage", "package")
 PROFILE = os.path.join(os.path.expanduser("~"), ".dsh", "profiles", "desktop")
 VENDOR = os.path.join(PROFILE, "vendor")
@@ -41,9 +42,48 @@ CHECKED = [
     # package with the new 28-slot model and the old 16-slot ring would throw at load, and nothing in
     # this list would have noticed. It was missing while the ring changed, which is how it was found.
     ("dist/helper/assets/wake.js", "assets/wake.js"),
+    # The spoken wake confirmation ("我在" in the ball's own TTS voice). `wake.js` asks for these by
+    # name through `dsh-wake://assets/voices/`, so a package with the new code and without the
+    # clips would fall back to the old chime on every wake and still pass every other check.
+    ("dist/helper/assets/voices/c1.wav", "assets/voices/c1.wav"),
+    ("dist/helper/assets/voices/c2.wav", "assets/voices/c2.wav"),
+    ("dist/helper/assets/voices/c3.wav", "assets/voices/c3.wav"),
+    # The continuous conversation's state machine. It is a new file rather than an edit, so a
+    # package assembled before it existed would otherwise pass every other check and leave the
+    # page importing a module that is not there — the loop would simply never run.
+    ("dist/helper/assets/voice-turn.js", "assets/voice-turn.js"),
+    # The closing-phrase table ("先这样", "没你事了"). Also a new file rather than an edit, and also
+    # imported by the page: without it the page throws on load and the ball stops drawing at all,
+    # which is a much louder failure than the feature simply not working.
+    ("dist/helper/assets/voice-closing.js", "assets/voice-closing.js"),
     ("dist/helper/preload.cjs", "preload.cjs"),
     ("dist/helper/lib/main.js", "lib/main.js"),
 ]
+
+# Files `assemble.mjs` rewrites on the way in (the settings page's plugin id) or that a bundler
+# produced (the host's compiled lib). They cannot be compared with their source byte for byte, so
+# they are compared with the *stage* instead: that proves the tarball carried the build that was
+# just measured, which is the question a stale install would otherwise answer wrongly.
+ASSEMBLED = [
+    ("client.js", "client.js"),
+    ("lib/index.js", "lib/index.js"),
+    ("dist/host/index.js", "dist/host/index.js"),
+]
+
+# What the assembled page must say, in its own words: the slider the user asked for, and the plugin
+# id `assemble.mjs` renames. A byte comparison cannot see a page whose source is right but whose
+# rewrite did not happen, so both markers are checked as text.
+CLIENT_MARKERS = ["dsh-orb-set-range", "id: 'dsh-orb'", "dsh-orb-wake-toggle"]
+CLIENT_REJECTS = ["@dsh-orb/client-ui-settings-orb"]
+
+
+def same_assembled_page(staged: str, source: str) -> bool:
+    """Whether the staged settings page is the source page with `assemble.mjs`'s one rewrite."""
+    with open(staged, "rb") as handle:
+        staged_text = handle.read().decode("utf8", "replace")
+    with open(source, "rb") as handle:
+        source_text = handle.read().decode("utf8", "replace")
+    return staged_text == source_text.replace("id: '@dsh-orb/client-ui-settings-orb'", "id: 'dsh-orb'")
 
 
 def check_stage_is_current() -> bool:
@@ -76,6 +116,17 @@ def check_stage_is_current() -> bool:
         print("\nthe staged build does not match the sources, so it is not this build.")
         print("re-run assemble.mjs, passing the directory itself rather than a folder inside it:")
         print(f'  node packages/bundle/scripts/assemble.mjs --out "{STAGE}"')
+        return False
+
+    page = os.path.join(STAGE, "client.js")
+    source_page = os.path.join(PROJECT, "packages", "client-settings", "client.js")
+    if not os.path.isfile(page):
+        print("STAGE MISSING client.js")
+        return False
+    if not same_assembled_page(page, source_page):
+        print("STAGE STALE  client.js (the settings page is not the one in the sources)")
+        return False
+    print("the staged settings page is the current one")
     return ok
 
 
@@ -220,6 +271,31 @@ def verify() -> bool:
             same = fa.read() == fb.read()
         print(f"{'OK  ' if same else 'DIFF'} {installed_rel}")
         ok = ok and same
+    for installed_rel, stage_rel in ASSEMBLED:
+        a = os.path.join(INSTALLED, installed_rel.replace("/", os.sep))
+        b = os.path.join(STAGE, stage_rel.replace("/", os.sep))
+        if not os.path.isfile(a) or not os.path.isfile(b):
+            print(f"MISSING {installed_rel}")
+            ok = False
+            continue
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            same = fa.read() == fb.read()
+        print(f"{'OK  ' if same else 'DIFF'} {installed_rel} (vs the built stage)")
+        ok = ok and same
+    # The page's own text, read back from the installed copy: the slider has to be in there, and the
+    # rename `assemble.mjs` performs has to have happened, or the plugin loader resolves the page
+    # under a name that is not in the package.
+    page = os.path.join(INSTALLED, "client.js")
+    with open(page, "rb") as handle:
+        text = handle.read().decode("utf8", "replace")
+    for marker in CLIENT_MARKERS:
+        present = marker in text
+        print(f"{'OK  ' if present else 'MISSING'} client.js contains {marker!r}")
+        ok = ok and present
+    for marker in CLIENT_REJECTS:
+        absent = marker not in text
+        print(f"{'OK  ' if absent else 'STALE'} client.js has no {marker!r}")
+        ok = ok and absent
     return ok
 
 

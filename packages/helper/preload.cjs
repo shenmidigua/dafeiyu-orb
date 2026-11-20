@@ -74,6 +74,23 @@ contextBridge.exposeInMainWorld('dshOrb', {
   send(text) {
     ipcRenderer.send('orb:prompt', text)
   },
+
+  /**
+   * Wake-word hand-off to the main DSH window's own microphone button.
+   *
+   * Not called by the page while the black panel owns the wake path: the panel opens and records
+   * the turn itself. Kept because the host side of the hand-off (the no-speech / pause /
+   * max-length limits and the send decision applied in the main window) is still wired up, so a
+   * page that wants to hand a turn over can do it without any change below this line.
+   */
+  mainVoiceStart() {
+    ipcRenderer.send('orb:main-voice')
+  },
+
+  /** Bring the main DSH window forward (used by the menu). */
+  openMain() {
+    ipcRenderer.send('orb:open-main')
+  },
   answerQuestion(id, answers) {
     ipcRenderer.send('orb:question-answer', { id, answers })
   },
@@ -311,6 +328,15 @@ contextBridge.exposeInMainWorld('dshOrb', {
    */
   onSpeech(callback) {
     ipcRenderer.on('orb:speech', (_event, settings) => callback(settings))
+  },
+  /**
+   * Hourly-chime settings pushed from the host: `{ enabled, quietFrom, quietTo }`.
+   *
+   * Sent rather than fetched for the same reason as the read-aloud switches: the ball's own menu
+   * flips it while the page is running, and the sample the switch plays is the page's job.
+   */
+  onChime(callback) {
+    ipcRenderer.on('orb:chime', (_event, settings) => callback(settings))
   },
   /**
    * Ask the main process to make sure the read-aloud service is running, starting it if needed.

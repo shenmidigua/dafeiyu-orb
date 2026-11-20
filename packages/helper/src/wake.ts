@@ -64,7 +64,21 @@ const MIME: Readonly<Record<string, string>> = Object.freeze({
   '.wasm': 'application/wasm',
   '.mjs': 'text/javascript; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.wav': 'audio/wav',
 })
+
+/**
+ * Folder inside the helper's own assets that ships the spoken wake confirmation.
+ *
+ * A different root from the models: those are passed in by the host from `dsh-voice-dialog`, while
+ * these clips are part of this plugin. The page reaches them on the same `dsh-wake://assets/`
+ * origin, so a packaged install resolves them without a `file://` URL and without touching the
+ * model directory.
+ */
+export const WAKE_VOICE_DIRECTORY = 'voices'
+
+/** One WAV inside the wake confirmation folder, and nothing else. */
+const VOICE_FILE = /^voices\/[A-Za-z0-9._-]+\.wav$/
 
 /** Tuning the engine reads before it starts. */
 export interface WakeConfig {
@@ -78,6 +92,16 @@ export interface WakeConfig {
   readonly autoExpandOnWake: boolean
   /** What the ball does after a detection: record one utterance and transcribe it. */
   readonly dictation: DictationConfig
+  /** Whether a reply read to its end reopens the microphone for another turn. */
+  readonly continuous: ContinuousConfig
+}
+
+/** Continuous conversation, fed by the ends of spoken replies. */
+export interface ContinuousConfig {
+  /** Whether the microphone comes back after a spoken reply. */
+  readonly enabled: boolean
+  /** How long a reopened microphone waits for speech before it returns to the wake word, seconds. */
+  readonly noSpeechSeconds: number
 }
 
 /** One utterance after the wake word, transcribed by the Host's speech service. */
@@ -90,6 +114,11 @@ export interface DictationConfig {
   readonly maxSeconds: number
   /** `true` sends the transcript straight away, `false` only fills the ball's draft. */
   readonly autoSend: boolean
+  /**
+   * Where the turn is recorded: the main window's composer microphone (`main`), or the ball's own
+   * black panel (`panel`). The page routes on it; nothing else in this process changes.
+   */
+  readonly target: 'main' | 'panel'
 }
 
 /** What a helper started by an older host, or without assets, uses. */
@@ -98,7 +127,8 @@ export const WAKE_DEFAULTS: WakeConfig = Object.freeze({
   keyword: 'hey_jarvis',
   threshold: 0.5,
   autoExpandOnWake: true,
-  dictation: Object.freeze({ enabled: true, silenceMs: 1200, maxSeconds: 15, autoSend: false }),
+  dictation: Object.freeze({ enabled: true, silenceMs: 2200, maxSeconds: 15, autoSend: false, target: 'main' }),
+  continuous: Object.freeze({ enabled: true, noSpeechSeconds: 6 }),
 })
 
 /** Environment variable holding the model directory. */
@@ -121,6 +151,19 @@ export function readWakeConfig(env: NodeJS.ProcessEnv = process.env): WakeConfig
     threshold: readThreshold(parsed?.threshold),
     autoExpandOnWake: parsed?.autoExpandOnWake === false ? false : WAKE_DEFAULTS.autoExpandOnWake,
     dictation: readDictation(parsed?.dictation),
+    continuous: readContinuous(parsed?.continuous),
+  }
+}
+
+/** The continuous block, field by field; anything malformed keeps the shipped default. */
+function readContinuous(value: unknown): ContinuousConfig {
+  const defaults = WAKE_DEFAULTS.continuous
+  const block = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  return {
+    enabled: typeof block.enabled === 'boolean' ? block.enabled : defaults.enabled,
+    noSpeechSeconds: readBounded(block.noSpeechSeconds, defaults.noSpeechSeconds, 2, 30),
   }
 }
 
@@ -135,6 +178,7 @@ function readDictation(value: unknown): DictationConfig {
     silenceMs: readBounded(block.silenceMs, defaults.silenceMs, 300, 10_000),
     maxSeconds: readBounded(block.maxSeconds, defaults.maxSeconds, 2, 120),
     autoSend: typeof block.autoSend === 'boolean' ? block.autoSend : defaults.autoSend,
+    target: block.target === 'panel' ? 'panel' : defaults.target,
   }
 }
 
@@ -165,16 +209,22 @@ export function registerWakeScheme(): void {
 }
 
 /**
- * Serve the model directory on the wake scheme.
- * @param config - the launch configuration naming the directory.
+ * Serve the model directory on the wake scheme, plus the helper's own spoken wake clips.
+ *
+ * The two roots are separate on purpose: models are an external folder the host seeds, while the
+ * confirmation WAVs ship inside this package. The page asks for both through one origin.
+ * @param config - the launch configuration naming the model directory.
+ * @param voiceRoot - the helper's own asset folder, which contains the voice clips, or `''`.
  * @returns a disposer that unregisters the handler.
  */
-export function serveWakeAssets(config: WakeConfig): () => void {
+export function serveWakeAssets(config: WakeConfig, voiceRoot = ''): () => void {
   const root = config.assetDirectory
   const files = allowedFiles(config.keyword)
   protocol.handle(WAKE_SCHEME, async (request) => {
-    if (root === '') return new Response(null, { status: 404 })
-    const target = wakeAssetPath(root, new URL(request.url).pathname, files)
+    const pathname = new URL(request.url).pathname
+    // Models first, then the built-in clips: one request path can only match one of the two, and
+    // the model whitelist is the narrow one that has to keep winning for its own files.
+    const target = wakeAssetPath(root, pathname, files) ?? wakeVoicePath(voiceRoot, pathname)
     if (target === undefined) return new Response(null, { status: 404 })
     let info
     try {
@@ -214,10 +264,29 @@ export function wakeAssetPath(
   pathname: string,
   files: readonly string[] = allowedFiles(WAKE_DEFAULT_KEYWORD),
 ): string | undefined {
+  if (root === '') return undefined
   // The whitelist is written with forward slashes; a Windows client may send either.
   const name = decodeURIComponent(pathname).replace(/^\/+/, '').split('\\').join('/')
   if (name === '' || name.includes('..')) return undefined
   if (!files.includes(name)) return undefined
+  const target = resolve(join(root, name))
+  if (!target.startsWith(resolve(root) + sep)) return undefined
+  return target
+}
+
+/**
+ * Map one request path onto the helper's own voice folder.
+ *
+ * Deliberately a narrower rule than the model whitelist: only `voices/<name>.wav`, so the model
+ * directory's paths and the package's other assets are not reachable through this branch.
+ * @param root - the helper's asset directory, which contains `voices`.
+ * @param pathname - the request pathname, with the leading slash.
+ * @returns the absolute file path, or undefined for anything else.
+ */
+export function wakeVoicePath(root: string, pathname: string): string | undefined {
+  if (root === '') return undefined
+  const name = decodeURIComponent(pathname).replace(/^\/+/, '').split('\\').join('/')
+  if (name.includes('..') || !VOICE_FILE.test(name)) return undefined
   const target = resolve(join(root, name))
   if (!target.startsWith(resolve(root) + sep)) return undefined
   return target

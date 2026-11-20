@@ -216,7 +216,7 @@ function harness(options: {
   const counts = { unsnaps: 0, asks: 0 }
   const factory = new Function('deps', `
     const { gif, classes, dockTab, document, DOCK_ARRIVE_DWELL_MS,
-            DOCK_ARRIVE_MARGIN_PX, DOCK_PEEK_RELEASE_PX, injected, api } = deps
+            DOCK_ARRIVE_MARGIN_PX, DOCK_PEEK_RELEASE_PX, DOCK_HOVER_ENABLED, injected, api } = deps
     let docked = injected.DOCKED
     let dockPointerInside = false
     let dockHoverTimer
@@ -370,6 +370,10 @@ function harness(options: {
     DOCK_ARRIVE_DWELL_MS,
     DOCK_ARRIVE_MARGIN_PX,
     DOCK_PEEK_RELEASE_PX,
+    // The page's own switch, read out of the source above. The functions this harness extracts carry
+    // `if (!DOCK_HOVER_ENABLED) return` guards, so the name has to exist in the sandbox or every case
+    // that reaches one dies with a `ReferenceError` rather than testing anything.
+    DOCK_HOVER_ENABLED,
     injected: {
       DOCKED: options.docked,
       FRAME: edges(options.cached),
@@ -555,14 +559,17 @@ if (DOCK_HOVER_ENABLED) describe('the docked strip plays its arrival clip on a h
     //
     // Three halves, because there are three ways a face could get there. `syncGif` has to leave the
     // element alone while docked — before the idle loop *and* before the frozen `still`, which would
-    // repaint it from a canvas and flash over the clip — and the peek has to strip the idle loop the
-    // ball carried into the dock, since nothing else would take it off.
+    // repaint it from a canvas and flash over the clip — and the peek has to empty the ball of the idle
+    // loop it carried into the dock, since nothing else would take it off.
     assert.match(pageFunction('syncGif'), /if \(docked !== undefined\) return\n\s*const broke = brokeNow\(\)/,
       'syncGif still reaches the idle loop while the ball is docked')
     assert.match(pageFunction('syncGif'), /if \(docked !== undefined\) return[\s\S]*?if \(gif\.dataset\.mode === 'still'\) return/,
       'and the early return sits above the frozen frame, not below it')
-    assert.match(pageFunction('openDockPeek'), /removeAttribute\('src'\)/,
-      'and the peek does not strip the face the ball came out of the dock wearing')
+    // Emptied with a blank frame rather than by removing the source: the element has to end up with a
+    // picture, because one with no source at all is the broken-image box. `ball-picture.test.ts` owns
+    // that distinction; what this line is about is only that the old face does not survive the peek.
+    assert.match(pageFunction('openDockPeek'), /gif\.src = BLANK_FRAME/,
+      'and the peek does not empty the ball of the face it came out of the dock wearing')
 
     // The behaviour, on the page's own `syncGif`: docked, the loop is not worn between the strip's faces.
     const page = harness({ cached: CLIP_LOOPED, docked: 'right' })
@@ -800,36 +807,6 @@ if (DOCK_HOVER_ENABLED) describe('the arrival never takes the ball out of its do
     const feed = /api\.onPointer\(\(point\) => \{[\s\S]*?\n  \}\)/.exec(shell)?.[0] ?? ''
     assert.match(feed, /enterUi\(\)/, 'the feed does not reach the clip at all')
     assert.equal(/unsnap/.test(feed), false, 'the feed still pulls the ball out of its dock')
-  })
-})
-
-describe('the hover pull-out is parked', () => {
-  it('does nothing on a hover, and says so in one place', () => {
-    // Parked as of this change: the frame that grew out of the strip is not wanted, and a hover that does nothing
-    // is the whole of "dropped for now". Both halves of the gesture read one flag, so nothing is left half-shown —
-    // the peek that grows the window and the arrival clip that greets it go off together.
-    assert.equal(DOCK_HOVER_ENABLED, false, 'the hover pull-out was switched back on; delete this suite and the skips above')
-
-    // The flag is actually consulted, in both places, and consulted first: a guard after the work it guards would
-    // not stop the work.
-    const body = (name: string) => {
-      const at = shell.indexOf(`function ${name}(`)
-      assert.notEqual(at, -1, `${name} is missing from the page`)
-      return shell.slice(at, shell.indexOf('\n  }', at))
-    }
-    const arrive = body('beginDockArrive')
-    assert.match(arrive, /if \(!DOCK_HOVER_ENABLED\) return/, 'the arrival no longer checks the flag')
-    const peek = body('openDockPeek')
-    assert.match(peek, /if \(!DOCK_HOVER_ENABLED\) return/, 'the peek no longer checks the flag')
-    assert.ok(
-      peek.indexOf('DOCK_HOVER_ENABLED') < peek.indexOf('dockPeeked = true'),
-      'the peek checks the flag after it has already claimed the hover',
-    )
-
-    // And what is *not* parked: the press that drags the ball out is a different gesture with its own listener,
-    // and it has to keep working or the ball could never leave its strip again.
-    assert.match(shell, /function handDockDragToBall\(/, 'the drag-out gesture was removed with the hover')
-    assert.doesNotMatch(body('handDockDragToBall'), /DOCK_HOVER_ENABLED/, 'the drag-out was parked along with the hover')
   })
 })
 

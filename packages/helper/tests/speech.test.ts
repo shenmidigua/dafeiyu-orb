@@ -195,14 +195,22 @@ describe('the queue plays a sentence ahead', () => {
     // saw: the first sentence played, the second never did, and nothing was said about either. The
     // reason is on screen now, so the sentences after the failure are still worth reading.
     const body = method('run')
-    assert.ok(body.includes('failures'), 'one failed sentence must not end the run by itself')
+    assert.ok(body.includes('if (blob === null)'), 'a refused sentence comes back as null, not as a throw')
     assert.ok(body.includes('continue'), 'the loop has to move on to the next sentence')
+    assert.ok(body.includes('incomplete = true'),
+      'and the reading must not be counted as read to its end because of it')
   })
 
-  it('still gives up when the service itself is gone', () => {
-    // Two failures in a row is not bad luck, and asking for the remaining sentences would only delay
-    // the same message by another round trip each.
-    assert.ok(method('run').includes('failures >= 2'))
+  it('stops for a newer reply, not for a sentence that failed', () => {
+    // There used to be a consecutive-failure counter here. It was removed with the queue rewrite:
+    // the service is local, so a dead one refuses each connection immediately and every remaining
+    // sentence costs nothing to try, while a counter would also cut short a run whose only problem
+    // was one unlucky clip. The one condition that still ends the loop early is a newer reading
+    // taking over — the generation check, which every exit goes through.
+    const body = method('run')
+    assert.ok(body.includes('if (generation !== this.generation) return'),
+      'a newer reply is the only thing that ends the run early')
+    assert.ok(!body.includes('failures'), 'a failure counter would end a readable reply for no reason')
   })
 
   it('returns the button to rest however the run ends', () => {
@@ -210,7 +218,8 @@ describe('the queue plays a sentence ahead', () => {
     // queue owns that transition instead, which means it has to happen on every way out — a normal
     // finish, a cancellation, and a service that gave up half way.
     assert.ok(method('run').includes('finally'), 'settling has to survive an early return')
-    assert.ok(method('run').includes('this.settle(generation)'), 'and has to settle the speaker')
+    assert.ok(method('run').includes('this.settle(generation, !incomplete)'),
+      'and has to settle the speaker, saying whether the reply was read out in full')
     assert.ok(method('settle').includes('generation !== this.generation'),
       'settling must not blank a newer reply')
   })
@@ -258,17 +267,26 @@ describe('the page speaks only a finished reply', () => {
     const body = pageFunction('speakWhenFinished')
     assert.ok(body.includes("block?.kind !== 'assistant'"), 'only assistant replies are spoken')
     assert.ok(body.includes('was !== true'), 'a block seen already finished must not be spoken')
-    // The key travels with the text: without it the button under that reply cannot become a stop
-    // control, and every message would look identical while one of them plays.
-    assert.ok(body.includes('speaker.speak(block.text, block.key)'),
-      'the raw block text and its key are what get spoken')
+    // The speaking itself is one function for both paths, so a reply the edge read and one the
+    // turn ending read cannot be read twice.
+    assert.ok(body.includes('speakReply(block)'), 'the edge hands the reply to the one speaker path')
   })
 
   it('leaves the button as the only way in when autoPlay is off', () => {
-    const body = pageFunction('speakWhenFinished')
+    const body = pageFunction('speakReply')
     assert.ok(body.includes('speaker.autoPlay'), 'the automatic path must consult autoPlay')
     assert.ok(body.includes('if (!speaker.autoPlay) return'),
       'autoPlay off must skip the automatic read entirely')
+  })
+
+  it('speaks the text with its key, and only once', () => {
+    // The key travels with the text: without it the button under that reply cannot become a stop
+    // control, and every message would look identical while one of them plays.
+    const body = pageFunction('speakReply')
+    assert.ok(body.includes('speaker.speak(text, key)'),
+      'the raw block text and its key are what get spoken')
+    assert.ok(body.includes('spokenText.get(key)'),
+      'a reply already read must not be read again by the other path')
   })
 
   it('fires the hook for every block update', () => {
@@ -281,6 +299,158 @@ describe('the page speaks only a finished reply', () => {
   it('remembers running per key so history reloads do not re-speak', () => {
     assert.ok(shellSource.includes('const speechRunningBefore = new Map()'),
       'the previous running state must be remembered per block')
+  })
+})
+
+describe('the turn ending reads an answer no edge did', () => {
+  /** Cut a top-level function out of the page module by brace matching; see `method` above. */
+  function pageFunction(name: string): string {
+    const head = shellSource.indexOf(`  function ${name}(`)
+    assert.notEqual(head, -1, `${name} is missing from shell.js`)
+    const open = shellSource.indexOf('{', paramListEnd(shellSource, head))
+    let depth = 0
+    for (let i = open; i < shellSource.length; i += 1) {
+      if (shellSource[i] === '{') depth += 1
+      else if (shellSource[i] === '}') {
+        depth -= 1
+        if (depth === 0) return shellSource.slice(head, i + 1)
+      }
+    }
+    throw new Error(`${name} never closes`)
+  }
+
+  interface ReplyBlock {
+    key: string
+    kind: string
+    text: string
+    running?: boolean
+  }
+
+  /**
+   * Run the speaking helpers the way the page runs them, against stubs.
+   *
+   * The state the page keeps — the running map, this turn's replies, the replies already read and
+   * the settle timers — is re-created here, so every case starts from a freshly loaded page. Feeding
+   * a block through `update` mirrors `upsertBlock`: the data is stored, the reply remembered, and the
+   * completion hook asked.
+   *
+   * `speakReply` reads the latest block one beat after being asked (the host coalesces updates on a
+   * timer, so the finished snapshot may still be a prefix), which is why every assertion below comes
+   * after `flush()`: no reading happens before that beat has passed.
+   */
+  function harness({ autoPlay = true } = {}) {
+    const spoken: Array<{ text: string; key: string }> = []
+    const captioned: Array<{ text: string; role: string }> = []
+    const blockData = new Map<string, ReplyBlock>()
+    const factory = new Function('deps', `
+      const { speaker, blockData, setTimeout, clearTimeout, pushBubble } = deps
+      const SPEECH_SETTLE_MS = 0
+      const speechRunningBefore = new Map()
+      const speechSettle = new Map()
+      const spokenText = new Map()
+      const turnReplies = []
+      ${pageFunction('rememberTurnReply')}
+      ${pageFunction('speakReply')}
+      ${pageFunction('speakWhenFinished')}
+      ${pageFunction('speakTurnReply')}
+      return { speakWhenFinished, speakTurnReply, rememberTurnReply }
+    `)
+    const page = factory({
+      speaker: {
+        autoPlay,
+        speak: (text: string, key: string) => { spoken.push({ text, key }) },
+      },
+      blockData,
+      setTimeout,
+      clearTimeout,
+      // Every finished reply also lands in the bubble as the ball's message (see
+      // `bubble-log.test.ts`); this file is about what reaches the speaker, so it is only counted.
+      pushBubble: (role: string, text: string) => { captioned.push({ text, role }) },
+    }) as {
+      speakWhenFinished: (block: ReplyBlock) => void
+      speakTurnReply: () => void
+    }
+    const update = (block: ReplyBlock) => {
+      blockData.set(block.key, block)
+      if (block.kind === 'assistant') (page as unknown as { rememberTurnReply: (key: string) => void }).rememberTurnReply(block.key)
+      page.speakWhenFinished(block)
+    }
+    /** Let the settle beat pass, so whatever was queued has been read out (or deliberately not). */
+    const flush = () => new Promise<void>((done) => setTimeout(done, 10))
+    return { page, spoken, captioned, blockData, update, flush }
+  }
+
+  it('reads the answer of a turn that called a tool before writing it', async () => {
+    // The shape the ball missed: reasoning, a tool call, then the answer as a *later* step's block.
+    // That last block can arrive already settled — the host settles it immediately but publishes
+    // its running state through a 60 ms timer — so the completion edge never fires.
+    const { page, spoken, update, flush } = harness()
+    update({ key: 'b:12:1:0', kind: 'reasoning', text: '先查一下', running: false })
+    update({ key: 'tool:call_1', kind: 'tool', text: 'code_agent', running: false })
+    update({ key: 'b:12:2:1', kind: 'assistant', text: '已经改好，也重新装上了。', running: false })
+    await flush()
+    assert.deepEqual(spoken, [], 'no completion edge reached the page, so nothing was read yet')
+
+    page.speakTurnReply()
+    await flush()
+    assert.deepEqual(spoken.map((read) => read.key), ['b:12:2:1'],
+      'the turn ending has to read the answer instead')
+
+    // The ending is reached twice in real use (the settled turn, then the fold re-publishing the
+    // answer), and the second one must not say it all again.
+    page.speakTurnReply()
+    await flush()
+    assert.deepEqual(spoken.map((read) => read.key), ['b:12:2:1'])
+  })
+
+  it('does not read a normal reply twice: the edge already did', async () => {
+    const { page, spoken, update, flush } = harness()
+    update({ key: 'b:9:1:1', kind: 'assistant', text: '好的，已经完成。', running: true })
+    update({ key: 'b:9:1:1', kind: 'assistant', text: '好的，已经完成。', running: false })
+    await flush()
+    assert.deepEqual(spoken.map((read) => read.key), ['b:9:1:1'],
+      'a reply seen running is read on its completion edge')
+    page.speakTurnReply()
+    await flush()
+    assert.deepEqual(spoken.map((read) => read.key), ['b:9:1:1'], 'and not a second time when the turn ends')
+  })
+
+  it('reads nothing from a turn that only called tools', async () => {
+    // No assistant prose: the ball must stay quiet rather than read a tool name or an old reply.
+    const { page, spoken, update, flush } = harness()
+    update({ key: 'tool:call_1', kind: 'tool', text: 'code_agent', running: false })
+    update({ key: 'tool:call_2', kind: 'tool', text: 'pwsh', running: true })
+    update({ key: 'tool:call_2', kind: 'tool', text: 'pwsh', running: false })
+    page.speakTurnReply()
+    await flush()
+    assert.deepEqual(spoken, [], 'a tool-only turn has no answer to read out')
+  })
+
+  it('says only the part that arrived after a partial reading', async () => {
+    // A snapshot that is still a prefix of the answer is read, and then the rest arrives: the
+    // remainder is spoken on its own rather than the whole reply being said again from the start.
+    const { spoken, update, flush } = harness()
+    update({ key: 'b:3:1:1', kind: 'assistant', text: '第一句。', running: true })
+    update({ key: 'b:3:1:1', kind: 'assistant', text: '第一句。', running: false })
+    await flush()
+    update({ key: 'b:3:1:1', kind: 'assistant', text: '第一句。第二句。', running: false })
+    await flush()
+    assert.deepEqual(spoken, [
+      { text: '第一句。', key: 'b:3:1:1' },
+      { text: '第二句。', key: 'b:3:1:1' },
+    ], 'the tail is what gets said, not the whole reply over again')
+  })
+
+  it('keeps the automatic path off when autoPlay is off', async () => {
+    const { page, spoken, captioned, update, flush } = harness({ autoPlay: false })
+    update({ key: 'b:12:2:1', kind: 'assistant', text: '已经改好，也重新装上了。', running: false })
+    page.speakTurnReply()
+    await flush()
+    assert.deepEqual(spoken, [], 'autoPlay off leaves the per-message button as the only way in')
+    // The bubble still repeats it: with the reading off the card is the only place the answer can
+    // be seen, and a caption is not a sound.
+    assert.deepEqual(captioned, [{ text: '已经改好，也重新装上了。', role: 'ball' }],
+      'the live line shows the reply whether or not it is read out')
   })
 })
 
@@ -415,7 +585,7 @@ describe('speaker configuration', () => {
     // `finally` in `run` is what guarantees it happens on every way out.
     assert.ok(method('settle').includes("this.currentKey = ''"),
       'finishing the queue must release the key')
-    assert.ok(method('run').includes('this.settle(generation)'),
+    assert.ok(method('run').includes('this.settle(generation, !incomplete)'),
       'and the queue is what has to call it, on every exit')
   })
 })

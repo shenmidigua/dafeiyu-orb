@@ -86,8 +86,48 @@ const CLOSE_NOTES_HEARD = [{ at: 0, freq: 1320, len: 0.1 }, { at: 0.12, freq: 88
  * the start cue, so "nothing reached me" cannot be mistaken for "done" even half-heard.
  */
 const CLOSE_NOTES_EMPTY = [{ at: 0, freq: 392, len: 0.09 }, { at: 0.16, freq: 294, len: 0.16 }]
+/**
+ * Open cue for a continuous turn: one bright, very short note — the "叮" of a radio opening its
+ * receiver. Higher than the wake chime and played at full scale: it also has to read from across
+ * a room, and too quiet it leaves the one question this cue exists to answer — "did it open?" —
+ * hanging.
+ */
+const OPEN_NOTES = [{ at: 0, freq: 1568, len: 0.08 }]
+/**
+ * Close cue for a continuous turn that heard nothing: one dull low note, the "嘟" that says the
+ * microphone is shut again. Deliberately not the two-knock empty cue above — that one reports a
+ * failed recording, and this one reports the end of a conversation that had already started.
+ */
+const SHUT_NOTES = [{ at: 0, freq: 440, len: 0.13 }]
+/**
+ * Cue peaks, doubled (+6 dB) from the levels the cues originally shipped with: the wake
+ * chime 0.44 -> 0.88, close 0.40/0.32 -> 0.80/0.64, open and shut 0.24 -> 0.48. These are
+ * the short cue tones; the spoken confirmation is separate and keeps `WAKE_VOICE_LEVEL` at
+ * unity so it is never boosted with them.
+ */
 
 const ORIGIN = 'dsh-wake://assets/'
+
+/**
+ * The spoken confirmation played on a fresh detection, in the ball's own TTS voice.
+ *
+ * Three takes of "我在" so the acknowledgement does not sound canned. They ship in the helper's
+ * own `assets/voices` folder and are served beside the models, which is why the page needs no
+ * second origin and no `file://` URL: `dsh-wake://assets/` is already on the page's `connect-src`.
+ *
+ * Exported because the tests and the packer both need the exact list: a clip that is renamed in
+ * one place has to be renamed in the other, or a wake quietly falls back to the chime.
+ */
+export const WAKE_VOICES = Object.freeze(['voices/c1.wav', 'voices/c2.wav', 'voices/c3.wav'])
+
+/**
+ * Peak gain of the spoken confirmation.
+ *
+ * The takes are mastered at about -3 dBFS, so unity is the level they were recorded at and nothing
+ * needs boosting. The sine cues are a different sound and are doubled on their own (see the
+ * cue note above); this constant stays at unity so the confirmation is never boosted with them.
+ */
+const WAKE_VOICE_LEVEL = 1
 
 /**
  * Wrap collected 16 kHz float frames into one PCM16 mono WAV file.
@@ -191,7 +231,8 @@ export class WakeEngine {
       keyword: 'hey_jarvis',
       threshold: 0.5,
       autoExpandOnWake: true,
-      dictation: { enabled: true, silenceMs: 1200, maxSeconds: 15, autoSend: false },
+      dictation: { enabled: true, silenceMs: 2200, maxSeconds: 15, autoSend: false },
+      continuous: { enabled: true, noSpeechSeconds: 6 },
     }
     this.state = 'disabled'
     this.detail = ''
@@ -228,22 +269,78 @@ export class WakeEngine {
     // while the microphone is open for an utterance; nothing else reads it.
     this.levels = new Float32Array(WAVE_BARS)
     this.levelCursor = 0
+    // Spoken confirmation, one slot per `WAKE_VOICES` entry, filled by `preloadVoices()`.
+    // `undefined` means "not fetched yet", while a `null` slot is a clip the helper would not
+    // serve — which is exactly what turns a missing file into the chime instead of an error.
+    this.voiceBlobs = undefined
+    this.voiceLoad = undefined
+    this.voiceAudio = undefined
   }
 
-  /** Tuning from the helper: keyword, threshold, what a detection does, and dictation. */
+  /**
+   * Tuning from the helper: keyword, threshold, what a detection does, and dictation.
+   *
+   * Every field is optional and is left alone when the message does not carry it. That is what makes
+   * a mid-session update possible: the settings page's silence slider sends `{ dictation }` on its
+   * own, and a partial payload that reset `autoExpandOnWake` (or the recorder's `maxSeconds`) would
+   * be the slider quietly changing two settings at once.
+   */
   configure(config) {
     if (config === null || typeof config !== 'object') return
     if (typeof config.keyword === 'string' && /^[a-z0-9_]+$/i.test(config.keyword)) this.config.keyword = config.keyword
     if (typeof config.threshold === 'number' && Number.isFinite(config.threshold)) {
       this.config.threshold = Math.min(0.99, Math.max(0.05, config.threshold))
     }
-    this.config.autoExpandOnWake = config.autoExpandOnWake !== false
-    if (config.dictation !== null && typeof config.dictation === 'object') this.config.dictation = config.dictation
+    if ('autoExpandOnWake' in config) this.config.autoExpandOnWake = config.autoExpandOnWake !== false
+    if (config.dictation !== null && typeof config.dictation === 'object') {
+      const block = config.dictation
+      const current = this.config.dictation
+      this.config.dictation = {
+        enabled: typeof block.enabled === 'boolean' ? block.enabled : current.enabled,
+        // Milliseconds, whatever the settings page shows: 0.3–10 s, rounded, never zero. A zero window
+        // would end the recording on its first frame and look like a microphone that never opens.
+        silenceMs: typeof block.silenceMs === 'number' && Number.isFinite(block.silenceMs)
+          ? Math.min(10_000, Math.max(300, Math.round(block.silenceMs)))
+          : current.silenceMs,
+        maxSeconds: typeof block.maxSeconds === 'number' && Number.isFinite(block.maxSeconds)
+          ? Math.min(120, Math.max(2, Math.round(block.maxSeconds)))
+          : current.maxSeconds,
+        autoSend: typeof block.autoSend === 'boolean' ? block.autoSend : current.autoSend,
+      }
+    }
+    if (config.continuous !== null && typeof config.continuous === 'object') {
+      this.config.continuous = {
+        enabled: config.continuous.enabled !== false,
+        noSpeechSeconds: typeof config.continuous.noSpeechSeconds === 'number'
+          && Number.isFinite(config.continuous.noSpeechSeconds)
+          ? Math.min(30, Math.max(2, config.continuous.noSpeechSeconds))
+          : 6,
+      }
+    }
+  }
+
+  /** The pause the next utterance will end on, milliseconds; the settings page's slider reads it back. */
+  silenceMs() {
+    return this.config.dictation.silenceMs
   }
 
   /** Whether a detection should open the ball's panel; the page asks instead of guessing. */
   autoExpand() {
     return this.config.autoExpandOnWake !== false
+  }
+
+  /**
+   * Where a detection sends the turn: the main window's composer, or this page's own panel.
+   *
+   * Read from the same block as the recorder's numbers, so a profile can move the wake back into
+   * the panel without a second setting. An older host sends no `target` at all, and the page has to
+   * treat that as `main` — that is what the hand-off is for, and the panel is the fallback only
+   * when the helper has no channel for it.
+   */
+  dictationTarget() {
+    return this.config.dictation !== null && this.config.dictation.target === 'panel'
+      ? 'panel'
+      : 'main'
   }
 
   /** Snapshot for the ball's own status line and for the helper's menu. */
@@ -282,6 +379,10 @@ export class WakeEngine {
     if (this.state === 'listening' || this.state === 'loading' || this.starting) return
     this.starting = true
     await this.publish('loading', '')
+    // Start the confirmation clips alongside the models: the clip has to be in memory by the
+    // first detection, and a fetch still in flight would leave the wake with nothing to play.
+    // A clip that cannot be fetched is recorded as `null`; nothing here can fail the start.
+    void this.preloadVoices()
     try {
       await this.load()
       // `load()` only resets the first time round — every later `enable()` finds the models
@@ -672,23 +773,43 @@ export class WakeEngine {
    * Resolves with a complete 16 kHz mono PCM16 WAV once the speaker has been quiet for
    * `silenceMs` after speaking, or with `undefined` when nothing was said, the recording
    * hit `maxSeconds`, or the engine stopped. The wake models are paused meanwhile.
-   * @param options - `{ silenceMs, maxSeconds }` from the host's `orb-wake.json`.
+   * @param {object} [options] — from the host's `orb-wake.json`; omitted fields come from the
+   *   tuning this engine was configured with, which is what lets the settings page's slider take
+   *   effect on the next utterance instead of the next launch.
+   * @param {number} [options.silenceMs] — silence after speech that ends the utterance.
+   * @param {number} [options.maxSeconds] — hard cap on one utterance.
+   * @param {number} [options.noSpeechMs] — how long an utterance that never starts speaking waits
+   *   before it gives up; this is the continuous conversation's quiet window.
+   * @param {'normal'|'continuous'} [options.cue] — which closing cue an empty recording gets. A
+   *   continuous turn plays a single low "shut" note; a normal one keeps the two knocks.
    * @returns the utterance as a WAV `ArrayBuffer`, or `undefined`.
    */
-  async dictate({ silenceMs = 1200, maxSeconds = 15 } = {}) {
+  async dictate(options = {}) {
+    const {
+      maxSeconds = this.config.dictation.maxSeconds,
+      noSpeechMs = DICTATION_NO_SPEECH_MS,
+      cue = 'normal',
+    } = options
+    // Milliseconds, from wherever it came: the caller's option, else the configured tuning. A
+    // non-finite value would make the frame count `NaN` and the recorder would never stop on
+    // silence, so it falls back rather than being trusted.
+    const silenceMs = Number.isFinite(options.silenceMs) ? options.silenceMs : this.config.dictation.silenceMs
     if (!this.running || this.dictation !== undefined) return undefined
     // Start the utterance's waveform empty: everything measured so far belongs to the
     // wake word and its chime, not to the sentence the ball is about to draw.
     this.resetLevels()
     const frameMs = (FRAME_SIZE / SAMPLE_RATE) * 1000
+    const quietWindow = Math.min(30_000, Math.max(1_500, Math.round(noSpeechMs)))
+    const silenceWindow = Math.min(10_000, Math.max(1, Math.round(silenceMs)))
     return await new Promise((resolve) => {
       this.dictation = {
         frames: [],
         heard: false,
         quiet: 0,
-        silenceFrames: Math.max(1, Math.round(silenceMs / frameMs)),
+        silenceFrames: Math.max(1, Math.round(silenceWindow / frameMs)),
         maxFrames: Math.max(1, Math.ceil((maxSeconds * 1000) / frameMs)),
-        noSpeechFrames: Math.max(1, Math.ceil(DICTATION_NO_SPEECH_MS / frameMs)),
+        noSpeechFrames: Math.max(1, Math.ceil(quietWindow / frameMs)),
+        cue: cue === 'continuous' ? 'continuous' : 'normal',
         resolve,
       }
     })
@@ -714,7 +835,20 @@ export class WakeEngine {
     // the next listen starts from silence and only a real wake word can arm the ball again.
     this.reset()
     const captured = state.heard && state.frames.length > 0
-    if (announce) this.playCloseTone(captured)
+    if (announce) {
+      if (captured) this.playCloseTone(true)
+      else if (state.cue === 'continuous') {
+        // The quiet window of a continuous turn ran out. The single low note says "the
+        // microphone is shut"; the two-knock empty cue would read as a failed recording.
+        this.playShutTone()
+        // The engine's `detected` state is held for a few seconds after the wake chime. A
+        // continuous turn is already over by now, so say "listening for the wake word" at the
+        // moment the cue sounds rather than leaving the badge on the old detection.
+        if (this.state === 'detected') void this.publish('listening', '')
+      } else {
+        this.playCloseTone(false)
+      }
+    }
     state.resolve(captured ? framesToWav(state.frames) : undefined)
   }
 
@@ -842,7 +976,7 @@ export class WakeEngine {
   }
 
   /**
-   * One detection: tone, event, visible state, then back to listening.
+   * One detection: confirmation, event, visible state, then back to listening.
    * @param score - the classifier score that fired.
    */
   async detected(score) {
@@ -856,27 +990,157 @@ export class WakeEngine {
   }
 
   /**
-   * Short confirmation tone for a fresh detection: the rising start cue.
+   * Confirmation for a fresh detection: one of the spoken "我在" takes, or the rising start cue
+   * when no take is available.
+   *
+   * The fallback is deliberately the chime rather than silence, at the doubled cue level: a wake that
+   * could not fetch its voice has to stay as audible as the other short cues. The
+   * promise is returned for the tests; `detected()` does not wait on playback.
+   * @returns whether a clip or the chime was started.
    */
   playChime() {
-    this.playNotes(START_NOTES, 0.22)
+    return this.playVoice().then((played) => {
+      if (!played) this.playNotes(START_NOTES, 0.88)
+    }).catch(() => {
+      this.playNotes(START_NOTES, 0.88)
+    })
+  }
+
+  /**
+   * Fetch the spoken confirmation clips once.
+   *
+   * The three takes are tens of KB each and come from this machine, so they are fetched when the
+   * engine starts rather than at detection: a play path that begins with a round trip would land
+   * the acknowledgement late at the one moment that has to feel immediate. A clip that is missing
+   * or fails becomes `null` and costs only itself.
+   * @returns one `Blob` or `null` per entry in `WAKE_VOICES`.
+   */
+  preloadVoices() {
+    if (this.voiceLoad !== undefined) return this.voiceLoad
+    this.voiceLoad = Promise.all(WAKE_VOICES.map(async (name) => {
+      try {
+        const response = await fetch(`${ORIGIN}${name}`)
+        if (!response.ok) return null
+        const blob = await response.blob()
+        return blob.size > 0 ? blob : null
+      } catch {
+        return null
+      }
+    })).then((blobs) => {
+      this.voiceBlobs = blobs
+      // An older helper does not serve the folder at all, which leaves every slot empty. Let a
+      // later `enable()` try again: the helper is restarted more often than this page, and the
+      // failure is not permanent.
+      if (blobs.every((blob) => blob === null)) this.voiceLoad = undefined
+      return blobs
+    })
+    return this.voiceLoad
+  }
+
+  /**
+   * Play one of the spoken confirmation clips.
+   *
+   * Deliberately a media element, the same way the reply reader plays service audio, rather than a
+   * WebAudio buffer: the takes are short PCM WAVs already in the browser's decode path. Returns
+   * `false` for every way a clip can be unavailable — not preloaded, missing from the helper, no
+   * media support, playback refused — so the caller can fall back to the chime. It never throws:
+   * the wake is already published by the time this runs, and a missing voice must not interrupt it.
+   * @returns whether a clip actually started.
+   */
+  async playVoice() {
+    const blobs = this.voiceBlobs
+    if (blobs === undefined) return false
+    // Uniform over the three takes. A missing slot is not swapped for another take: the user
+    // asked for a random version of the sentence, and the beep is the honest answer to "that
+    // version is not here".
+    const chosen = blobs[Math.floor(Math.random() * blobs.length)]
+    if (chosen === null || chosen === undefined) return false
+    let url
+    try {
+      if (typeof Audio !== 'function') return false
+      // A second wake while the last confirmation is still talking replaces it instead of
+      // layering two voices.
+      this.voiceAudio?.pause()
+      url = URL.createObjectURL(chosen)
+      const audio = new Audio(url)
+      audio.volume = WAKE_VOICE_LEVEL
+      this.voiceAudio = audio
+      const release = () => {
+        URL.revokeObjectURL(url)
+        if (this.voiceAudio === audio) this.voiceAudio = undefined
+      }
+      audio.addEventListener('ended', release)
+      audio.addEventListener('error', release)
+      await audio.play()
+      return true
+    } catch {
+      if (url !== undefined) URL.revokeObjectURL(url)
+      this.voiceAudio = undefined
+      return false
+    }
   }
 
   /**
    * Cue for a dictation that closed itself, so the end of a recording is as audible as its
-   * start and is never confused with it: falling when speech was captured, two low knocks
-   * when the recorder gave up on silence.
+   * start and is never confused with it: falling when speech was captured. An empty normal
+   * recording gets the two low knocks; an empty continuous one gets `playShutTone` instead,
+   * chosen by `finishDictation` from the recording's own cue.
    * @param captured - whether the finished utterance held any speech.
    */
   playCloseTone(captured) {
-    this.playNotes(captured ? CLOSE_NOTES_HEARD : CLOSE_NOTES_EMPTY, captured ? 0.2 : 0.16)
+    this.playNotes(captured ? CLOSE_NOTES_HEARD : CLOSE_NOTES_EMPTY, captured ? 0.8 : 0.64)
+  }
+
+  /** The microphone is reopening for the next turn: the short "叮" that starts listening. */
+  playOpenTone() {
+    // Full scale: request ducking off in the OS and this still has to be audible over a room, so
+    // nothing is held back here. 1.0 on a single sine is the loudest sample value with no clipping.
+    this.playNotes(OPEN_NOTES, 1)
+  }
+
+  /**
+   * Resolve when the spoken confirmation has finished, or at once when there is none.
+   *
+   * The main window records with its own microphone, in another process, and its echo cancellation
+   * cannot know about a clip this page is playing. Starting that recorder while "我在" is still
+   * talking would put the acknowledgement into the transcript — the sentence the user hears is the
+   * one thing the microphone must not hear. So the hand-off waits here, and only the acknowledgement
+   * delays it: no clip, no wait.
+   * @param timeoutMs - the longest wait, for a clip that never reports its end.
+   * @returns a promise that always settles.
+   */
+  whenVoiceDone(timeoutMs = 4000) {
+    const audio = this.voiceAudio
+    if (audio === undefined || audio === null) return Promise.resolve()
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        audio.removeEventListener('ended', finish)
+        audio.removeEventListener('error', finish)
+        clearTimeout(timer)
+        resolve()
+      }
+      // A second wake pauses this clip instead of ending it, and a pause fires neither event.
+      const timer = setTimeout(finish, Math.max(0, timeoutMs))
+      audio.addEventListener('ended', finish)
+      audio.addEventListener('error', finish)
+    })
+  }
+
+  /** A continuous turn heard nothing: the single low "嘟" that ends it and returns to the wake word. */
+  playShutTone() {
+    this.playNotes(SHUT_NOTES, 0.48)
   }
 
   /**
    * Play one short sequence of sine notes on its own AudioContext.
    *
-   * Deliberately a WebAudio tone and not speech: a spoken confirmation would be
-   * captured straight back in by the microphone and could be scored as speech.
+   * The cues stay tones rather than speech: they sound while the microphone is open, and a word
+   * there would be captured and could be scored as speech. The one spoken clip — the wake
+   * confirmation — runs at detection and relies on the echo cancellation `openMicrophone()` asks
+   * for, not on being inaudible.
    * @param notes - `{ at, freq, len }` in seconds, relative to the sequence start.
    * @param level - peak gain of the whole sequence.
    */

@@ -82,6 +82,10 @@ declare module 'electron' {
     setActivationPolicy?(policy: 'accessory'): void
     dock?: { hide(): void }
     on(event: 'before-quit' | 'window-all-closed', listener: () => void): void
+    /** Chromium switches read at startup; the ball uses it to let a spoken cue play without a gesture. */
+    commandLine: {
+      appendSwitch(name: string, value?: string): void
+    }
   }
 
   export interface MenuItemOptions {

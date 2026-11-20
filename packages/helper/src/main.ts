@@ -23,6 +23,7 @@ import {
   serveWakeAssets,
   wakeAvailable,
   WAKE_SCHEME,
+  type DictationConfig,
   type WakeConfig,
 } from './wake.ts'
 import { spokenName } from './wake-names.ts'
@@ -30,13 +31,34 @@ import { spokenName } from './wake-names.ts'
 const socketAddress = process.env.DSH_ORB_SOCKET ?? ''
 const token = process.env.DSH_ORB_TOKEN ?? ''
 const webPort = process.env.DSH_ORB_WEB_PORT ?? ''
+/**
+ * The helper's own asset folder.
+ *
+ * `main.js` runs from `lib/`, so this resolves to the sibling `assets/` in the workspace and to
+ * `dist/helper/assets/` in an installed package — the same base `loadFile` below uses. The spoken
+ * wake clips live in `assets/voices` and are served from here, not from the host's model folder.
+ */
+const assetsRoot = fileURLToPath(new URL('../assets', import.meta.url))
 
-/** Wake-word settings the host seeded at launch. */
-const wake: WakeConfig = readWakeConfig()
+/**
+ * Wake-word settings the host seeded at launch.
+ *
+ * Reassigned, not mutated in place: the host publishes the dictation block on every `chrome`
+ * message, because the settings page's silence slider can move it while the ball is up, and a value
+ * read only at launch would need a relaunch that drops the panel.
+ */
+let wake: WakeConfig = readWakeConfig()
 
 // The ball's page loads its ONNX models and the wasm runtime over a private scheme.
 // Privileges have to be declared before the app is ready.
 registerWakeScheme()
+
+// The wake confirmation is a media element now, and Chromium refuses to start one with sound until
+// the page has seen a user gesture. A profile that resumes listening at launch has seen none — the
+// wake word itself is not a gesture — so the helper opts its own window out of that gate. Every
+// sound this process makes is one the user asked the ball to make, and the switch is process-wide,
+// which is the same page the reply reader plays in.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 
 /** Theme preference as stored by the official ui-theme settings section. */
 type ThemeSource = 'light' | 'dark' | 'system'
@@ -50,10 +72,45 @@ interface ChromeState {
   overlay: MenuSelection
   background: MenuSelection
   millifractionEnabled: boolean
+  reply: ReplySettings
   wakeEnabled: boolean
+  /**
+   * The recorder's tuning, when the message carried one.
+   *
+   * `undefined` means the host is older than this field or the message was malformed, and the launch
+   * value has to stand — as opposed to an empty object, which would reset the pause to something the
+   * user never chose.
+   */
+  dictation?: DictationConfig
   openMain: boolean
   catalog: MenuCatalog
   speech: SpeechSettings
+  chime: ChimeSettings
+}
+
+/**
+ * Hourly-chime settings pushed in every `chrome` message.
+ *
+ * The file behind them is `orb-chime.json` on the host; the menu flips `enabled`, and the quiet
+ * window is a hand edit. The defaults here must match `CHIME_DEFAULTS` in `assets/chime.js` and
+ * `CHIME_DEFAULTS` in the host's `preferences.ts`: the page starts on those before the first
+ * message lands, and a mismatch would chime once where the profile said silence.
+ */
+interface ChimeSettings {
+  enabled: boolean
+  quietFrom: number
+  quietTo: number
+}
+
+/**
+ * Terse-reply switch mirrored from the profile, plus the cap it enforces.
+ *
+ * The host owns the file (`orb-reply.json`); the helper only draws the row and names the cap, so a
+ * missing field means "keep what the last `chrome` message said" rather than an invented number.
+ */
+interface ReplySettings {
+  enabled: boolean
+  maxReplyChars: number
 }
 
 /**
@@ -79,10 +136,14 @@ let chrome: ChromeState = {
   overlay: defaultSelection,
   background: defaultSelection,
   millifractionEnabled: false,
+  // Matches `REPLY_DEFAULTS` on the host: a profile with no `orb-reply.json` is minimal replies on,
+  // eighty characters, so the row is checked before the first `chrome` message lands.
+  reply: { enabled: true, maxReplyChars: 80 },
   wakeEnabled: false,
   openMain: false,
   catalog: { groups: [] },
   speech: { enabled: false, autoPlay: false, endpoint: 'http://127.0.0.1:8765' },
+  chime: { enabled: true, quietFrom: 0, quietTo: 7 },
 }
 /**
  * Whether the profile wants wake-word detection on, and whether this helper can honour
@@ -152,7 +213,7 @@ app.on('window-all-closed', () => {
 void app.whenReady().then(async () => {
   if (process.platform === 'darwin') app.dock?.hide()
   wakeReady = wakeAvailable(wake)
-  serveWakeAssets(wake)
+  serveWakeAssets(wake, assetsRoot)
   win = openWindow()
   try {
     overlays = await attachOverlays({ ball: () => win, write })
@@ -173,6 +234,9 @@ void app.whenReady().then(async () => {
     // Same for the balance: the host reads it on its own cadence, so the page that has just loaded
     // can easily be older than the reading.
     pushBalance()
+    // And for the chime: a page that reloads resets to the shipped defaults, and the switch the
+    // profile actually holds has to be the one it runs on.
+    if (win && !win.isDestroyed()) win.webContents.send('orb:chime', chrome.chime)
     // A profile that already had wake on resumes listening as soon as the page is up.
     if (wakeWanted && wakeReady) void enableWake()
   })
@@ -532,6 +596,24 @@ ipcMain.on('orb:stop', (event) => {
   write({ type: 'stop' })
 })
 
+// ── main-window voice ────────────────────────────────────────────────────────
+//
+// The wake path belongs to the black panel again, so the page does not call these. The hand-off
+// is kept whole: a page that does call it makes the host remember the request, the main DSH
+// window's page press its own microphone button, and the limits and send decision stay the same
+// as the ball's (see `takeMainVoice` in host/src/orb.ts). The page reaches the host on the normal
+// web port, so these two messages only ever travel over the helper socket.
+ipcMain.on('orb:main-voice', (event) => {
+  if (!fromBall(event)) return
+  noteWakeHandOff('wake: the ball asked for the main window\'s microphone')
+  write({ type: 'main-voice-start' })
+})
+
+ipcMain.on('orb:open-main', (event) => {
+  if (!fromBall(event)) return
+  write({ type: 'open-main' })
+})
+
 // Renderer clipboard APIs need a focused document; the ball rests unfocused,
 // so writes go through the main process, which has no such gate.
 ipcMain.on('orb:copy', (event, text) => {
@@ -629,6 +711,22 @@ async function noteToolFaceRequest(name: unknown, answer: unknown): Promise<void
     appendFileSync(path, `${new Date().toISOString()} asked=${JSON.stringify(name)} answered=${src === null ? 'null' : `${String(src).length} chars`}\n`)
   } catch {
     // A readout that cannot be written is not a reason to change what the ball wears.
+  }
+}
+
+/**
+ * Record one wake hand-off where a human can read it.
+ *
+ * A wake that opens no microphone has four possible breaks — the ball never asked, the ask never
+ * reached the host, the page never collected, or the page collected and failed — and from the
+ * outside all four look like "nothing happened". This is the ball's end of that chain; the host's
+ * end writes to the same file.
+ */
+function noteWakeHandOff(line: string): void {
+  try {
+    appendFileSync(join(app.getPath('home'), '.dsh', 'dsh-orb', 'stream.log'), `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    // As above: a readout that cannot be written must not change what the ball does.
   }
 }
 
@@ -932,10 +1030,30 @@ function deliver(message: unknown): void {
     return
   }
   if (record.type === 'chrome') {
+    const wantedWake = (record as { wakeEnabled?: unknown }).wakeEnabled
     chrome = readChrome(record)
+    // The ball's own menu is not the only place the switch lives any more: the main window's
+    // composer has one too, and a flip there has to reach the engine now rather than at the next
+    // launch. `wakeWanted` is what the page was told, so only a real change acts — the host mirrors
+    // this process's own `set-wake` back in every `chrome` message, and acting on that would send
+    // the same enabled/disabled notice a second time.
+    if (wantedWake === true && !wakeWanted) enableWake()
+    else if (wantedWake === false && wakeWanted) disableWake()
+    // The recorder is tuned from the settings page while the ball is up, so the block travels with
+    // every chrome message and is handed straight to the page: the next utterance ends on it, with
+    // no relaunch and no menu round-trip. `wake.dictation` is the launch value until this lands, and
+    // `wakePayload()` reads it back for a page that reloads in the meantime.
+    if (chrome.dictation !== undefined) {
+      wake = { ...wake, dictation: chrome.dictation }
+      if (win && !win.isDestroyed()) win.webContents.send('orb:wake', { type: 'tuning', dictation: chrome.dictation })
+    }
     // Straight to the page: the read-aloud buttons have to appear and disappear as the settings
     // page flips the switch, with no reload and no menu round-trip.
     if (win && !win.isDestroyed()) win.webContents.send('orb:speech', chrome.speech)
+    // The hourly chime's switch and quiet window. The page owns the timer, so a flip in the menu
+    // has to reach it now: turning the chime on speaks a sample immediately, and that is the only
+    // proof the user gets without waiting for the next hour.
+    if (win && !win.isDestroyed()) win.webContents.send('orb:chime', chrome.chime)
     return
   }
   if (record.type === 'appearance') {
@@ -1108,6 +1226,7 @@ function wakePayload(enabled: boolean): Record<string, unknown> {
     threshold: wake.threshold,
     autoExpandOnWake: wake.autoExpandOnWake,
     dictation: wake.dictation,
+    continuous: wake.continuous,
     origin: `${WAKE_SCHEME}://assets/`,
   }
 }
@@ -1279,21 +1398,71 @@ function readChrome(value: unknown): ChromeState {
     overlay?: MenuSelection
     background?: MenuSelection
     millifractionEnabled?: unknown
+    reply?: unknown
     wakeEnabled?: unknown
+    dictation?: unknown
     openMain?: unknown
     catalog?: MenuCatalog
     speech?: unknown
+    chime?: unknown
   }
   return {
     overlay: selectionOr(record.overlay, chrome.overlay),
     background: selectionOr(record.background, chrome.background),
     millifractionEnabled: record.millifractionEnabled === true,
-    // Informational only: the ball's menu owns the switch, and it has already told
-    // the host about every change, so the host's value just mirrors it back.
-    wakeEnabled: chrome.wakeEnabled,
+    reply: readReply(record.reply, chrome.reply),
+    // The main window's composer owns a switch as well now, so this is no longer a mirror of what
+    // the ball's menu said: it is whichever of the two last asked, and the `chrome` handler above
+    // acts on it.
+    wakeEnabled: typeof record.wakeEnabled === 'boolean' ? record.wakeEnabled : chrome.wakeEnabled,
+    dictation: readDictationMessage(record.dictation),
     openMain: record.openMain === true,
     catalog: record.catalog ?? { groups: [] },
     speech: readSpeech(record.speech, chrome.speech),
+    chime: readChime(record.chime, chrome.chime),
+  }
+}
+
+/**
+ * The dictation block from the host, field by field, or `undefined` when it sent none.
+ *
+ * Per-field for the same reason as {@link readSpeech}: an older host sends nothing and the launch
+ * value keeps standing, while a partial update must not reset the fields it did not mention. The
+ * clamp mirrors the host's own, so a hand-edited out-of-range `silenceMs` is bounded here too rather
+ * than reaching the recorder as a window of zero frames.
+ */
+function readDictationMessage(value: unknown): DictationConfig | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as { enabled?: unknown; silenceMs?: unknown; maxSeconds?: unknown; autoSend?: unknown; target?: unknown }
+  const fallback = wake.dictation
+  return {
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : fallback.enabled,
+    silenceMs: typeof record.silenceMs === 'number' && Number.isFinite(record.silenceMs)
+      ? Math.min(10_000, Math.max(300, Math.round(record.silenceMs)))
+      : fallback.silenceMs,
+    maxSeconds: typeof record.maxSeconds === 'number' && Number.isFinite(record.maxSeconds)
+      ? Math.min(120, Math.max(2, Math.round(record.maxSeconds)))
+      : fallback.maxSeconds,
+    autoSend: typeof record.autoSend === 'boolean' ? record.autoSend : fallback.autoSend,
+    target: record.target === 'panel' ? 'panel' : fallback.target,
+  }
+}
+
+/**
+ * Reply settings from the host, each field falling back independently.
+ *
+ * Per-field for the same reason as {@link readSpeech}: an older host sends nothing and the row
+ * keeps the shipped defaults, while a partial update does not reset the other field.
+ */
+function readReply(value: unknown, fallback: ReplySettings): ReplySettings {
+  if (typeof value !== 'object' || value === null) return fallback
+  const record = value as { enabled?: unknown; maxReplyChars?: unknown }
+  const cap = typeof record.maxReplyChars === 'number' && Number.isFinite(record.maxReplyChars)
+    ? Math.round(record.maxReplyChars)
+    : fallback.maxReplyChars
+  return {
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : fallback.enabled,
+    maxReplyChars: cap > 0 ? cap : fallback.maxReplyChars,
   }
 }
 
@@ -1317,6 +1486,27 @@ function readSpeech(value: unknown, fallback: SpeechSettings): SpeechSettings {
   }
 }
 
+/**
+ * Chime settings from the host, each field falling back independently.
+ *
+ * The quiet window is clamped to 0–24 here as well as on the host, because the row draws its
+ * numbers straight from this record: an out-of-range value from a hand-edited file would be
+ * printed in the menu before the page ever had a chance to correct it.
+ */
+function readChime(value: unknown, fallback: ChimeSettings): ChimeSettings {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return fallback
+  const record = value as { enabled?: unknown; quietFrom?: unknown; quietTo?: unknown }
+  const hour = (candidate: unknown, current: number): number =>
+    typeof candidate === 'number' && Number.isFinite(candidate)
+      ? Math.min(24, Math.max(0, Math.round(candidate)))
+      : current
+  return {
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : fallback.enabled,
+    quietFrom: hour(record.quietFrom, fallback.quietFrom),
+    quietTo: hour(record.quietTo, fallback.quietTo),
+  }
+}
+
 function selectionOr(value: MenuSelection | undefined, fallback: MenuSelection): MenuSelection {
   if (!value || typeof value.provider !== 'string' || typeof value.model !== 'string') return fallback
   return value
@@ -1328,6 +1518,15 @@ async function showMenu(window: BrowserWindow): Promise<void> {
     overlay: chrome.overlay,
     background: chrome.background,
     millifractionEnabled: chrome.millifractionEnabled,
+    replyEnabled: chrome.reply.enabled,
+    replyMaxChars: chrome.reply.maxReplyChars,
+    chimeEnabled: chrome.chime.enabled,
+    chimeQuietFrom: chrome.chime.quietFrom,
+    chimeQuietTo: chrome.chime.quietTo,
+    // The chime is spoken by the read-aloud service, so the row needs it: without one there is
+    // nothing to speak the time, and a checked row that does nothing is the failure this label
+    // exists to avoid.
+    speechEnabled: chrome.speech.enabled,
     wakeEnabled: wakeWanted && wakeReady,
     wakeAvailable: wakeReady,
     wakeWord: spokenName(wake.keyword),
@@ -1339,6 +1538,8 @@ async function showMenu(window: BrowserWindow): Promise<void> {
     setOverlay: (selection) => { write({ type: 'set-overlay', selection }) },
     setBackground: (selection) => { write({ type: 'set-background', selection }) },
     setMillifraction: (enabled) => { void confirmMillifraction(window, enabled) },
+    setReply: (enabled) => { write({ type: 'set-reply', enabled }) },
+    setChime: (enabled) => { write({ type: 'set-chime', enabled }) },
     setWake: (enabled) => { if (enabled) enableWake(); else disableWake() },
     dictate: () => {
       if (win && !win.isDestroyed()) win.webContents.send('orb:dictate')

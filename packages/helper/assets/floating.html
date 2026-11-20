@@ -10,6 +10,13 @@
     <link rel="stylesheet" href="chat.css">
   </head>
   <body>
+    <!-- The panel is a reply bubble since 2026-11-20: the conversation itself lives in the main
+         window, so this card only shows the ball's latest reply (plus an agent's question, which
+         is the one thing that still has to be answered here). The chat chrome below — history,
+         permission chip, new-conversation, the TCC sheet, the selection chip and the composer —
+         is hidden by the block at the end of floating.css, not deleted from here: shell.js
+         addresses every one of these ids at startup, and a missing node would take the whole page
+         down. To get the old panel back, delete that CSS block; nothing in this file has to change. -->
     <section id="panel" hidden>
       <button id="history" type="button" aria-pressed="false">
         <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
@@ -28,6 +35,10 @@
       </div>
       <button id="new-conversation" type="button">+</button>
       <div id="transcript" role="log" aria-live="polite"></div>
+      <!-- 对话记录（2026-11-20）：气泡里那张一左一右的聊天。对话本身在主窗口进行，球这边只把
+           "我听到你说的是这句"和"它刚说的是这句"重新排成两列——你说的靠右，它说的靠左，像微信。
+           行由 shell.js 动态插入（没有静态子节点），空的时候 hidden，所以气泡收起时和以前一样。 -->
+      <div id="bubble-log" role="log" aria-live="polite" hidden></div>
       <div id="question" hidden>
         <div class="question-card">
           <header class="question-heading">

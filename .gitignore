@@ -105,3 +105,12 @@ dsh-voice-dialog/assets/*.onnx.*.bak
 # onnxruntime-web runtime (MIT, fetched from CDN — not source)
 dsh-voice-dialog/assets/ort/
 dsh-voice-dialog/logs/
+
+# Local-only copies kept beside the work while it was in progress: a pre-change snapshot of the
+# cue pack and of the voices, and dated backups from a couple of experiments. The originals they
+# were copied from are in the repository, so these are weight and nothing else. (Added 2026-11-20.)
+.backup/
+dsh_orb/assets-orig/
+dsh_orb/voices-orig/
+dsh_orb/backup-*/
+*.bak-vol2

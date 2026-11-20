@@ -150,6 +150,37 @@ describe('profile preferences', () => {
     assert.equal(new ProfileStore(path).speech().autoPlay, false)
   })
 
+  it('turns the hourly chime on by default, with night silent', () => {
+    // On is the shipped answer: the ball already speaks, and a chime nobody ever heard is a feature
+    // that cannot be judged. The 0–7 window is what keeps the first night from switching it off.
+    const path = dir('chime')
+    const store = new ProfileStore(path)
+    assert.deepEqual(store.chime(), { enabled: true, quietFrom: 0, quietTo: 7 })
+
+    // The menu flips only the switch; the window is a hand edit and has to survive the rewrite.
+    store.setChime({ enabled: false })
+    assert.deepEqual(new ProfileStore(path).chime(), { enabled: false, quietFrom: 0, quietTo: 7 })
+    assert.deepEqual(JSON.parse(readFileSync(join(path, 'orb-chime.json'), 'utf8')), {
+      enabled: false,
+      quietFrom: 0,
+      quietTo: 7,
+    })
+    store.setChime({ quietFrom: 22, quietTo: 6 })
+    assert.deepEqual(new ProfileStore(path).chime(), { enabled: false, quietFrom: 22, quietTo: 6 })
+  })
+
+  it('clamps the chime window instead of trusting a hand edit', () => {
+    // 31 is not an hour: stored as-is it would look like a window that silences everything while
+    // silencing nothing, and 24 is the only sane reading of "the end of the day".
+    const path = dir('chime-broken')
+    writeFileSync(join(path, 'orb-chime.json'), JSON.stringify({
+      enabled: 'yes',
+      quietFrom: 31,
+      quietTo: -4,
+    }))
+    assert.deepEqual(new ProfileStore(path).chime(), { enabled: true, quietFrom: 24, quietTo: 0 })
+  })
+
   it('accepts only http and https speech endpoints', () => {
     assert.equal(isSpeechEndpoint('http://127.0.0.1:8765'), true)
     assert.equal(isSpeechEndpoint('https://tts.example.com'), true)
@@ -212,7 +243,23 @@ describe('profile preferences', () => {
 describe('wake preferences', () => {
   it('keeps the shipped dictation defaults while nothing is configured', () => {
     const store = new ProfileStore(dir('wake-empty'))
-    assert.deepEqual(store.wake().dictation, { enabled: true, silenceMs: 1200, maxSeconds: 15, autoSend: false })
+    assert.deepEqual(store.wake().dictation, { enabled: true, silenceMs: 2500, maxSeconds: 15, autoSend: false, target: 'main' })
+    assert.deepEqual(store.wake().continuous, { enabled: true, noSpeechSeconds: 6 })
+  })
+
+  it('clamps the continuous quiet window and keeps it when the wake switch is rewritten', () => {
+    const path = dir('continuous-file')
+    writeFileSync(join(path, 'orb-wake.json'), JSON.stringify({
+      enabled: true,
+      continuous: { enabled: false, noSpeechSeconds: 1 },
+    }))
+    const store = new ProfileStore(path)
+    assert.deepEqual(store.wake().continuous, { enabled: false, noSpeechSeconds: 2 },
+      'the quiet window is clamped to the range the engine accepts')
+    store.setWakeEnabled(false)
+    const written = JSON.parse(readFileSync(join(path, 'orb-wake.json'), 'utf8')) as { continuous?: unknown }
+    assert.deepEqual(written.continuous, { enabled: false, noSpeechSeconds: 2 },
+      'rewriting the wake switch must not drop the continuous block')
   })
 
   it('clamps the dictation block and survives a rewrite of the switch', () => {
@@ -223,13 +270,13 @@ describe('wake preferences', () => {
       dictation: { enabled: false, silenceMs: 1, maxSeconds: 9999, autoSend: true },
     }))
     const store = new ProfileStore(path)
-    assert.deepEqual(store.wake().dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true })
+    assert.deepEqual(store.wake().dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true, target: 'main' })
     store.setWakeEnabled(false)
     const reread = new ProfileStore(path).wake()
     assert.equal(reread.enabled, false)
-    assert.deepEqual(reread.dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true })
+    assert.deepEqual(reread.dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true, target: 'main' })
     const written = JSON.parse(readFileSync(join(path, 'orb-wake.json'), 'utf8')) as { dictation?: unknown }
-    assert.deepEqual(written.dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true })
+    assert.deepEqual(written.dictation, { enabled: false, silenceMs: 300, maxSeconds: 120, autoSend: true, target: 'main' })
   })
 
   it('re-reads the file before flipping the switch, so an outside edit is not undone', () => {
@@ -280,6 +327,66 @@ describe('wake preferences', () => {
     const reread = new ProfileStore(path).wake()
     // 5 is above the 0.99 ceiling, so it clamps down to it rather than being taken literally.
     assert.equal(reread.threshold, 0.99, 'an out-of-range threshold survived the round trip')
-    assert.deepEqual(reread.dictation, { enabled: true, silenceMs: 300, maxSeconds: 120, autoSend: false })
+    assert.deepEqual(reread.dictation, { enabled: true, silenceMs: 300, maxSeconds: 120, autoSend: false, target: 'main' })
+  })
+
+  it('moves only the silence window and leaves the rest of the file as it stands', () => {
+    // What the settings page's slider calls. A profile written by hand can carry a keyword, an
+    // asset directory and a `maxSeconds` the page has no UI for; saving the pause must not reset
+    // any of them, and must land in the file the helper reads at launch rather than in memory only.
+    const path = dir('silence-write')
+    const file = join(path, 'orb-wake.json')
+    writeFileSync(file, JSON.stringify({
+      enabled: true,
+      keyword: 'dafeiyu',
+      threshold: 0.95,
+      assetDirectory: 'C:/models/assets',
+      autoExpandOnWake: false,
+      dictation: { enabled: true, silenceMs: 2200, maxSeconds: 20, autoSend: true },
+      continuous: { enabled: false, noSpeechSeconds: 9 },
+    }))
+    const store = new ProfileStore(path)
+
+    store.setDictationSilence(3500)
+
+    assert.equal(store.wake().dictation.silenceMs, 3500, 'the in-memory value the menu reads')
+    const written = JSON.parse(readFileSync(file, 'utf8')) as {
+      keyword: string
+      threshold: number
+      assetDirectory: string
+      autoExpandOnWake: boolean
+      dictation: Record<string, unknown>
+      continuous: Record<string, unknown>
+    }
+    assert.equal(written.dictation.silenceMs, 3500)
+    assert.equal(written.dictation.maxSeconds, 20, 'a recorder cap the page has no UI for was reset')
+    assert.equal(written.dictation.autoSend, true)
+    assert.equal(written.keyword, 'dafeiyu')
+    assert.equal(written.threshold, 0.95)
+    assert.equal(written.assetDirectory, 'C:/models/assets')
+    assert.equal(written.autoExpandOnWake, false)
+    assert.deepEqual(written.continuous, { enabled: false, noSpeechSeconds: 9 })
+
+    // Round numbers and out-of-band values settle inside the range `readWake` accepts, so the slider
+    // can never store something the next read would silently replace — and nothing lands on zero.
+    store.setDictationSilence(0)
+    assert.equal(store.wake().dictation.silenceMs, 300)
+    store.setDictationSilence(99_000)
+    assert.equal(store.wake().dictation.silenceMs, 10_000)
+    store.setDictationSilence(1234.6)
+    assert.equal(store.wake().dictation.silenceMs, 1235)
+    assert.equal(new ProfileStore(path).wake().dictation.silenceMs, 1235)
+  })
+
+  it('falls back to 2.5 s when the stored pause is missing or unusable', () => {
+    // "Not set yet" must be the shipped default, never zero: a zero window ends the recording on
+    // its first frame, which the user experiences as a microphone that never opens.
+    const unusable = [undefined, {}, { silenceMs: null }, { silenceMs: '2.2' }, { silenceMs: Number.NaN }]
+    for (const [index, dictation] of unusable.entries()) {
+      const path = dir(`silence-fallback-${index}`)
+      writeFileSync(join(path, 'orb-wake.json'), JSON.stringify({ enabled: true, dictation }))
+      const store = new ProfileStore(path)
+      assert.equal(store.wake().dictation.silenceMs, 2500, `dictation ${JSON.stringify(dictation)}`)
+    }
   })
 })

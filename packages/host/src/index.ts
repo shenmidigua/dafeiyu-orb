@@ -9,6 +9,7 @@ import { registerOrbRoutes } from './routes.ts'
 import { installOrbServices, watchOrbPermissions } from './services.ts'
 import { watchAppearance } from './appearance.ts'
 import { OrbRuntime, type OrbContext } from './orb.ts'
+import { registerReplyStyle } from './reply-style.ts'
 
 /** Cordis plugin name. */
 export const name = 'orb-host'
@@ -21,6 +22,7 @@ export const inject = [
   'workspaceController',
   'sessions',
   'agentDefaultModel',
+  'systemPrompt',
 ]
 
 export type { OrbContext }
@@ -42,6 +44,9 @@ export function apply(ctx: OrbContext, config: { autoStart?: boolean } = {}): vo
     const detachQuestions = runtime.attachQuestions()
     const detachPermissions = watchOrbPermissions(ctx, store)
     const detachRoutes = registerOrbRoutes({ ctx, store, tcc, control: runtime })
+    // The terse-reply contract is a prompt section rather than a preset persona: it belongs to
+    // the ball's sessions only, and a section provider is told which agent it is assembling for.
+    const detachReplyStyle = registerReplyStyle(ctx, store)
     // Theme and locale follow the official settings document; a missing
     // settings service leaves the ball on its system defaults.
     const detachAppearance = watchAppearance(ctx, (appearance) => { runtime.setAppearance(appearance) })
@@ -55,6 +60,7 @@ export function apply(ctx: OrbContext, config: { autoStart?: boolean } = {}): vo
       detachQuestions()
       detachPermissions()
       detachRoutes()
+      detachReplyStyle()
       detachAppearance()
       runtime.halt()
     }

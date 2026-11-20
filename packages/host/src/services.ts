@@ -6,7 +6,8 @@ import { isAbsolute, relative, resolve } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { isPermissionPreset, type PermissionPreset, type ProfileStore } from './preferences.ts'
 
-interface SessionLike {
+/** The parts of a session header this plugin reads. */
+export interface SessionLike {
   readonly header?: {
     readonly cwd?: string
     readonly agentPreset?: string
@@ -63,7 +64,16 @@ function pinSession(ctx: { get(name: string): unknown }, session: SessionLike, p
   }
 }
 
-function isOrbSession(session: SessionLike): boolean {
+/**
+ * Whether a session belongs to the ball: a Computer Use or background standard session whose
+ * workspace sits inside the orb's own `dsh_orb` folder.
+ *
+ * Exported because the reply-style contract gates on exactly this — "the ball's sessions" must
+ * mean one thing in the plugin, not two approximations of it.
+ * @param session - session or anything with a header.
+ * @returns true for sessions the ball owns.
+ */
+export function isOrbSession(session: SessionLike): boolean {
   const preset = session.header?.agentPreset
   const cwd = session.header?.cwd
   if ((preset !== 'computer-use' && preset !== 'standard') || cwd === undefined) return false

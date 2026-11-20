@@ -20,14 +20,18 @@ import { helperMain } from './helper-path.ts'
 import { openMainWindow } from './open-main.ts'
 import { isDesktopHost, isTccRight, TccMonitor, type TccRight, type TccStatus } from './tcc.ts'
 import {
+  DICTATION_NO_SPEECH_MS,
   isAgentModelSelection,
   isPermissionPreset,
+  MAX_SILENCE_MS,
+  MIN_SILENCE_MS,
   type AgentModelSelection,
+  type ChimeSettings,
   type PermissionPreset,
   type ProfileStore,
   type SpeechSettings,
 } from './preferences.ts'
-import { tokensMatch } from './routes.ts'
+import { tokensMatch, type MainVoiceCommand } from './routes.ts'
 import { createOverlayGuard } from './overlay-guard.ts'
 import {
   openSystemUrl,
@@ -35,7 +39,7 @@ import {
   SelectionController,
   type SelectionStarter,
 } from './selection.ts'
-import { pinSessionId } from './services.ts'
+import { pinSessionId, type SessionLike } from './services.ts'
 import { selectModelKeepDefault } from './select-model.ts'
 import { resolveWakeAssets } from './wake-assets.ts'
 import { createTranscriber } from './transcribe.ts'
@@ -58,8 +62,44 @@ const BALANCE_POLL_MS = 60 * 60_000
  * while an answer streams; anything faster is an IPC message per token for no visible gain.
  */
 const ORB_STREAM_CUE_MS = 1000
+/**
+ * The shortest gap between two "these are the words being written over there" messages.
+ *
+ * The bubble's live line shows what the main window is writing, and a line that changes ten times a
+ * second is unreadable — but a line that changes once a second loses words. 120 ms is roughly one
+ * sentence arriving per message: the page appends every message it gets to the line it is holding,
+ * so nothing is dropped, only coalesced.
+ */
+const ORB_OTHER_TEXT_MS = 120
+/** How much of one conversation's words the live line carries: the newest end of the answer. */
+const ORB_OTHER_TEXT_CHARS = 600
 /** How often the stream from another conversation is summarised in the log while it lasts. */
 const ORB_STREAM_LOG_MS = 15_000
+/**
+ * How long a wake-word hand-off waits for the main window's page to poll for it.
+ *
+ * The page polls five times a second while it is open, because a wake should open the microphone
+ * on the same breath as the word that caused it. A hand-off older than this is dropped rather
+ * than pressed later: the user has moved on, and a microphone opening on its own minutes after
+ * the wake would record a room the user forgot about. The page consumes the hand-off on its own
+ * first poll, so this only bounds the case where no page is open at all.
+ */
+const MAIN_VOICE_TTL_MS = 15_000
+/**
+ * How long the main window's microphone may wait for the first word, milliseconds.
+ *
+ * The value lives in `./preferences.ts` because the composer's microphone route also hands it to
+ * the page; this alias keeps every reader of the hand-off on one name.
+ */
+const MAIN_VOICE_NO_SPEECH_MS = DICTATION_NO_SPEECH_MS
+/**
+ * The gap a continuous exchange leaves between a finished reply and the next microphone.
+ *
+ * Short because the page announces the reopening with a cue of its own: the beat that used to let
+ * a person notice they were being listened to is the "叮" at the start of the turn, not silence.
+ * All this needs to cover is the page seeing the stop button gone — a DOM update, not a sentence.
+ */
+const MAIN_VOICE_FOLLOW_UP_MS = 150
 
 /** Host services the plugin injects. Shapes match the official 0.1.7-rc.2 controllers. */
 export interface OrbContext {
@@ -109,6 +149,17 @@ export interface OrbContext {
       snapshotEvents(): readonly { readonly type: string; readonly seq: number; readonly data: unknown }[]
       readonly header?: { readonly cwd?: string; readonly agentPreset?: string }
     } | undefined
+  }
+  /**
+   * The prompt registry. The terse-reply contract registers one section here; `./reply-style.ts`
+   * owns the text and the session gate.
+   */
+  readonly systemPrompt: {
+    section(section: {
+      readonly name: string
+      readonly order: number
+      readonly text: (context: { readonly agent?: { readonly session?: SessionLike } }) => string
+    }): () => void
   }
   readonly agentDefaultModel?: {
     currentSelection(): {
@@ -267,6 +318,16 @@ export class OrbRuntime {
   private readonly seenChunkKinds = new Set<string>()
   /** The last tool name announced for another conversation, so a change in it is never throttled away. */
   private otherStreamTool: string | undefined
+  /**
+   * Words from a conversation that is not this ball's, waiting for the coalescing timer.
+   *
+   * Another conversation's prose used to reach the page as nothing but a face cue — *that* words
+   * were arriving, never which. The bubble needs the words themselves now (see `#bubble-line` in
+   * `assets/floating.html`), and this is the one place they are collected: appended per delta, sent
+   * as one message every {@link ORB_OTHER_TEXT_MS}.
+   */
+  private otherTextBuffer = ''
+  private otherTextTimer: ReturnType<typeof setTimeout> | undefined
   /** Whether this plugin has ever seen a session event through the global subscription. Logged once. */
   private userMessageSeenLogged = false
   /** Keys of the newest settled assistant message: the turn's final answer so far. */
@@ -283,6 +344,15 @@ export class OrbRuntime {
   private readonly overlayWaiters = new Map<string, () => void>()
   /** Chrome window ids each helper reported, keyed by its socket. */
   private readonly chromeWindows = new Map<Socket, readonly number[]>()
+  /**
+   * Wake-word hand-offs waiting for the main window's page.
+   *
+   * A counter rather than a boolean: the page consumes it on its next poll, and a wake that
+   * landed while the page was busy with the previous turn must still be visible as a new hand-off
+   * once the page polls again. `mainVoiceAt` is the age check, see {@link MAIN_VOICE_TTL_MS}.
+   */
+  private mainVoiceRequest = 0
+  private mainVoiceAt = 0
   private readonly tcc: { status(): TccStatus; open(right: TccRight): Promise<void> }
   private readonly selection: SelectionController
   private readonly overlay = createOverlayGuard({
@@ -396,9 +466,12 @@ export class OrbRuntime {
     if (type === 'user/message') {
       if (mine) return
       this.noteOtherStream('the user sent a message in another session')
-      // Only the signal, never the words: the page reads the face from the pack and plays it exactly as it plays
-      // the cue for a message sent from its own composer.
-      this.broadcast({ type: 'session-turn', outcome: 'user' })
+      // The cue is the face, the words are the bubble's live line: the main window's dictation
+      // writes into a composer this page does not have, so the sentence the user just said is
+      // only readable if it travels with the cue. Never the words *and* the face in one message —
+      // the face comes from `session-turn` either way, and `text` is an addition to it, not a type.
+      const said = clip(userText(record.data), 200).trim()
+      this.broadcast({ type: 'session-turn', outcome: 'user', ...(said === '' ? {} : { text: said }) })
       return
     }
     if (mine) return
@@ -473,6 +546,36 @@ export class OrbRuntime {
     this.otherStreamAt.set(kind, now)
     this.noteToolCall(`sent kind=${kind}${tool === undefined ? '' : ` tool=${tool}`} sockets=${this.sockets.size}`)
     this.broadcast({ type: 'session-turn', outcome: kind, sessionId, ...(tool === undefined ? {} : { tool }) })
+  }
+
+  /**
+   * Collect the words another conversation is writing, and send them once per {@link ORB_OTHER_TEXT_MS}.
+   *
+   * The face cue above is about *that* something is happening; this is about *what*. The bubble's
+   * live line repeats the answer as it streams (see `#bubble-line` in `assets/shell.js`), and the
+   * sentence has to arrive whole enough to read — hence a buffer and a timer rather than one message
+   * per delta, and hence the tail rather than the head: the part worth watching is the part arriving.
+   */
+  private announceOtherText(text: string): void {
+    if (text === '') return
+    this.otherTextBuffer = `${this.otherTextBuffer}${text}`.slice(-ORB_OTHER_TEXT_CHARS)
+    if (this.otherTextTimer !== undefined) return
+    this.otherTextTimer = setTimeout(() => {
+      this.otherTextTimer = undefined
+      this.flushOtherText()
+    }, ORB_OTHER_TEXT_MS)
+  }
+
+  /** Send whatever words are waiting, now. Called by the timer and by the end of the attempt. */
+  private flushOtherText(): void {
+    if (this.otherTextTimer !== undefined) {
+      clearTimeout(this.otherTextTimer)
+      this.otherTextTimer = undefined
+    }
+    const text = this.otherTextBuffer
+    this.otherTextBuffer = ''
+    if (text === '') return
+    this.broadcast({ type: 'session-turn', outcome: 'text', text })
   }
 
   /**
@@ -564,7 +667,12 @@ export class OrbRuntime {
     // written", and a face held for a fixed window past the last word goes on typing after the words stop.
     if (frame.type === 'end') {
       if (session?.id === this.sessionId) this.attemptPositions.delete(attemptId)
-      else this.announceOtherStreamEnded()
+      else {
+        // The words still waiting in the buffer are the end of the answer: send them before the end
+        // cue, so the line the page settles on is the whole reply rather than a prefix of it.
+        this.flushOtherText()
+        this.announceOtherStreamEnded()
+      }
       return
     }
     if (session?.id !== this.sessionId) {
@@ -575,6 +683,12 @@ export class OrbRuntime {
       const news = streamNews(frame)
       if (news !== null) {
         this.announceOtherStream(news.kind, typeof session?.id === 'string' ? session.id : '', news.tool)
+        // Words as well as the face, on their own cadence: the face needs one message a second, the
+        // bubble's line needs the sentences. Only prose — reasoning is not something the ball says.
+        if (news.kind === 'typing' && frame.type === 'chunk') {
+          const chunk = asRecord(frame.chunk)
+          if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') this.announceOtherText(chunk.text)
+        }
       }
       return
     }
@@ -1321,7 +1435,15 @@ export class OrbRuntime {
       this.dirtyTimer ??= setTimeout(() => this.flushDirty(), 60)
       return
     }
-    this.dirty.delete(key)
+    // A block that settles before its first running update was flushed would reach the ball as one
+    // finished message, and the page reads autoplay off the running → finished edge (see
+    // `speakWhenFinished` in packages/helper/assets/shell.js). A short final answer — the one a turn
+    // writes after a tool call — can stream and settle inside the 60 ms window above, and arrived
+    // silent for exactly that reason. The running state goes out first here; both messages are
+    // applied in the same frame on the page, so nothing is drawn twice.
+    if (this.dirty.delete(key)) {
+      this.broadcast({ type: 'block', key, kind, text: next, running: true })
+    }
     this.publish(message)
   }
 
@@ -1470,6 +1592,7 @@ export class OrbRuntime {
       threshold: settings.threshold,
       autoExpandOnWake: settings.autoExpandOnWake,
       dictation: settings.dictation,
+      continuous: settings.continuous,
     })
     const assets = resolveWakeAssets(settings)
     if (assets === undefined) {
@@ -1564,7 +1687,7 @@ export class OrbRuntime {
     return tokensMatch(token, this.token)
   }
 
-  /** Push permission, both models, the catalog, the wake switch, and the avatar version to the ball. */
+  /** Push permission, both models, the catalog, the wake and reply switches, and the avatar version to the ball. */
   async publishChrome(): Promise<void> {
     const models = this.store.models()
     let catalog = { groups: [] as readonly { id: string; name: string; models: readonly unknown[] }[] }
@@ -1579,12 +1702,23 @@ export class OrbRuntime {
       overlay: models.overlay,
       background: models.background,
       millifractionEnabled: this.store.millifractionEnabled(),
+      // The ball's own menu toggles this, so the checked state has to travel back to it; the cap
+      // rides along read-only because the row names the number it enforces.
+      reply: this.store.reply(),
       // Only the switch travels here; the keyword, threshold, and asset directory are
       // seeded into the helper at launch and re-read from the profile file there.
       wakeEnabled: this.store.wake().enabled,
+      // The recorder's own tuning, though, has to be able to move while the ball is up: the settings
+      // page's silence slider writes it, and a value read only at launch would need a relaunch that
+      // drops the panel. The helper revalidates the block and hands it to the page, which is what the
+      // next utterance ends on.
+      dictation: this.store.wake().dictation,
       // Read-aloud lives in the settings page rather than the ball's menu, and the page can change
       // it with the ball open — so the switches travel on every publish rather than only at launch.
       speech: this.store.speech(),
+      // The hourly chime's switch and quiet window: the ball's menu flips the first, the file holds
+      // both, and the page runs the timer — so it needs the current values on every publish.
+      chime: this.store.chime(),
       openMain: isDesktopHost(),
       catalog,
     })
@@ -1677,8 +1811,7 @@ export class OrbRuntime {
     await this.publishChrome()
   }
 
-  async setBallEnabled(enabled: boolean): Promise<void> {
-    this.store.setBallEnabled(enabled)
+  async setBallEnabled(enabled: boolean): Promise<void> {    this.store.setBallEnabled(enabled)
     if (process.platform === 'linux') return
     if (enabled) {
       void this.start().catch((error: unknown) => {
@@ -1700,10 +1833,68 @@ export class OrbRuntime {
     await this.publishChrome()
   }
 
+  /**
+   * Move the "finished speaking" pause from the settings page's slider, in milliseconds.
+   *
+   * Writes the same field the helper read at launch, then publishes: the block rides the `chrome`
+   * message, the helper hands it to the page, and the next utterance ends on the new value. Nothing
+   * is restarted — a relaunch here would drop the ball and its panel for a number the recorder can
+   * take mid-session.
+   */
+  async setWakeSilence(silenceMs: number): Promise<void> {
+    const current = this.store.wake().dictation.silenceMs
+    const next = Math.min(MAX_SILENCE_MS, Math.max(MIN_SILENCE_MS, Math.round(silenceMs)))
+    if (current === next) return
+    this.store.setDictationSilence(next)
+    await this.publishChrome()
+  }
+
+  /**
+   * Turn the terse-reply contract on or off, as asked by the ball's own menu.
+   *
+   * No restart and no relaunch: the section's text provider re-reads `orb-reply.json` on every
+   * prompt assembly, so the next answer is already written under the new switch. Only the ball's
+   * own sessions get the section at all, so the main window is unaffected either way — see
+   * `./reply-style.ts`.
+   */
+  async setReplyEnabled(enabled: boolean): Promise<void> {
+    this.store.setReply({ enabled })
+    await this.publishChrome()
+  }
+
+  /**
+   * Turn the hourly chime on or off, as asked by the ball's own menu.
+   *
+   * Only `enabled` is touched: the quiet window is a hand edit in `orb-chime.json`, and a menu
+   * click must not rewrite a number the user typed. The page re-arms nothing either — its timer
+   * re-reads the settings when it fires — so this is one store write and one broadcast.
+   * @param enabled - the state the menu row just showed.
+   */
+  async setChimeEnabled(enabled: boolean): Promise<void> {
+    if (this.store.chime().enabled === enabled) return
+    this.store.setChime({ enabled })
+    await this.publishChrome()
+  }
+
   /** The speech service wrapper, built on first use so a profile without one still loads. */
   private transcriber(): ReturnType<typeof createTranscriber> {
     this.transcriberInstance ??= createTranscriber(this.ctx)
     return this.transcriberInstance
+  }
+
+  /**
+   * Transcribe one recorded utterance handed over by the main window's page.
+   *
+   * The composer's microphone button records on its own — the page is where the user is, and its
+   * recorder is the ball's own procedure rather than the voice-input plugin's DOM — and posts the
+   * 16 kHz mono PCM16 WAV here. The same wrapper answers, so a sentence recorded in the composer
+   * and a sentence recorded on the ball are recognised by the same service with the same provider.
+   *
+   * Never throws: a failure is a short Chinese reason the page can show, which is what
+   * {@link createTranscriber} already promises.
+   */
+  async transcribe(audio: Buffer): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+    return await this.transcriber().transcribe(audio)
   }
 
   /**
@@ -1762,6 +1953,14 @@ export class OrbRuntime {
       this.run('wake', () => this.setWakeEnabled(record.enabled === true))
       return
     }
+    if (record.type === 'set-reply' && typeof record.enabled === 'boolean') {
+      this.run('reply', () => this.setReplyEnabled(record.enabled === true))
+      return
+    }
+    if (record.type === 'set-chime' && typeof record.enabled === 'boolean') {
+      this.run('chime', () => this.setChimeEnabled(record.enabled === true))
+      return
+    }
     if (record.type === 'transcribe' && typeof record.id === 'string' && typeof record.audioBase64 === 'string') {
       this.run('transcribe', () => this.answerTranscription(socket, record.id as string, record.audioBase64 as string))
       return
@@ -1793,6 +1992,18 @@ export class OrbRuntime {
     }
     if (record.type === 'open-main') {
       this.run('open-main', () => this.openMain())
+      return
+    }
+    if (record.type === 'main-voice-start') {
+      this.mainVoiceRequest += 1
+      this.mainVoiceAt = Date.now()
+      // The first of three readouts on the hand-off: the ball asked, the page collected, or neither.
+      // A wake that opens no microphone is one of those three and they look identical from outside.
+      this.noteOtherStream('wake: the ball handed a turn to the main window')
+      // Bring the main window forward, then let its page take the hand-off on its next poll. The
+      // page presses the microphone button itself, so this process never types into or clicks on
+      // the page it does not own.
+      this.run('main-voice', () => this.openMain())
       return
     }
     if (record.type === 'tcc') {
@@ -1974,6 +2185,43 @@ export class OrbRuntime {
   private async openMain(): Promise<void> {
     if (!isDesktopHost()) return
     await openMainWindow(this.ctx)
+  }
+
+  /**
+   * Take the wake-word hand-off waiting for the main window's page, if any.
+   *
+   * The page calls this from the normal web port, so a page that is not open simply leaves the
+   * hand-off to expire ({@link MAIN_VOICE_TTL_MS}). It is consumed here rather than left for a
+   * second poll: the page reloads between turns, and a hand-off that survived a reload would
+   * press the microphone on a turn the user has already finished.
+   *
+   * `send` reuses the black panel's rule exactly — `applyTranscript` in `assets/shell.js` sends
+   * when `autoSend` is on or when the turn is a voice turn, and a wake-word turn is a voice turn
+   * whenever continuous conversation is on. `noSpeechMs` is {@link MAIN_VOICE_NO_SPEECH_MS}, the
+   * same limit the panel's recorder ran on; the pause and the ceiling come from `orb-wake.json`
+   * and are the values the panel's slider writes.
+   */
+  takeMainVoice(): MainVoiceCommand | null {
+    if (this.mainVoiceRequest === 0) return null
+    this.mainVoiceRequest = 0
+    const age = Date.now() - this.mainVoiceAt
+    if (age > MAIN_VOICE_TTL_MS) {
+      this.noteOtherStream(`wake: the page collected the hand-off ${age} ms late, past its ${MAIN_VOICE_TTL_MS} ms window`)
+      return null
+    }
+    // The middle readout: the main window's page is polling and took the command. Silence here
+    // while the line above exists means the page is not running this plugin's client half.
+    this.noteOtherStream(`wake: the main window collected the hand-off after ${age} ms`)
+    const wake = this.store.wake()
+    return {
+      start: true,
+      noSpeechMs: MAIN_VOICE_NO_SPEECH_MS,
+      silenceMs: wake.dictation.silenceMs,
+      maxSeconds: wake.dictation.maxSeconds,
+      send: wake.dictation.autoSend || wake.continuous.enabled,
+      continuous: wake.continuous.enabled,
+      followUpMs: MAIN_VOICE_FOLLOW_UP_MS,
+    }
   }
 }
 

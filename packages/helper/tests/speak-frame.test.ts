@@ -189,9 +189,10 @@ function repaintsFor(sequence: boolean[], frameLoaded = true): {
   const status = { textContent: '' }
   const factory = new Function('deps', `
     const { speechButtons, status, speechStatusText, paintSpeakButton, speakSrc,
-            loadSpeakFrame, syncGif, wake } = deps
+            loadSpeakFrame, syncGif, wake, continuousVoice, scheduleVoiceTurn } = deps
     let speakActive = false
     let speechStatus = ''
+    let speechFinished = 0
     ${assignedFunction(shell, 'syncSpeechButtons')}
     return (state) => syncSpeechButtons(state)
   `)
@@ -214,9 +215,12 @@ function repaintsFor(sequence: boolean[], frameLoaded = true): {
       mute: () => { counter.mutes += 1 },
       unmute: () => { counter.unmutes += 1 },
     },
-  }) as (state: { speaking: boolean; enabled: boolean }) => void
+    // The continuous exchange is not what this fixture is about; its edge must simply not run.
+    continuousVoice: { spoken: () => 'idle' },
+    scheduleVoiceTurn: () => {},
+  }) as (state: { speaking: boolean; enabled: boolean; finished: number }) => void
 
-  for (const speaking of sequence) call({ speaking, enabled: true })
+  for (const speaking of sequence) call({ speaking, enabled: true, finished: 0 })
   return { ...counter }
 }
 
