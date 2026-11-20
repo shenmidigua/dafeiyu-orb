@@ -341,6 +341,26 @@ warm-up 就是为此存在——**改动特征提取逻辑时务必保持与 `pa
 
 `dsh-voice-dialog/assets/ort/`（onnxruntime-web，MIT）不入库，需从 CDN 获取。
 
+## 极简回复（语音）
+
+球上的会话默认走「极简回复」：结论先行，正文 ≤80 字 / ≤3 行，不出现表格、参考链接堆砌和「顺带一提」式补充，
+也不用 Markdown 表格 / 多层列表 / 代码块（TTS 念不出来）。用户明确说「展开」「详细说说」时才放开。
+
+实现是**系统提示词里的一段 section**（`packages/host/src/reply-style.ts`，`order = 3100`，排在所有工具段之后），
+不是 preset 里的人格前缀：球和主窗口共用 `computer-use` preset，人格分不开两者，而 section 的 provider 能拿到
+当前正在拼装的 agent。判定复用 `services.ts` 的 `isOrbSession()`——会话 cwd 在 `dshHomePath('dsh_orb')` 之下即算球上的会话，
+所以**球自己那轨和它派出的后台标准会话都算**；主窗口会话拿到空字符串，`renderPrompt` 会直接丢弃该段。
+
+配置在本机是 `C:\Users\digua\.dsh\profiles\desktop\orb-reply.json`：
+
+```json
+{ "enabled": true, "maxReplyChars": 80 }
+```
+
+- **关掉**：球上右键 → **极简回复（≤80 字）**取消勾选，勾选态即生效态（helper 的 `menu.ts` 发出 `set-reply`，host 的 `setReplyEnabled` 写回文件并广播新状态）；也可以直接 `"enabled": false`；删文件 = 默认开启。两种方式都作用于下一条回复。
+- `maxReplyChars` 夹在 20–2000；写坏或缺失回落 80。菜单项只是把当前上限读出来展示（`极简回复（≤80 字）`），改上限仍然改这个字段。
+- `ProfileStore.reply()` 每次都重读文件，改完下一条回复生效，不用重启 dsh。
+
 ## 本机相关
 
 `dsh_orb/` 下的探针与打包脚本包含硬编码的 Windows 绝对路径，换机器需自行调整。

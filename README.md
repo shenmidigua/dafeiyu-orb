@@ -16,12 +16,42 @@ There is no telemetry.
 
 On startup the plugin spawns its own helper (a pinned, verified Electron runtime in an isolated profile) and the ball appears at the right edge of the primary display, always on top.
 
-- **Hover** expands the panel, **click** pins it, and it collapses when the pointer leaves. **Drag** moves the ball; dragging it beyond the left or right screen edge docks it into a thin sliver — hover again to slide it back.
-- **Right-click** opens the menu: open the main window, floating-ball agent settings and background agent settings (each track picks its own model and thinking level), the coordinate-encoding toggle, and "Disable floating ball". The ball follows the official dsh process — when the official app exits, the ball exits with it.
-- The panel carries the ball's conversation history with **History** and **New**, an **Access** chip (view-only / workspace edits / full access; full by default, applying to the ball's commands and the background sessions it dispatches), and a composer that wraps around the ball. When the agent asks you a question, the question card is answered right on the ball; if the helper disconnects, an unanswered question is handed back to the main window.
-- The transcript is rendered natively in the ball: streaming thinking / text / tool calls interleaved in arrival order, collapsible tool cards with parameters and results (terminal, diff, read, search, web), Shiki dual-theme highlighting, copy buttons for user and assistant messages, and a per-turn token-usage pill.
-- Appearance follows the main window: dark / light theme and interface language (Chinese / English) mirror the official appearance and language settings, including live switching.
+- **Hover** floats a small card beside the ball with **the latest reply only**; it collapses when the pointer leaves, and a **click** pins it for a slower read. **Drag** moves the ball; dragging it beyond the left or right screen edge docks it into a thin sliver — hover again to slide it back.
+- **Right-click** opens the menu: open the main window, floating-ball agent settings and background agent settings (each track picks its own model and thinking level), the coordinate-encoding toggle, the terse-reply toggle (its character cap is in the label), the hourly-chime toggle (its silent window is in the label), and "Disable floating ball". The ball follows the official dsh process — when the official app exits, the ball exits with it.
+- The ball has no chat box any more: the conversation, history, permission chip and composer all live in the main window now, and the 320×190 card beside it is a "what did it just say" readout. The old panel's elements are still in the page — hidden, not deleted — because the page resolves every one of them by id, and a missing node would take the whole page, ball included, down at startup. To bring the old panel back, delete the last block in `floating.css`.
+- One exception: when the agent asks a question in the ball's session, the card grows back to an answerable size (options / custom answer / cancel). It is the only thing left on the ball that still needs your hands — an unanswered question blocks the agent.
+- Read-aloud, the wake word and voice input still work on the ball; there is just no visible composer, so a dictation is sent straight to the ball's session. Appearance still mirrors the main window (dark / light, Chinese / English, live).
 - The ball avatar can be set to one of six built-in animated GIFs, or replaced with a custom GIF / PNG / WebP (2 MB cap), in main-window **Settings → Floating Ball**. The built-ins stay animated: the ball plays them whenever it is active, exactly like the shipped default.
+
+## Terse replies
+
+Sessions on the ball answer for the ear by default: the conclusion first, a body of at most 80 characters and three lines, no tables, no lists of links, no "by the way" addenda, and no Markdown tables, nested lists, or code blocks — none of those can be read aloud. Only an explicit "expand" / "tell me in detail" lifts the limit.
+
+The contract is a system-prompt section, and it covers the ball's sessions only (including the background sessions it dispatches); ordinary sessions in the main window keep their normal answers. The switch and the character cap live in `orb-reply.json` in the dsh profile directory, next to `orb-speech.json` and `orb-wake.json`:
+
+```json
+{ "enabled": true, "maxReplyChars": 80 }
+```
+
+- **To turn terse mode off**: right-click the ball and uncheck **Terse replies (≤80 chars)** — the row is checked while the contract is on and its label names the cap. If you would rather edit the file, set `"enabled"` to `false`; deleting the file means the default, which is **on**. Either way the click or the edit applies to the next reply.
+- `maxReplyChars` accepts 20–2000 and is clamped to that band; a missing or invalid field falls back to the default. The menu row shows the value it is enforcing; the cap itself is still set in the file.
+- The file is re-read for every assembly, so an edit applies to the next reply — no dsh restart needed.
+
+## Hourly chime
+
+On the hour, every hour, the ball says the time once — "现在是上午九点整。" — and goes quiet again. One line, one hour; it never revisits the last one or previews the next. It speaks through the ball's own read-aloud service, so it sounds like the same voice that reads replies.
+
+- **The switch**: right-click the ball → **Hourly chime**. Checking it takes effect immediately, and **unchecking then checking it again speaks the current time on the spot** — the sample is the only way to judge the voice without waiting for an hour. With no read-aloud service configured the row reads "turn read-aloud on first" and is greyed out, because there is no voice to say anything.
+- **Silent at night**: 0–7 by default. The window lives in the same file and may wrap midnight (`"quietFrom": 22, "quietTo": 6` silences 22:00 through 05:59).
+- **Never talks over you**: while a reply is being read, while a dictation is in flight, or at any point in a continuous voice exchange (armed after a dictated message, waiting, or with the microphone about to open), the chime stands down and that hour is simply skipped.
+- Configuration lives in `orb-chime.json` in the dsh profile directory, next to `orb-speech.json` and `orb-wake.json`; deleting the file means the default (on, silent 0–7):
+
+```json
+{ "enabled": true, "quietFrom": 0, "quietTo": 7 }
+```
+
+- The menu writes only `enabled`; the quiet window is a file edit (`quietFrom` / `quietTo`, 0–24, equal ends meaning every hour including night). Both directions apply at the next whole hour — no dsh restart needed.
+- The timer recomputes from the wall clock rather than adding an hour each time, and past 90 seconds late it skips that hour entirely: it never announces a time that has already stopped being true.
 
 ## Dual-track agent architecture
 

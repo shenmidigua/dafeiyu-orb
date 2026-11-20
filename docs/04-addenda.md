@@ -169,3 +169,95 @@ Windows 上的实测反馈:在浏览器里点球、输入、回车提交后,**Ag
 - **修复**(`packages/host/src/open-main.ts`):新增 `openEnvironment()`——复制环境并删掉 `ELECTRON_RUN_AS_NODE`,`spawnOpen` 用它作为子进程环境。macOS 走 `open`,由 LaunchServices 启动应用、拿不到这个环境,因此不受影响(该函数在 darwin 上是惰性的)。
 - **验证**:真机在 `ELECTRON_RUN_AS_NODE=1` 下调用真实 `openMainWindow`,最小化的主窗口被唤醒并成为前台(`IsIconic=False`、前台窗口即主窗口);修复前同一条件无反应。
 - **测试**:`host/tests/open-main.test.ts` 新增用例(删标记、保留其余变量、不改动调用方对象)。
+
+## 12. 极简回复:球上的会话默认只说结论(2026-11-19)
+
+球说的每句话都要被念出来,而「念」对文本有硬约束:表格、链接清单、代码块、三层嵌套列表都变成一串读不懂的音节。所以球上的会话默认按「说给耳朵听」来回答——先给结论,正文控制在 80 字、3 行以内,不用表格与 Markdown 结构,也不写「顺带一提」式的补充;只有用户明确说「展开」「详细说说」时才越过限制。
+
+- **注入方式**(`packages/host/src/reply-style.ts`):`registerReplyStyle(ctx, store)` 往 prompt 组装里挂一个文本 provider,把 `store.reply()` 读到的规则拼成一段 section。provider 每次组装都重读 `orb-reply.json`,所以改开关或改上限是**下一条回复就生效**,既不重载 helper 也不重开 dsh。
+- **只作用于球**:section 只在 `isOrbSession()` 为真时出现(含球派出的后台会话);主窗口里的普通会话拿到的是空字符串,行为与以前完全一样。
+- **配置**(`packages/host/src/preferences.ts`):`orb-reply.json` = `{ enabled, maxReplyChars }`,默认 `{ true, 80 }`。`maxReplyChars` 夹取 20–2000(超界按边界处理),缺字段或写坏回落默认;`setReply` 先重读再写整份文件、只改传入字段——与 `setWakeEnabled` 同一套做法,用户随时可能在背后手改。
+- **测试**:`host/tests/reply-style.test.ts` 覆盖规则文本与开关;`host/tests/preferences.test.ts` 覆盖默认值、夹取与落盘。
+
+## 13. 极简回复开关进球的右键菜单(2026-11-19)
+
+规则能落盘还不够——用户得能在一秒钟内关掉它,而球上唯一的入口就是右键菜单。
+
+- **入口**(`packages/helper/src/menu.ts`):`ContextMenuState` 加 `replyEnabled` / `replyMaxChars`,`ContextMenuActions` 加 `setReply`;菜单行是 `type: 'checkbox'`,`checked` 取 host 广播来的 `chrome.reply.enabled`。上限直接写进文案(中文「极简回复（≤N 字）」、英文 `Minimal replies (≤N chars)`),因为那个数字在别处看不见。
+- **链路**:菜单点击 → `write({ type: 'set-reply', enabled })`(`helper/src/main.ts` 的 `showMenu`)→ `orb.ts` 的 `onControl` → `setReplyEnabled()`;helper 侧的 `chrome` 消息新增 `reply: { enabled, maxReplyChars }` 字段,点击后重新广播,勾选态立刻跟着变。
+- **不重载**:切开关只广播 chrome,不重建 helper,球窗不会闪一下。
+- **测试**:`helper/tests/menu.test.ts` 补一条菜单用例(勾选态、`≤N 字` 文案跟配置走、点击两个方向都发 `setReply`)并更新既有的 `contextMenuTemplate` 调用;`host/tests/runtime.test.ts` 补端到端一条——`menu` 广播初始是 `{enabled:true, maxReplyChars:80}` → `set-reply false` → 文件落盘 `{"enabled":false,"maxReplyChars":80}` → 球的会话 section 变空、主窗口仍为空 → 再 `set-reply true` → section 回来且写着 80 字。
+
+## 14. 整点报时(2026-11-20)
+
+球在每个整点说一句时间。「现在是上午九点整。」一行字,说完就结束。这是球能主动提供的唯一一种信息,所以它的价值全在克制:一个整点、一句话、一个准确的时刻。
+
+动手前工作区里已经有一版未提交的半成品(`shell.js` 的 `scheduleHourly`),但它有三处接不上:静默窗口硬编码 0–7;唯一的关闭方式是 `?hourly=off` 这个 URL 参数,而 helper 用 `loadFile('floating.html')` 从不带 query,于是这条开关是死代码——实际行为是「只要开了朗读就永远报时」,也没有任何菜单或设置入口;它还和朗读开关绑死,用户想关掉报时只能连朗读一起关。**它也从没进过安装包**:装好的 `dist/helper/assets/shell.js` 里没有 `hourly`,所以此前一次都没响过。
+
+- **判定收进纯函数**(`packages/helper/assets/chime.js`):`hourlyLine(hour)`(零点/上午/中午/下午/晚上的措辞、12 与 0 的绕回)、`isQuietHour(hour, settings)`(支持跨午夜 `22 → 6`,`from === to` 表示整夜也报)、`chimeWanted({ hour, settings, now, at, canSpeak })`(开关 / 静默窗口 / 迟到 90 秒 / 是否有人在说话,四件事一个入口)、`nextHourAt(now)`、`normalizeChime(value)`(夹取 0–24)。放这里而不是页面里,是因为它们都是**可听出来的错**:3:04 报「三点」、凌晨四点开嗓、或者盖住正在念的回复。
+- **配置**(`packages/host/src/preferences.ts`):`orb-chime.json`,`{ enabled, quietFrom, quietTo }`,默认 `{ true, 0, 7 }`——开启是因为球本来就是用户主动装的东西,一次没响过的报时没法评价;0–7 静音是因为凌晨四点响一次就是最快的卸载理由。`setChime` 先重读再写整份文件、只改传入字段(与 `setReply` 同一套做法,用户随时可能在背后手改),`chime()` 每次读盘,手改下一个整点生效,越界值夹取到 0–24 而不是信它。
+- **链路**:`chrome` 广播新增 `chime` 字段 → helper `ChromeState` 读入(每字段独立回落)→ `orb:chime` 推送(收到 `chrome` 时一次、`did-finish-load` 再一次,免得页面重载后回到出厂默认);菜单点击 `write({ type: 'set-chime', enabled })` → host `setChimeEnabled()`(值没变就不写盘也不广播)。页面定时器**不因设置变化重排**:它在响的那一刻才读 `chime`,所以切换开关不会堆出第二个定时器。
+- **菜单行**(`packages/helper/src/menu.ts`):`整点报时（0–7 点静音）`,勾选态来自 `chrome.chime.enabled`。静默窗口写进文案,因为那个数字在别处看不见;`quietFrom === quietTo` 时只写「整点报时」,不写「0–0 点静音」那种听起来像午夜静默的假区间。没有朗读服务时置灰并改成「整点报时（需先开启朗读）」——勾了却不出声是这个标签要避免的失败。
+- **开启即试听**:`applyChime` 在 off→on 的沿上念一遍当前时间(`previewChime`),不受静默窗口约束(这一刻是用户自己要的)。理由很简单:一个开关如果唯一的证据是一小时后那声响,用户没法验证它。试听走同一条 `speaker.speak(..., 'hourly')` 路径,所以听到的就是整点会听到的。
+- **不抢话**:页面用既有的 `maySpeakUp()` 回答「现在能不能说话」——正在朗读回复、听写中、或语音连续对话处于任何非空闲状态(说完等回复的 armed、等开口的 waiting、麦克风待开的 opening),任一为真就让路,这个整点直接跳过,不排队补报。原先只挡 `waiting`,但 `opening` 一响就会被录制进去、`armed` 一响会替对话把回合交出去,所以判据改成 `continuousVoice.active`。
+- **测试**:新增 `helper/tests/chime.test.ts` 20 例(措辞、12/13/18/23 与 0 的绕回、跨午夜窗口与空窗口、迟到阈值、`canSpeak` 缺省视为否、让路判据、下一个整点跨午夜不漂移、夹取,以及「页面/helper/preload/host 四处接线都在」的源码断言);`helper/tests/menu.test.ts` 新增一条菜单用例(有声音/无静默窗口/没朗读三种文案与置灰)并更新既有调用的行序与索引;`host/tests/preferences.test.ts` 补 2 例(默认值与「只翻开关不动窗口」的落盘、越界夹取)。
+- **装配**:`pnpm build`(bundle assemble 整目录复制 `assets`,新文件自动随包)→ `node packages/bundle/scripts/assemble.mjs --out ~/.dsh/dsh_orb/buildstage/package` → `python dsh_orb/pack_and_install.py`(81 files,20.2 MB,`INSTALL VERIFIED`)→ `python dsh_orb/restart_dsh.py` → `python dsh_orb/restart_helper.py --dry` 确认球窗在。第一个整点(15:00)是实机验收点:球应该「现在是下午三点整。」本机 8765 的朗读服务在线。
+- **既存失败(改动前后一致,与本改动无关)**:`helper/tests/continuous-conversation.test.ts` 2 条与 `speak-frame.test.ts` 3 条仍是红的——工作区里未提交的连续对话改动把 `running` / `asking()` 塞进了 `syncSpeechButtons`,并把 `VOICE_WAITING` 加进了 `voice-turn.js` 的 import,配套测试没有跟着更新(测试沙箱没提供 `running`,import 断言还写着 `import { ContinuousVoice }`)。
+
+## 15. 球的对话框降为「回复气泡」(2026-11-20)
+
+用户把对话功能搬到了主窗口,要求把球上那个可展开的对话框注释掉,但不影响其余功能。落地结果:球旁那张 420×520 的卡片变成 320×190 的一块看板,只显示**最新一条回复**;拖动、停靠、右键菜单、朗读、语音唤醒、听写、整点报时、外观与头像全部照旧。
+
+- **不删标记,只停笔画**(`packages/helper/assets/floating.css` 末尾新增一段「switch」式样式):`shell.js` 启动时按 id 解析约 60 个节点(transcript、composer、status、question、history、permission…),缺任何一个都是 TypeError,整页连同球一起消失。所以 `#history` / `#new-conversation` / `#permission` / `#history-list` / `#tcc-gate` / `#selection-chip` / `#composer` 全部 `display: none`,元素与接线一个不动——与第 9 节隐藏 `#wake-badge`/`#wake-meter` 是同一种做法。要恢复旧面板,删掉这一段即可,HTML 不必改。
+- **为什么不改 `--panel-width` / `--panel-height`**:这两个数是页面与主进程的契约。`BALL_COLUMN` 由面板宽度推导、`BALL_ROW` 由面板高度推导,`geometry.test.ts` 把样式表钉在这两个常量上(第 190–196 行)。把契约改小会让球在它自己的窗口里挪位。所以气泡尺寸另起 `--bubble-width/height`,卡片画在原来那 520px 的列里;`body.expand-left` 的 `left`、`body.expand-up` 的 `top` 改成按 `--bubble-*` 重算,卡片与球之间仍然是那一个 `--panel-gap`。`expand-right` 不需要新规则:卡片从球的列起画,窗口本来就宽出一整块面板。
+- **清掉为对话框预留的空位**:`#panel` 的 `padding`(底/顶那条 composer 带)、`#panel::after`(那条圆角输入框底)、`#transcript` 的 36px 让位内边距,全部归零,回复从卡片自己的 14×16 内边距开始。
+- **展开即滚到底**(`shell.js` 的 `setExpanded(true)`):190px 只装得下几行,而恢复一段历史后 `scrollTop` 从 0 开始——不锚底的话,气泡打开时看到的是**最早**那条消息,恰好与「看最新回复」相反。加了一行 `transcript.scrollTop = transcript.scrollHeight` 并注明理由。
+- **唯一例外:提问卡**。`shell.js` 在有待答提问时给 `body` 加 `asking`(第 5911 行),样式据此把卡片恢复成 420×520,选项/自定义输入/取消那套原样可用——那是球上唯一还需要用户动手、且答不了就会卡住 Agent 的地方。其余状态(`running` / `docked` / `wake-recording`)都不改变卡片尺寸。
+- **保留下来的**:朗读与「开启即试听」、整点报时(依赖 `speaker` 与 `continuousVoice`,两者都是模块级、与面板是否显示无关)、语音唤醒与听写(听写写进隐藏的 composer 并照常提交,`#voice-row` 的状态行也没隐藏,所以听写/出错仍有一行字)、外观跟随、头像、拖动与停靠、右键菜单里的全部开关。
+- **取舍(需要知道)**:球上不再有历史/**新建**、Access 权限芯片、文字输入框;macOS 的 TCC 授权提示(`#tcc-gate`)也一并不再显示。这些入口现在只在主窗口。
+- **测试**:新增 `helper/tests/panel-bubble.test.ts` 8 例——气泡尺寸、`--panel-*` 未被改动、双向定位用 `--bubble-*`、隐藏清单、`transcript` 内边距、提问时恢复 420×520 且只有 `asking` 会、展开锚底;以及一条结构性护栏:把 `shell.js` 里 `querySelector('#…')` / `getElementById('…')` 的 id 全抓出来,逐个断言 `floating.html` 里仍有同名节点(「注释掉面板」最容易犯的错就是漏掉一个 id,让整页启动即崩)。全量 `host`+`helper` 629 例、625 过,4 条红仍是第 14 节记录的既存失败。
+- **装配与实测**:`pnpm build` → `assemble.mjs --out ~/.dsh/dsh_orb/buildstage/package` → `pack_and_install.py`(`INSTALL VERIFIED`,81 files / 20.2 MB)→ `restart_helper.py` 重载球,`stream.log` 14:42 出现 `page: {"phase":"apply","ready":"complete"}` 说明新页面已跑起来。视觉上用装配后的 `floating.html` + `floating.css` 做了一次静态渲染(Chromium 无头、两段示例文字、去掉页面脚本):气泡量到 320×190,两段文字排满约六行、无工具栏无输入框;`body.asking` 状态量到 420×520,提问卡的选项与底部按钮都在。真机上的悬停动效与拖动仍未做像素级冒烟,留给用户看一眼。
+
+## 16. 气泡里的「实时文字」：唤醒、听写、回复三处都有字(2026-11-20)
+
+第 15 节把卡片降成气泡之后,用户立刻指出了真问题:气泡里没有字。三个时刻都空着——唤醒时球说的是「我在」(一段音频 clip,屏幕上什么都没有)、用户说完一句(文字写进的是被隐藏的 `#composer`,气泡里看不见)、球语音回复时(回复在**主窗口**那个会话里,本页 `#transcript` 拿不到)。
+
+- **一条字幕元素,不改既有结构**(`floating.html` 的 `<p id="bubble-line">` + `floating.css` 末尾):`hidden` 时不占地方,所以安静的球和以前完全一样;有字时贴在 transcript 下方、卡片底部,最多三行、超出只留最新一截(前面加省略号)。`data-role="me"` 是用户自己那句(右对齐、无底色),`system` 是「正在听/正在识别」这类提示,默认是球说的话。
+- **唤醒应答**:`applyWakeStatus` 里 `playWakeFrame()` 之后补一行 `showBubbleLine(messages.wakeAck)`,字就是那段 clip 正在说的「我在。」(`messages.wakeAck`,中英各一条)。这一段 clip 原本是唯一的确认,屏幕上看不见就成了「球没反应」。
+- **听写**:`startDictation` 在开录和送识别两处各给一行(`正在听你说…` / `正在识别…`,hold=0 一直挂着——录音没有本页能看见的结束);`applyTranscript` 拿到文本后先 `showBubbleLine(text, 'me')` 再照原样写进 composer 并提交,所以「我说的是这句」第一次变得可读。
+- **回复**:`speakReply` 是所有「答完一条」的统一入口,字幕放在 `if (!speaker.autoPlay) return` **之前**——朗读关掉时卡片是唯一能看到答案的地方,这一行不该跟着朗读一起消失。`speech.test.ts` 的 harness 因此多了 `showBubbleLine` 桩,并加了一条断言:autoPlay 关掉时仍会上字幕。
+- **主窗口的回复**:这才是关键——用户的对话在主窗口,那是**另一个 session**,主机原本只广播「那边在写字」这个种类、不带字(`announceOtherStream`)。`host/src/orb.ts` 新增 `announceOtherText` + `flushOtherText`:把 `text-delta` 的 `chunk.text` 按 120ms 合并成一条 `{ type:'session-turn', outcome:'text', text }`,回答结束(`frame.type === 'end'`)时先把缓冲区发完再发 `streamed`,所以页面停在的是整句而不是半句。`user/message` 那条广播也顺带带上 `userText(...)`(截 200 字),于是用户在主窗口说的那句同样能上字幕。页面侧只是给 `onSessionTurn` 加了三个分支:`user`(换人说的话,重置累积)、`text`(追加)、`ended`/`streamed`(收尾,6 秒后自己淡出)。
+- **什么时候替用户打开卡片**:`openBubbleForLine` 只在「没展开、没有待答提问、**没有吸附**、且配置允许自动展开(`wake.autoExpand()`,即 `orb-wake.json` 的 `autoExpandOnWake`)」时调用 `setExpanded(true)`。吸附(strip)是用户主动把球收起来的状态,为一句字幕把它拽出来是球在打断人;`setExpanded` 自己会 `applyDocked(undefined)`,所以吸附判断必须先做。
+- **测试**:新增 `helper/tests/bubble-line.test.ts` 19 例——按 `other-stream.test.ts` 的老办法把页面函数抠出来编译,喂假节点断言:显示/角色、空串不清空、空白折叠、超长只留尾部、折叠时开卡片而展开时不动、吸附不开、提问中不开、配置关掉自动展开时不开、hold=0 不排定时器、流式累积与收尾、超时后自己隐藏;另有一组接线断言(唤醒/听写/回复/`onSessionTurn` 四分支/主机 `announceOtherText`/HTML+CSS+`querySelector` 三处都在)。`host`+`helper` 全量 648 例、644 过,4 条红仍是既存失败(第 14 节)。
+- **装配与实测**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py` → `restart_dsh.py`(主机侧的新广播要整个 DSH 重起才会加载;`dist/host/index.js` 里已能看到 `announceOtherText`)。`stream.log` 07:16:57 出现 `page: {"phase":"apply","ready":"complete"}`,随后 `composer recorder ready: true`,说明新页面与新主机都在跑;重载后 07:19:36 又有一次 apply,是字幕元素补齐后的那一版。静态视觉仍用装配后的 html+css 走无头 Chromium:字幕贴在卡片底部、圆角浅底、三行内截断。
+
+## 17. 气泡高度跟着文字走(2026-11-20)
+
+用户接着问:回复的框能不能按文字多少实时变高。原来那张卡是死高 190px——一句「我在。」和一段六行的回答占一样大的地方,短句四周全是空白,长句在里面挤成滚动条。
+
+- **改成内容高度**(`floating.css` 气泡块):`#panel` 从 `height: var(--bubble-height)` 换成 `height: auto`,加上 `--bubble-min-height: 76px`(单行字幕的矮条)与 `--bubble-max-height: 420px`(再长就由 transcript 自己滚)。`--bubble-height` 这个名字随之消失,免得「看着还在用、其实没人读」。
+- **`flex: 1` 在自动高度里是个陷阱**:`#transcript` 的基样式是 `flex: 1`,即 `1 1 0%` ——在固定高卡片里是"撑满",在内容定高的卡片里那 0% 的 basis 会让正文塌成 0,只剩一条字幕浮在空条里。所以气泡块里重写成 `flex: 0 1 auto; min-height: 0; overflow-y: auto`:内容说多高就多高,顶到 420 之后自己滚。
+- **锚边换了**:`body.expand-up` 原本算 `top = ball-row + ball - bubble-height`,高度一活这行就没有答案了。改成 `top: auto; bottom: var(--ball-row)` 让底边钉在球的下沿向上长——窗口高 = `BALL_ROW + PANEL_SIZE.height + CHROME_INSET`,球的下沿正好在窗口底边之上 `BALL_ROW`,所以是同一个变量换了个方向读。`expand-down` 不用动:它本来就是从球的上沿往下长。
+- **提问卡仍是定高**:`body.asking #panel` 用 `--bubble-asking-height: 520px` + `max-height: none`,选项和取消按钮必须能点到,不能跟着问题文字变高。`body.asking #transcript` 那里恢复 `flex: 1`。
+- **点击穿透要跟着重报**:窗口是"只有球和卡片区域接收点击"的(click-through),区域由 `syncHitTest()` 用实时 rect 报给主进程。卡片现在会**在打开之后继续长高**(回复流式进来),旧的 rect 会让下半截落进穿透区——字看得见、点不到,也滚不动。所以加了一个 `ResizeObserver(() => syncHitTest())` 观察 `#panel`(不可用时跳过,不影响页面)。
+- **流式续写本来就跟着滚**:`stage()` 里已有 `nearBottom` 判断,块消息到齐后 `transcript.scrollTop = scrollHeight`,所以长回答在 420 的帽子上会一直停在最新一行;卡片在长高阶段是整块往上长(底边钉住),不需要额外滚动。
+- **测试**:`panel-bubble.test.ts` 的断言跟着改——`--bubble-min-height` 76 / `--bubble-max-height` 420、`--bubble-height` 必须彻底消失(而不是被遮挡)、`#panel` 是 `height: auto`、`expand-up` 用底边锚、提问卡用 `--bubble-asking-height`、`#transcript` 是 `0 1 auto` + `min-height: 0`、帽高必须装得进窗口(`≤ 520 - 12`),以及 `ResizeObserver(() => syncHitTest())` 这行必须在页面里。`panel-bubble` + `bubble-line` + `geometry` 三个文件 58 例全过。
+- **静态实测**:装配后的 html+css 走无头 Chromium 三张图——单行「我在。」量成 320×86 的矮条;六段回答长到约 320×300,没有空白也没有滚动条;二十段回答停在 420 并出现滚动条(第 9 段只露出半行,说明是被裁而不是被拉伸)。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py` 重载球页面。
+
+## 18. 气泡里的一左一右：把字幕变成对话记录(2026-11-20)
+
+上一节把气泡做成"有多少字就多高"，这一轮用户把它推到了终点：**我和它的对话要同时显示在这个框里，像微信那样一左一右。**
+
+原来那张卡里只有一条字幕，只能记住"最近一句话"，而且谁的都行——它说"我在"、你说一句、它回一句，三条挤在同一行里轮流出现，读起来像状态栏而不是对话。改法是把"一行字幕"换成"一份对话记录"：
+
+- **结构**：`#bubble-line`（`<p>`）换成 `#bubble-log`（`<div role="log" aria-live="polite" hidden>`），行由 `shell.js` 动态插入，没有静态子节点；空的时候 `hidden`，所以球安静时卡片外观未变。每行是 `.bubble-msg[data-role]` 套一层 `.bubble-text`：`ball` 靠左、浅灰底，`me` 靠右、蓝底白字，`system` 居中、灰色小字。靠说话人的那个圆角切成 5px，当作最省事的"气泡尾巴"。
+- **正文让位**：`#transcript` 改成 `display: none`。它是同一批字的原始排版（还有工具卡片），气泡里要的是重排后的两列，留着就会出现“同一句话上下各一份”。**没有删**——`shell.js` 启动时要解析 60 多个 id、`stage()` 整条路径和提问卡的布局都还在用它，删掉就是整页 TypeError。这与第 15 节隐藏聊天件是同一条原则：能藏不能删。
+- **三种文字都进对话**：唤醒应答 `pushBubble('ball', messages.wakeAck)`（"我在。"），听写结果 `pushBubble('me', text)`（你说的那句靠右），回复 `pushBubble('ball', text)`（在朗读开关之前，所以关掉朗读也看得见）。跨会话那路（主窗口在写字）原本是 `appendBubbleStream`，现在它往**同一个气泡里追加**，而不是每条增量推一个新气泡——一次回答是一个气泡，字在里面长。
+- **状态行另算**：`showBubbleStatus`（"正在听你说…"、"正在识别…"、"没听清"）是**一行有且只有一行**，新的替换旧的，`hold` 是它自己消失的时间（0 = 等到被替换，因为录音和识别都没有本页能计时的终点）。任何真实消息进来都会把它摘掉——状态活得比它描述的那句话长，就是在撒谎。
+- **两种重复被挡住**：① 一次回答既走跨会话流、又走 `speakReply` 的完成回调，同一句会画两遍；`settleBubbleStream` 记下最后落定的文本与时刻，`pushBubble('ball', …)` 在 5 秒内遇到同一句就丢弃第二份（`BUBBLE_TWIN_MS`）。② 流还没结束，用户又说了一句：`pushBubble` 第一件事就是 `settleBubbleStream()`，否则新的碎片会继续落进上一条气泡里。
+- **上限与滚动**：最多留 12 条（`BUBBLE_LOG_ROWS`），超出丢最旧的；单条超过 1200 字（`BUBBLE_LOG_CHARS`）只留尾部加省略号。每插一条都 `bubbleLog.scrollTop = bubbleLog.scrollHeight`，所以最新的一句永远在视野里。新建会话（`clearTranscript`）顺手清空记录，否则新对话会变成旧聊天下面接着写。
+- **高度仍然自适应**：这一节没有推翻第 17 节，只是把 `${#transcript}` 的那套 `flex: 0 1 auto; min-height: 0; overflow-y: auto` 挪到 `#bubble-log` 上，`--bubble-min-height: 76px`／`--bubble-max-height: 420px` 照旧；提问时 `body.asking #bubble-log { display: none }` 让位给 520px 的提问卡。`ResizeObserver(panel) → syncHitTest()` 因此更必要了——每来一条消息卡片都会长高一次。
+- **测试**：`bubble-line.test.ts` 重写为 `bubble-log.test.ts`（29 例，用一个能 `append`/`remove` 的假 DOM 直接跑页面函数）：左右分列、顺序、12 条上限、空白折叠、超长只留尾部、空串不画、四种打开条件、状态行替换/被消息摘掉/自己过期/`hold 0` 常驻、流式只有一个气泡、新消息关闭旧流、同一句不画两遍、清空；另有接线断言（唤醒/听写/回复/跨会话）与样式断言（左右规则、自动高度、`#transcript` 不绘制、提问时让位）。`panel-bubble.test.ts` 与 `speech.test.ts` 的断言同步改写（后者把 `showBubbleLine` 桩换成 `pushBubble`）。
+- **静态实测**：装配后的真 html+css 无头渲染三张——三轮对话（我在。/ 现在几点了 / 现在是下午三点整。）高度约 190、左右分明；五条长对话卡片长到约 460 的截图框内全部可见；超长回答顶到 420 后被裁。
+- **装配**：`pnpm build` → `assemble.mjs --out buildstage\package` → `pack_and_install.py`（`INSTALL VERIFIED`）→ `restart_helper.py`（球窗在、`stream.log` 里 `ready:"complete"`）。
