@@ -39,7 +39,7 @@ CREATE_NO_WINDOW = 0x08000000
 STARTF_USESHOWWINDOW = 0x00000001
 SW_HIDE = 0
 
-PYTHON = r"D:\tools\indextts\py311\python.exe"
+PYTHON = r"D:\tools\py311\python.exe"
 DEFAULT_SCRIPT = r"D:\tools\edgetts\edge_server.py"
 # The file DSH_ORB_TTS_LAUNCH resolves to, which is the switch between engines.
 LAUNCHER = r"D:\tools\indextts\start_server.cmd"

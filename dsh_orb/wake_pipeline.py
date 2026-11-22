@@ -36,7 +36,7 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).parent
-PYTHON = r"D:\tools\indextts\py311\python.exe"
+PYTHON = r"D:\tools\py311\python.exe"
 
 DATA = pathlib.Path(r"C:\Users\digua\wakeword\data")
 FEATURE_DIR = DATA / "features"

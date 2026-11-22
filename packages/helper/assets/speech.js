@@ -68,6 +68,19 @@ export function plainForSpeech(markdown) {
     .replace(/`([^`]+)`/g, '$1')                     // inline code
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' 图片 ')      // images
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')        // links keep their label
+    // A source cited in brackets is meant for the eye, not the ear: reading a URL out loud is a
+    // string of English syllables that says nothing the sentence did not already say. The whole
+    // bracket goes with it, separators and all, because "（ 、 ）" on its own would be read as a
+    // pause in the middle of a sentence. Bracket groups first, so the bare-URL rule below cannot
+    // leave the emptied brackets behind.
+    .replace(/[（(][^（()）\n]*https?:\/\/[^（()）\n]*[）)]/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')                 // any URL left outside brackets
+    .replace(/[（(]\s*[、,，]?\s*[）)]/g, '')         // brackets emptied by either rule
+    // Square brackets are read as a label, not as words: "[17173]" spoken aloud is a run of digits
+    // that belongs to the page, not to the sentence. Unlike the round ones above this is
+    // unconditional — a bracketed aside is a citation marker wherever it appears. It has to come
+    // after the link rule, which is the one case where the bracket holds words worth reading.
+    .replace(/[【\[][^【】\[\]\n]*[】\]]/g, ' ')
     .replace(/^\s{0,3}>\s?/gm, '')                  // block quotes
     .replace(/^\s{0,3}#{1,6}\s+/gm, '')             // headings
     .replace(/^\s{0,3}([-*+]|\d+\.)\s+/gm, '')       // list markers
@@ -75,8 +88,43 @@ export function plainForSpeech(markdown) {
     .replace(/(\*\*|__)(.*?)\1/g, '$2')             // bold
     .replace(/(\*|_)(.*?)\1/g, '$2')                // italic
     .replace(/[*_~`]/g, '')                          // leftovers
+    // A name the service reads badly in Chinese. 德拉曼 is a transliteration the voice spells out
+    // syllable by syllable, and the character answers to the English one; so the words on screen
+    // stay as written while the words in the air are the name itself. Only the name — a Chinese
+    // sentence around it is still Chinese, and the service reads the mix the way it is written.
+    .replace(/德拉曼/g, 'Delamain')
     .replace(/[ \t]+/g, ' ')
     .trim()
+}
+
+/**
+ * The performance notes a reply carries, in the order they appear.
+ *
+ * A bracketed group of Chinese words is direction for the voice, not a word to read: the persona is
+ * told to open a sentence whose tone matters with `[声音低沉下去，语速放慢]`. `plainForSpeech` drops
+ * that group, which is right for the ear — and is exactly why the note has to be collected here,
+ * from the markdown rather than from the stripped text, and handed to the service in a field of its
+ * own. The same syntax also carries citations (`[17173]`), so a candidate has to look like a note:
+ * square brackets only, Chinese words in it, and no link or image standing behind it.
+ *
+ * @param {string} markdown the raw assistant text
+ * @returns {{ text: string, index: number }[]} each note and where it started
+ */
+export function stageDirections(markdown) {
+  if (typeof markdown !== 'string') return []
+  const found = []
+  const pattern = /\[([^[\]\n]{1,60})\]/g
+  let match
+  while ((match = pattern.exec(markdown)) !== null) {
+    const text = match[1].trim()
+    // A direction is Chinese prose. A run of digits or Latin is the citation marker the same
+    // syntax carries in ordinary replies, and a link's label is a word to read, not to perform.
+    if (!/[\u4e00-\u9fff]/.test(text)) continue
+    if (/https?:|\/\/|@/.test(text)) continue
+    if (markdown.charAt(match.index - 1) === '!' || markdown.charAt(match.index + match[0].length) === '(') continue
+    found.push({ text, index: match.index })
+  }
+  return found
 }
 
 /**
@@ -123,6 +171,45 @@ export function sentencesForSpeech(text, { min = MIN_SENTENCE_CHARS, max = MAX_S
 }
 
 /**
+ * Join the sentence list into the units actually sent, two sentences at a time.
+ *
+ * The service chooses its own tempo for every request, and it does so visibly: one sentence asked
+ * for four times came back at 5.56, 6.54, 5.99 and 5.56 characters a second — the same text, the
+ * same voice, no rate asked for. One request per sentence therefore gives every sentence of a reply
+ * a pace of its own, which is heard exactly as the complaint it is: "the middle sentences slow
+ * down". Asking for an explicit rate centres that spread without narrowing it (the request takes
+ * `audio_params.speech_rate`, and ±30 moves the whole distribution), because the spread is the
+ * service choosing rather than the request failing to say.
+ *
+ * What narrows it is a shared utterance: two sentences in one request are read at one tempo by
+ * construction. Two and not more, because both bounds are real — more sentences per request means
+ * hearing fewer of them sooner, and the first sound is the thing this file exists to speed up. A
+ * four-sentence reply becomes two requests, so two paces instead of four, and the wait for the first
+ * one grows by one sentence rather than by three.
+ *
+ * A pair longer than {@link MAX_SENTENCE_CHARS} is left alone: the same request-size bound that
+ * protects a long sentence from becoming a long wait applies to the pair.
+ */
+function pairsForSpeech(sentences, hints) {
+  const units = []
+  for (let index = 0; index < sentences.length; index += 2) {
+    const first = sentences[index]
+    const second = sentences[index + 1]
+    // The note belongs to the sentence it opened, so the pair keeps the first one that exists —
+    // a direction is about how that stretch of the reply should sound, and the second sentence in
+    // the same breath is part of the same stretch.
+    const hint = (hints[index] ?? '') !== '' ? hints[index] : (second === undefined ? '' : (hints[index + 1] ?? ''))
+    if (second === undefined || first.length + second.length > MAX_SENTENCE_CHARS) {
+      units.push({ text: first, hint: hints[index] ?? '' })
+      if (second !== undefined) units.push({ text: second, hint: hints[index + 1] ?? '' })
+      continue
+    }
+    units.push({ text: `${first}${second}`, hint })
+  }
+  return units
+}
+
+/**
  * Whether a `fetch` failed because it never reached the service.
  *
  * Worth distinguishing from a service that answered badly: the first is usually just it not being
@@ -144,8 +231,14 @@ export class Speaker {
    * @param {() => Promise<{ ok: boolean, reason?: string }>} [options.ensure] ask the host to make
    *   sure the service is running, starting it if needed. Omitted when nothing can start it.
    */
-  constructor({ endpoint = 'http://127.0.0.1:8765', onState, ensure } = {}) {
+  constructor({ endpoint = 'http://127.0.0.1:8765', voice = '', onState, ensure } = {}) {
     this.endpoint = endpoint.replace(/\/+$/, '')
+    /**
+     * Which of the service's voices to read with. Sent per request rather than fixed at launch,
+     * because the service routes on it: one URL serves every voice, so choosing one is a field
+     * change and not a restart. Empty means "whatever the service was started with".
+     */
+    this.voice = typeof voice === 'string' ? voice.trim() : ''
     this.onState = typeof onState === 'function' ? onState : () => {}
     this.ensure = typeof ensure === 'function' ? ensure : null
     /** Generation counter — every new request bumps it, and stale work checks it before continuing. */
@@ -192,14 +285,30 @@ export class Speaker {
   }
 
   /**
+   * Choose the voice the next sentences are asked for in.
+   *
+   * Not a cancel: a reading already in the air finishes in the voice it started in, and the one
+   * after it is the new voice. Cutting a sentence off half-way to change timbre is the more
+   * annoying half of the change.
+   */
+  setVoice(voice) {
+    if (typeof voice !== 'string') return
+    const next = voice.trim()
+    if (next === this.voice) return
+    this.voice = next
+    this.emit()
+  }
+
+  /**
    * Apply the host's speech settings.
    *
    * Turning the feature off cancels immediately: leaving a half-read answer playing after the user
    * switched it off would be the more surprising half of that decision.
-   * @param {{enabled?: unknown, autoPlay?: unknown, endpoint?: unknown}} settings
+   * @param {{enabled?: unknown, autoPlay?: unknown, endpoint?: unknown, voice?: unknown}} settings
    */
-  configure({ enabled, autoPlay, endpoint } = {}) {
+  configure({ enabled, autoPlay, endpoint, voice } = {}) {
     this.setEndpoint(endpoint)
+    this.setVoice(voice)
     if (typeof enabled === 'boolean' && enabled !== this.enabled) {
       this.enabled = enabled
       if (!enabled) this.cancel()
@@ -266,10 +375,29 @@ export class Speaker {
    * the button needs it to know which one to turn into a stop control.
    * @param {string} markdown the raw assistant text
    * @param {string} [key] block identity, for the stop affordance
+   * @param {object} [options] `minChars` overrides the "probably a fragment" floor; a wake
+   * acknowledgement is deliberately two characters long and still has to be heard.
    */
-  speak(markdown, key = '') {
+  speak(markdown, key = '', { minChars = MIN_CHARS } = {}) {
     const text = plainForSpeech(markdown)
-    if (!this.enabled || text.length < MIN_CHARS) return
+    if (!this.enabled || text.length < minChars) return
+    const sentences = sentencesForSpeech(text)
+    // Each note is attached to the sentence that sits where the note sat in the reply, measured as a
+    // share rather than as a count: `sentencesForSpeech` merges short lines, so counting sentences
+    // would drift by one and put a tired direction on the joke before it. The share does not drift.
+    const hints = sentences.map(() => '')
+    if (sentences.length > 0) {
+      for (const note of stageDirections(markdown)) {
+        const share = markdown.length === 0 ? 0 : note.index / markdown.length
+        const target = Math.min(sentences.length - 1, Math.floor(share * sentences.length))
+        if (hints[target] === '') hints[target] = note.text
+      }
+    }
+
+    // Two sentences per request, so a reply is read at two paces rather than one per sentence —
+    // see {@link pairsForSpeech} for what that fixes and what it costs. The queue below is
+    // unchanged: it still waits for one unit, asks for the next, then plays this one.
+    const units = pairsForSpeech(sentences, hints)
 
     // A newer request always wins. Cancelling first means the previous answer stops mid-word rather
     // than talking over the new one.
@@ -286,10 +414,18 @@ export class Speaker {
     // is a bug in this file — and an unhandled rejection would leave the button showing a stop square
     // for a reply nobody is reading. The whole text is handed over: `sentencesForSpeech` bounds what
     // one request may contain, and the queue's own generation check is what can stop a reading early.
-    this.run(sentencesForSpeech(text), generation).catch((error) => {
+    //
+    // The promise goes back to the caller because one caller needs the end of the reading as an
+    // edge of its own: a wake acknowledgement holds the microphone shut until it has finished
+    // talking. Every other caller ignores it.
+    this.pending = this.run(
+      units.map((unit) => unit.text),
+      generation,
+      units.map((unit) => unit.hint),
+    ).catch((error) => {
       this.fail('playback', String((error && error.message) || error))
-      this.settle(generation)
     })
+    return this.pending
   }
 
   /**
@@ -307,12 +443,12 @@ export class Speaker {
    * Deliberately not `async` in a way that can reject: a failure is reported through {@link fail} and
    * arrives as a `null`, so the loop has exactly one way out.
    */
-  async run(sentences, generation) {
+  async run(sentences, generation, hints = []) {
     const inFlight = new Map()
     const request = (index) => {
       if (index >= sentences.length) return null
       if (!inFlight.has(index)) {
-        inFlight.set(index, this.request(sentences[index], generation, index === 0))
+        inFlight.set(index, this.request(sentences[index], generation, index === 0, hints[index] ?? ''))
       }
       return inFlight.get(index)
     }
@@ -369,10 +505,15 @@ export class Speaker {
    * Resolves with the audio, or `null` when the answer no longer matters — cancelled, superseded, or
    * failed, in which case {@link fail} has already reported why.
    */
-  request(text, generation, allowRevive) {
+  request(text, generation, allowRevive, instruct = '') {
     return new Promise((resolve) => {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+      // The voice rides with the sentence, and the performance note rides beside it rather than in
+      // it: the service reads the note as direction for how to speak the sentence, and the text it
+      // reads out is the sentence alone — the note was already dropped from that by plainForSpeech.
+      const payload = this.voice === '' ? { text } : { text, voice: this.voice }
+      if (instruct !== '') payload.instruct = instruct
       const settle = (value) => {
         clearTimeout(timer)
         resolve(value)
@@ -381,7 +522,9 @@ export class Speaker {
       fetch(`${this.endpoint}/speak`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        // The voice rides with the sentence: the service picks its engine from it, so leaving it out
+        // would silently read everything in whatever that process was launched with.
+        body: JSON.stringify(payload),
         signal: controller.signal,
       })
         .then((response) => {

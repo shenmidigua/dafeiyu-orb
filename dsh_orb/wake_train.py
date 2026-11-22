@@ -68,6 +68,11 @@ LR = 1e-4
 # reads the disk instead.
 HARD_NEGATIVE_WEIGHT = 3.0
 
+# What one positive window is worth is not a constant: it depends on how big the grid is. The rule
+# lives at the usage site (a compact phrase family has ~210 clips against ~4686 negatives, and at
+# weight 1.0 the loss is mostly "do not fire on speech" — the first 小弟 model answered 0.000 on
+# held-out positives), and `--positive-weight` overrides it.
+
 # openWakeWord's own hard-example filter. Negatives already scoring near zero are suppressed and cost
 # nothing to keep punishing; positives already near one are learned. Dropping them concentrates every
 # step on the samples that are still wrong.
@@ -118,11 +123,11 @@ class Split:
     that they agree.
     """
 
-    def __init__(self, side: str, hard: bool | None = None) -> None:
+    def __init__(self, side: str, hard: bool | None = None, stem: str = "") -> None:
         self.side = side
-        self.x = np.load(FEATURE_DIR / f"{side}.npy").astype(np.float32)
-        self.clip_ids = np.load(FEATURE_DIR / f"{side}-clips.npy").astype(np.int64)
-        self.names = json.loads((FEATURE_DIR / f"{side}-names.json").read_text(encoding="utf-8"))
+        self.x = np.load(FEATURE_DIR / f"{stem}{side}.npy").astype(np.float32)
+        self.clip_ids = np.load(FEATURE_DIR / f"{stem}{side}-clips.npy").astype(np.int64)
+        self.names = json.loads((FEATURE_DIR / f"{stem}{side}-names.json").read_text(encoding="utf-8"))
         if self.x.shape[0] != self.clip_ids.shape[0]:
             raise SystemExit(f"{side}: {self.x.shape[0]} windows but {self.clip_ids.shape[0]} ids")
         if self.clip_ids.size and int(self.clip_ids.max()) >= len(self.names):
@@ -257,34 +262,56 @@ def export(model: nn.Module, path: pathlib.Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phrase", default="dafeiyu",
+                        help="which wake word to train (see wake_phrases.PROFILES); each one reads "
+                             "its own feature files and writes its own model")
     parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--positive-weight", type=float, default=None,
+                        help="what one positive window is worth against the negatives; omit it and a "
+                             "grid under a thousand clips gets 6.0, a bigger one keeps 1.0")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", type=pathlib.Path, default=OUTPUT)
+    parser.add_argument("--out", type=pathlib.Path, default=None)
     parser.add_argument("--load", type=pathlib.Path, default=None,
                         help="skip training and export this checkpoint instead")
     args = parser.parse_args()
+
+    # `dafeiyu`'s files have no stem, because they were written before there was a second keyword.
+    # Every other phrase is namespaced, so one directory can hold several models' arrays and neither
+    # training run can pick up the other's positive clips.
+    stem = "" if args.phrase == "dafeiyu" else f"{args.phrase}-"
+    if args.out is None:
+        args.out = OUTPUT if args.phrase == "dafeiyu" else FEATURE_DIR / f"{args.phrase}.onnx"
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
     for required in ("positive", "negative", "prefix"):
-        if not (FEATURE_DIR / f"{required}.npy").exists():
-            raise SystemExit(f"no {required}.npy under {FEATURE_DIR}; run "
-                             f"`wake_dataset.py features` first")
+        if not (FEATURE_DIR / f"{stem}{required}.npy").exists():
+            raise SystemExit(f"no {stem}{required}.npy under {FEATURE_DIR}; run "
+                             f"`wake_dataset.py features --phrase {args.phrase}` first")
 
-    positive = Split("positive")
-    negative = Split("negative")
+    positive = Split("positive", stem=stem)
+    negative = Split("negative", stem=stem)
     # The positive clips' own prefix windows, labelled negative. See PREFIX_SLOTS in wake_dataset.py
     # for the measurement this exists to fix; here it is one more block of negatives to train on.
-    prefix = Split("prefix", hard=True)
+    prefix = Split("prefix", hard=True, stem=stem)
     if prefix.n_clips != positive.n_clips:
         raise SystemExit(f"prefix: {prefix.n_clips} clips against {positive.n_clips} positives. The "
                          f"two must be in step or their folds cannot be copied across, and a prefix "
                          f"window in training with its own phrase held out is a memorised score "
                          f"reported as a generalisation score.")
     print(f"  positives: {positive.x.shape[0]} windows / {positive.n_clips} clips")
+    # The compact phrase grid runs ~210 clips against ~4686 negatives, and at weight 1.0 the model
+    # learns the majority class: the first 小弟 model answered 0.000 on held-out positives at every
+    # threshold above 0.3, i.e. it could not be shipped at any setting. The 大肥鱼 grid is 1470/4018
+    # and was fine at 1.0, so the default is a rule rather than a number: a grid under a thousand
+    # clips gets 6.0, everything else keeps the historical 1.0.
+    positive_weight = args.positive_weight
+    if positive_weight is None:
+        positive_weight = 6.0 if positive.n_clips < 1000 else 1.0
+    print(f"  positive weight: {positive_weight:g}")
     print(f"  negatives: {negative.x.shape[0]} windows / {negative.n_clips} clips "
           f"({int(negative.hard_clip.sum())} adversarial)")
     print(f"  prefix negatives: {prefix.x.shape[0]} windows, hard by construction")
@@ -305,9 +332,9 @@ def main() -> int:
     # re-deriving it means re-running this RNG in this exact order, and any change to the number of
     # folds or the order of these two calls would silently move clips across the fence, turning a
     # held-out score into a memorisation score with nothing to show for it.
-    np.save(FEATURE_DIR / "folds-positive.npy", positive.folds)
-    np.save(FEATURE_DIR / "folds-negative.npy", negative.folds)
-    np.save(FEATURE_DIR / "folds-prefix.npy", prefix.folds)
+    np.save(FEATURE_DIR / f"{stem}folds-positive.npy", positive.folds)
+    np.save(FEATURE_DIR / f"{stem}folds-negative.npy", negative.folds)
+    np.save(FEATURE_DIR / f"{stem}folds-prefix.npy", prefix.folds)
 
     train_positive = positive.windows(fold, held_out=False)
     train_negative = negative.windows(fold, held_out=False)
@@ -316,7 +343,7 @@ def main() -> int:
     y = np.concatenate([np.full(int(train_positive.sum()), 1.0, dtype=np.float32),
                         np.zeros(int(train_negative.sum()), dtype=np.float32),
                         np.zeros(int(train_prefix.sum()), dtype=np.float32)])
-    weight = np.concatenate([np.ones(int(train_positive.sum()), dtype=np.float32),
+    weight = np.concatenate([np.full(int(train_positive.sum()), positive_weight, dtype=np.float32),
                              negative.hard_weight()[train_negative],
                              prefix.hard_weight()[train_prefix]])
     print(f"  training on {x.shape[0]} windows, holding out fold {fold}")
@@ -391,7 +418,7 @@ def main() -> int:
         model.load_state_dict(best_state)
     print(f"  best clip AUC: {best_auc:.4f}")
 
-    checkpoint = FEATURE_DIR / "dafeiyu.pt"
+    checkpoint = FEATURE_DIR / f"{args.phrase}.pt"
     torch.save({"state": model.state_dict(), "input_shape": list(INPUT_SHAPE), "fold": fold,
                 "folds": args.folds, "seed": args.seed, "epochs": args.epochs,
                 "clip_auc": best_auc}, checkpoint)

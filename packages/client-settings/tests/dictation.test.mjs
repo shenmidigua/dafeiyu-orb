@@ -39,6 +39,11 @@ function loadPage(options = {}) {
   // How long the limits take to arrive, which is the window between "a turn was asked for" and
   // "the device opens".
   const dictationDelayMs = options.dictationDelayMs ?? 0
+  // Hand-offs the wake bridge should receive, one per poll: the first entry is a wake that is
+  // already waiting when the page loads, and after the queue is empty the loop parks.
+  const wakes = options.wake === undefined ? [] : [options.wake]
+  const sent = []
+  const results = []
 
   class FakeContext {
     constructor(settings) {
@@ -155,7 +160,24 @@ function loadPage(options = {}) {
       // The wake hand-off polls this page for as long as it is open. Real timers would keep this
       // process alive after the last test, so the first poll parks on a promise that never
       // settles: the recorder under test needs no wake word, and nothing here waits on the loop.
-      if (path === '/.dsh-orb/main-voice') return new Promise(() => {})
+      if (path === '/.dsh-orb/main-voice') {
+        if (wakes.length > 0) {
+          const next = wakes.shift()
+          return json(next)
+        }
+        return new Promise(() => {})
+      }
+      if (path === '/.dsh-orb/voice-send') {
+        if (request.method !== 'POST') return { ok: false, status: 405, async text() { return '{}' } }
+        sent.push(JSON.parse(request.body).text)
+        calls.push({ path, request })
+        return json({ ok: true })
+      }
+      if (path === '/.dsh-orb/main-voice-result') {
+        results.push(JSON.parse(request.body))
+        calls.push({ path, request })
+        return json({ ok: true })
+      }
       if (path === '/.dsh-orb/client-report') {
         if (request.body) notes.push(JSON.parse(request.body).note)
         return json({ ok: true })
@@ -198,7 +220,7 @@ function loadPage(options = {}) {
     slots: { inject: (_name, register) => register(), register: () => {} },
   })
 
-  return { sandbox, draft, events, posted, notes, dictation, contexts, cues, get mediaCalls() { return mediaCalls } }
+  return { sandbox, draft, events, posted, notes, results, dictation, contexts, cues, sent, get mediaCalls() { return mediaCalls } }
 }
 
 function json(body) {
@@ -442,5 +464,64 @@ describe('composer dictation button', () => {
     assert.equal(await running, 'empty')
     assert.equal(page.mediaCalls, 0, 'the microphone never opens for a turn that was called off')
     assert.equal(page.posted.length, 0)
+  })
+})
+
+/**
+ * A wake turn whose hand-off names a conversation, and the pressed button beside it.
+ *
+ * The user pinned one session and asked that every speech-awakened sentence go there, whatever
+ * window is in front. That means two things have to hold at once: the wake turn posts the words and
+ * never types them into the box on screen, and a hand-pressed turn keeps behaving exactly as before.
+ */
+describe('a wake turn routed to one conversation', () => {
+  const wake = (extra = {}) => ({
+    start: true,
+    send: true,
+    continuous: true,
+    silenceMs: 120,
+    maxSeconds: 5,
+    noSpeechMs: 300,
+    ...extra,
+  })
+
+  it('posts the transcript instead of writing it here', async () => {
+    const page = loadPage({ wake: wake({ sendTo: 'session-voice' }) })
+    await speak(page)
+    const started = Date.now()
+    while (Date.now() - started < 5_000 && page.sent.length === 0) await sleep(20)
+    assert.deepEqual(page.sent, ['你好'], `notes: ${page.notes.join(' | ')}`)
+    assert.equal(page.draft.value, '', 'nothing is typed into the window that happens to be in front')
+    assert.ok(
+      page.notes.filter((note) => typeof note === 'string').some((note) => note.includes('sent the transcript to the wake target (session-voice)')),
+      'the turn says where it went, because the reply is not on this screen',
+    )
+  })
+
+  it('does not reopen the microphone on a routed turn', async () => {
+    const page = loadPage({ wake: wake({ sendTo: 'session-voice' }) })
+    await speak(page)
+    const started = Date.now()
+    while (Date.now() - started < 5_000 && page.sent.length === 0) await sleep(20)
+    // The reply is being written in another conversation, so there is nothing here to wait for and
+    // nothing to hand the microphone back for: a second automatic recording is what this rules out.
+    await sleep(400)
+    assert.equal(page.mediaCalls, 1, 'one wake is one recording')
+    // And the ball is told, because it keeps its own continuous exchange alive at the wake: without
+    // this flag it hands the microphone back the moment that reply starts being read out, and the
+    // agent's own voice becomes the next user turn.
+    assert.deepEqual(page.results.at(-1), { outcome: 'sent', routed: true })
+  })
+
+  // The rule the user stressed: only a wake routes. A press of the button beside the composer is
+  // the same recorder on the same profile, and it must still drop the words in the box.
+  it('leaves the pressed button writing into the box', async () => {
+    const page = loadPage({ dictation: { autoSend: true } })
+    const running = page.sandbox.window.__dshOrbBallTurn()
+    await speak(page)
+    assert.equal(await running, 'sent')
+    assert.equal(page.sent.length, 0, 'the button has nowhere else to send it')
+    assert.ok(page.events.some((event) => event.type === 'keydown'), 'it submits through the composer')
+    assert.deepEqual(page.results, [], 'and no hand-off happened, so there is no ending to report')
   })
 })

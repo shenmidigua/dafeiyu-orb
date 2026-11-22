@@ -35,7 +35,7 @@ STARTF_USESHOWWINDOW = 0x00000001
 SW_HIDE = 0
 SW_SHOWNORMAL = 1
 
-PYTHON = r"D:\tools\indextts\py311\python.exe"
+PYTHON = r"D:\tools\py311\python.exe"
 CMD = r"C:\Windows\System32\cmd.exe"
 
 # Stands in for start_server.cmd: a cmd that runs a console python which stays resident. `-c` keeps

@@ -40,12 +40,46 @@ def digest(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def deployed_model() -> pathlib.Path:
-    """The file the orb loads, from the orb's own settings rather than from a retyped path."""
+def deployed_model(keyword: str = "") -> pathlib.Path:
+    """The file the orb loads, from the orb's own settings rather than from a retyped path.
+
+    The keyword defaults to the one the orb is configured for, which is right for the common case of
+    replacing the model it is already running. `--as` overrides it, because with several keywords
+    installed side by side the file to replace is the one being retrained, not the one currently
+    selected: naming the target after the *configured* keyword would write a 小弟 model called
+    dafeiyu.onnx and quietly ruin the model that was working.
+    """
     settings = json.loads(SETTINGS.read_text(encoding="utf8"))
     directory = pathlib.Path(settings["assetDirectory"])
-    keyword = settings["keyword"]
-    return directory / f"{keyword}.onnx"
+    name = keyword or settings["keyword"]
+    return directory / f"{name}.onnx"
+
+
+def write_sidecar(target: pathlib.Path, source: pathlib.Path) -> None:
+    """Copy the threshold the model was measured at into `<keyword>.json` beside it.
+
+    The threshold travels with the model because `orb-wake.json` holds one number for whichever
+    keyword is selected, which was fine while there was one keyword. With several side by side they
+    each have their own operating point — 小弟's 0.999 is its own measurement, not 大肥鱼's 0.95 —
+    and a global number would hand the next word somebody else's cut-off. The report is read from
+    beside the model that was trained (`features/<keyword>-eval.json`), because this step is the one
+    that knows both.
+    """
+    report = source.parent / f"{source.stem}-eval.json"
+    if not report.exists():
+        print(f"  no eval report next to {source.name}; the orb keeps its current threshold")
+        return
+    try:
+        chosen = json.loads(report.read_text(encoding="utf8")).get("chosen") or {}
+        value = chosen.get("threshold")
+    except (OSError, ValueError, TypeError):
+        value = None
+    if value is None:
+        print(f"  {report.name} names no threshold; the orb keeps its current one")
+        return
+    sidecar = target.with_name(f"{target.stem}.json")
+    sidecar.write_text(json.dumps({"threshold": round(float(value), 4)}, indent=2), encoding="utf8")
+    print(f"  threshold {round(float(value), 4)} written to {sidecar.name}")
 
 
 def main() -> int:
@@ -53,6 +87,8 @@ def main() -> int:
     parser.add_argument("--from", dest="source", type=pathlib.Path, default=DEFAULT_SOURCE)
     parser.add_argument("--tag", default=time.strftime("%Y-%m-%d"),
                         help="what the model being replaced is backed up as")
+    parser.add_argument("--as", dest="as_keyword", default="",
+                        help="deploy as this keyword's file (default: the keyword the orb is set to)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -62,7 +98,7 @@ def main() -> int:
         return 1
 
     try:
-        target = deployed_model()
+        target = deployed_model(args.as_keyword)
     except Exception as error:  # noqa: BLE001
         print(f"  cannot read the orb's settings ({type(error).__name__}: {error})")
         print(f"  looked in {SETTINGS}")
@@ -74,9 +110,12 @@ def main() -> int:
     source_digest = digest(source)
     if target.exists() and digest(target) == source_digest:
         print()
-        print("  the deployed model is already these exact bytes — nothing to do.")
+        print("  the deployed model is already these exact bytes — nothing to copy.")
         print("  (If the orb is still behaving like the old one, it is the restart that is missing,")
         print("   not the copy: the helper loads the model once, when its engine starts.)")
+        # Still worth doing: a re-run after a hand-copied model is exactly when the sidecar is
+        # missing, and skipping it here would leave the orb on the previous keyword's threshold.
+        write_sidecar(target, source)
         return 0
 
     if target.exists():
@@ -111,6 +150,7 @@ def main() -> int:
         print(f"  *** the copy does not match the source ({after[:16]} against {source_digest[:16]}) ***")
         return 1
     print(f"  deployed {after[:16]}  ({target.stat().st_size} bytes), verified byte for byte")
+    write_sidecar(target, source)
 
     print()
     print("  The orb is still running the previous model: the helper loads it once, when its engine")

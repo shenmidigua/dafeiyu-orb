@@ -16,7 +16,7 @@ describe('a wake turn uses the page\'s own recorder', () => {
   it('hands the turn to the shared recorder with the ball\'s numbers', () => {
     assert.match(
       page,
-      /async function oneTurn\(command, afterReply = false\)[\s\S]{0,2000}?return await voiceTurn\(limits, command\.send === true, grace\)/,
+      /async function oneTurn\(command, afterReply = false\)[\s\S]{0,2000}?return await voiceTurn\(limits, command\.send === true, grace, sendTo\)/,
       'a wake turn must run the same recorder the microphone button runs',
     )
   })
@@ -39,7 +39,7 @@ describe('a wake turn uses the page\'s own recorder', () => {
   it('waits for read-aloud to finish before opening the device', () => {
     assert.match(
       page,
-      /async function voiceTurn\(limits, send, graceMs = 0\) \{\s*try \{[\s\S]{0,400}?await waitForQuiet\(180_000, graceMs\)[\s\S]{0,400}?markListening\(true\)/,
+      /async function voiceTurn\(limits, send, graceMs = 0, sendTo = ''\) \{\s*try \{[\s\S]{0,400}?await waitForQuiet\(180_000, graceMs\)[\s\S]{0,400}?markListening\(true\)/,
       'a microphone opened into a reply that is still being read records the reply',
     )
     assert.match(page, /data-phase="playing"\], \[data-phase="preparing"/, 'the read-aloud button publishes its phase')
@@ -152,6 +152,75 @@ describe('a wake turn uses the page\'s own recorder', () => {
       assert.ok(lead <= 40, `${name}: ${lead.toFixed(0)} ms of silence before the first word`)
       assert.ok(tail <= 160, `${name}: ${tail.toFixed(0)} ms of silence after the last word`)
     }
+  })
+})
+
+// A wake turn can be aimed at one fixed conversation: the user pinned a session called 语音总管 and
+// asked for every speech-awakened turn to land there whatever window is in front. Two halves have
+// to hold for that to be true — the host decides the target, and the page posts the words instead of
+// typing them here — and the "only after a wake" rule lives in the fact that a hand-pressed
+// microphone button never carries a `sendTo` at all.
+describe('a wake turn can be pointed at one conversation', () => {
+  it('posts the transcript when the hand-off names a target', () => {
+    assert.match(
+      page,
+      /if \(sendTo !== ''\) \{[\s\S]{0,600}?await postWords\(text\)/,
+      'a targeted turn goes to the host rather than into this window\'s composer',
+    )
+    assert.match(
+      page,
+      /async function postWords\(text\)[\s\S]{0,600}?'\/\.dsh-orb\/voice-send'/,
+      'the page hands the words over on the host\'s own route',
+    )
+  })
+
+  it('keeps the pressed-microphone button out of it', () => {
+    // The button beside the composer is the same recorder, and it must keep writing into the box.
+    assert.match(page, /return await voiceTurn\(limits, limits\.autoSend\)/, 'the button path passes no target')
+  })
+
+  it('does not continue the exchange on a targeted turn', () => {
+    assert.match(
+      page,
+      /const routed = typeof command\.sendTo === 'string' && command\.sendTo !== ''/,
+      'the loop has to know a targeted turn cannot be waited on from here',
+    )
+    assert.match(
+      page,
+      /while \(outcome === 'sent' && command\.continuous === true && !routed\)/,
+      'a reply running in another window is not a reply this page can wait for',
+    )
+    assert.match(
+      page,
+      /void reportTurnOutcome\(outcome, routed\)/,
+      'and the ball has to be told, or it hands the microphone back on its own',
+    )
+  })
+
+  it('resolves the target by title, and falls back rather than failing', () => {
+    const orb = readFileSync(join(here, '../../host/src/orb.ts'), 'utf8')
+    assert.match(orb, /const VOICE_TARGET_TITLE = '语音总管'/, 'the title is the pin the user described')
+    assert.match(
+      orb,
+      /if \(record\.origin === 'subagent'\) continue/,
+      'a subagent that happens to carry the title is not a conversation anybody can talk to',
+    )
+    assert.match(
+      orb,
+      /\.\.\.\(target === undefined \? \{\} : \{ sendTo: target \}\)/,
+      'no target means the ordinary hand-off, unchanged: the words land in the visible conversation',
+    )
+  })
+
+  it('holds the hand-off long enough for the lookup, never longer', () => {
+    const orb = readFileSync(join(here, '../../host/src/orb.ts'), 'utf8')
+    assert.match(
+      orb,
+      /if \(this\.voiceRoute\.pending && Date\.now\(\) - this\.voiceRoute\.since < VOICE_ROUTE_WAIT_MS\) return null/,
+      'a poll inside the lookup has to come back empty without consuming the hand-off',
+    )
+    const wait = Number(/const VOICE_ROUTE_WAIT_MS = ([0-9_]+)/.exec(orb)[1].replace(/_/g, ''))
+    assert.ok(wait <= 3_000, `the hold stays short, got ${wait} ms`)
   })
 })
 

@@ -193,12 +193,15 @@ describe('the score the engine reports', () => {
 
   it('counts a run up to the number of windows the rule needs, then starts over', async () => {
     const fixture = engine()
-    await feed(fixture, true, 0.99, 0.99, 0.99)
+    // The dot count belongs to the rule, so this feeds as many windows as the rule needs instead of
+    // the three that used to be a literal here. Pinning 3 made the test fail the moment the rule
+    // became two - which is the test doing its job, but for a reason that is not the rule's.
+    await feed(fixture, true, ...Array.from({ length: CONSECUTIVE_WINDOWS }, () => 0.99))
     // The window that fires is reported with the run it completed, not with the zero it is reset to:
     // the meter has to be able to show all the dots lit and *then* the ball wake, or the last thing
     // the user sees before a detection is a bar that appears to have given up one window early.
     assert.deepEqual(fixture.state.reports.map((report) => report.streak),
-                     [1, 2, CONSECUTIVE_WINDOWS],
+                     Array.from({ length: CONSECUTIVE_WINDOWS }, (_, index) => index + 1),
                      `a run should climb to ${CONSECUTIVE_WINDOWS} on the window that fires`)
     assert.equal(fixture.state.fires.length, 1)
 

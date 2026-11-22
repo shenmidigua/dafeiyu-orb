@@ -18,7 +18,7 @@ import sys
 import time
 
 CREATE_NO_WINDOW = 0x08000000
-PYTHON = r"D:\tools\indextts\py311\python.exe"
+PYTHON = r"D:\tools\py311\python.exe"
 SCRIPT = pathlib.Path(r"D:\tools\milora\milora_server.py")
 
 

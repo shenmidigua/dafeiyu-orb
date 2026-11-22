@@ -94,6 +94,12 @@ declare module 'electron' {
     checked?: boolean
     enabled?: boolean
     submenu?: MenuItemOptions[]
+    /**
+     * A built-in command instead of a handler. The one place it is used is the selection menu: `copy`
+     * and `selectAll` are Chromium's own edit commands, which is what makes right-clicking a
+     * selection write to the system clipboard (and match what Ctrl+C already does).
+     */
+    role?: 'copy' | 'cut' | 'paste' | 'selectAll'
     click?: (item: { checked: boolean }) => void
   }
 

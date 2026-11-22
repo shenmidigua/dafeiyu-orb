@@ -19,7 +19,7 @@ Two things are reported per candidate:
 
 Run with the interpreter the rest of the wake-word pipeline uses (see `wake_pipeline.py`):
 
-    D:\\tools\\indextts\\py311\\python.exe wake_candidate_probe.py [--voices 14] [--rates 3]
+    D:\\tools\\py311\\python.exe wake_candidate_probe.py [--voices 14] [--rates 3]
 """
 
 from __future__ import annotations

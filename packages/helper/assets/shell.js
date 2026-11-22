@@ -402,7 +402,7 @@ const DOCK_HOVER_ENABLED = true
  * so the two cannot drift: the only loose end is this margin, which the test pins to the helper's
  * own constant.
  */
-const DOCK_ARRIVE_MARGIN_PX = 8
+const DOCK_ARRIVE_MARGIN_PX = 3
 /**
  * How much further the pointer has to travel *past* the peeking ball before the peek is put away,
  * in CSS pixels.
@@ -429,12 +429,17 @@ const RECOMMENDED_SUFFIX = /\s*(?:\((?:recommended|推荐)\)|（(?:recommended|�
 const PERMISSION_PRESETS = ['read-only', 'workspace-write', 'danger-full-access']
 
 /**
- * Reads assistant replies aloud through the local IndexTTS service.
+ * Reads assistant replies aloud through the local read-aloud service on `endpoint`.
  *
- * The settings page owns the switches: the host pushes `speech: { enabled, autoPlay, endpoint }` in
- * every `chrome` message, so turning speech on takes effect without a rebuild or a restart. Off is
- * the default, because a fresh profile has no service behind it and a play button that never works
- * is worse than no button.
+ * The service is whatever listens on that port; today it is the Edge proxy, and the local IndexTTS
+ * model that used to serve it was removed from this machine on 2026-11-21. Nothing here is
+ * engine-specific: the contract is `GET /health` and `POST /speak`, and the `voice` field of the
+ * request is how one process serves several timbres.
+ *
+ * The settings page owns the switches: the host pushes `speech: { enabled, autoPlay, endpoint,
+ * voice }` in every `chrome` message, so turning speech on — or changing the timbre — takes effect
+ * without a rebuild or a restart. Off is the default, because a fresh profile has no service behind
+ * it and a play button that never works is worse than no button.
  *
  * `?speech=off` / `?speech=<url>` still override the host, which is how you test a port without
  * touching the profile file.
@@ -444,6 +449,9 @@ const PERMISSION_PRESETS = ['read-only', 'workspace-write', 'danger-full-access'
  */
 const speechParams = new URLSearchParams(location.search)
 const SPEECH_ENDPOINT = speechParams.get('speech') ?? 'http://127.0.0.1:8765'
+// One window may try a voice without writing the profile, the same way `?speech=<url>` tries a
+// port. Empty means the voice arrives with the first settings push, as it always did.
+const SPEECH_VOICE = speechParams.get('voice') ?? ''
 /**
  * Block key → its read-aloud button.
  *
@@ -462,9 +470,19 @@ const speechButtons = new Map()
  * assignment the notification has nothing to repaint, because no button exists yet.
  */
 let syncSpeechButtons = () => {}
+/**
+ * Re-point the wake confirmation at the pre-rendered set for the voice that is now selected.
+ *
+ * Declared as a no-op for the same reason as {@link syncSpeechButtons}: the speaker is constructed
+ * before the wake engine exists, and it notifies its listener during that construction.
+ */
+let syncWakeVoiceSet = () => {}
 const speaker = new Speaker({
   endpoint: SPEECH_ENDPOINT,
-  onState: (state) => syncSpeechButtons(state),
+  // The voice the host has stored, so the first sentence is already in the chosen one instead of
+  // waiting for the first settings push to arrive.
+  voice: SPEECH_VOICE,
+  onState: (state) => { syncSpeechButtons(state); syncWakeVoiceSet() },
   // Starting the service is the host's job: the page can spawn nothing, and the host is what knows
   // how this machine launches it. Resolves once it is up — or once it has given up.
   ensure: () => (typeof api?.ensureSpeech === 'function'
@@ -473,6 +491,67 @@ const speaker = new Speaker({
 })
 if (speechParams.has('speech')) {
   speaker.configure({ enabled: speechParams.get('speech') !== 'off' })
+}
+
+/**
+ * The lines a cloned voice answers a wake with.
+ *
+ * Pre-rendered rather than spoken on the spot: every line is rendered once into
+ * `assets/voices/<voice>-<n>.wav`, numbered in this table's order, so a wake is a file this page
+ * already holds. One table for the clips and the captions is what keeps them together: the bubble
+ * looks its text up by the index of the take that played, so a caption can only be wrong if this
+ * table is wrong.
+ *
+ * Seven lines, drawn at random per wake, so the ball does not answer with the same sentence every
+ * time. They are the user's own picks: the bare "我在。" is the shortest and plainest, the rest lean
+ * on the character's formal register — 报身份、请人开口、或只是表示在候命. The bare "我在。" was
+ * called abrupt once and is kept because he still wants it in the rotation.
+ */
+const WAKE_ACK_LINES = Object.freeze([
+  '我在。',
+  '我在，您请讲。',
+  '我在，请您吩咐。',
+  '有何吩咐？',
+  '听候您的指示。',
+  '随时为您服务。',
+  '您请讲。',
+])
+
+/**
+ * The names a person sees in `assets/voices`, by voice id.
+ *
+ * A take used to be `volc-S_LDHrp2Kl2-3.wav`, which says nothing to whoever opens that folder; the
+ * files are now named for the voice and the sentence it speaks (`德拉曼-3-我在请您吩咐.wav`). The
+ * ids are the ones the profile stores, and a voice that is not in this table keeps its id as the
+ * label — a folder with an id in it is ugly, but a name that does not match its file is broken.
+ */
+const ACK_VOICE_NAMES = Object.freeze({
+  'volc-S_LDHrp2Kl2': '德拉曼',
+  'volc-S_77Ftp2Kl2': '德拉曼2',
+})
+
+/** A line as it appears inside a file name: nothing a filesystem would refuse. */
+function lineForFileName(line) {
+  return line.replace(/[，。？！、；：,.?!"'“”‘’\s]/g, '')
+}
+
+/**
+ * Which pre-rendered set belongs to a voice, if any ships with it.
+ *
+ * A voice without a set returns `undefined`, which is what tells the engine to use the shipped
+ * takes and the page to speak the line through the service instead. The voices that do ship one
+ * get the whole latency win: no request, no synthesis wait, no silence.
+ * @param voice - the read-aloud voice id the profile stores.
+ */
+function ackSetFor(voice) {
+  if (typeof voice !== 'string' || !voice.startsWith('volc-')) return undefined
+  const label = ACK_VOICE_NAMES[voice] ?? voice
+  return {
+    // Number and sentence together: the number keeps the order of `WAKE_ACK_LINES`, the sentence is
+    // what makes one file tell itself apart from the next in a folder listing.
+    names: WAKE_ACK_LINES.map((line, index) => `voices/${label}-${String(index + 1)}-${lineForFileName(line)}.wav`),
+    texts: WAKE_ACK_LINES,
+  }
 }
 
 const zh = {
@@ -523,8 +602,12 @@ const zh = {
   wakeRecording: '正在听你说…',
   wakeTranscribing: '正在识别…',
   // 唤醒应答只有一段音频 clip（`playWakeFrame`），屏幕上原本什么都不写，气泡看着像“没反应”。
-  // 这一行就是那段 clip 的字幕，也是气泡被唤醒后第一句有内容的话。
+  // 但字幕不该写死在这里：三段 clip 不是同一句话（「我在」「我在呢」「我在听你说」），写死一行就
+  // 会对不上随机抽到的那一段。真正在说的字跟 clip 放在同一张表里（`WAKE_VOICE_TEXTS`，wake.js），
+  // 气泡的字幕取自那一张表；下面这条只是「一段 clip 都没放出来、只响了提示音」时的兜底。
   wakeAck: '我在。',
+  bubbleMore: '展开',
+  bubbleLess: '收起',
   wakeLoading: '语音唤醒加载中…',
   wakeFailed: '语音唤醒不可用：{why}',
   wakeOff: '语音唤醒已关闭',
@@ -597,8 +680,12 @@ const en = {
   wakeDetected: 'Wake word heard',
   wakeRecording: 'Listening to you…',
   wakeTranscribing: 'Transcribing…',
-  // The caption for the acknowledgement clip — see the note on the Chinese table.
+  // Only the fallback for the no-clip (chime) path: the caption itself is read from
+  // `WAKE_VOICE_TEXTS` in wake.js, the table that describes the takes — they are not all the same
+  // sentence, so one line written here captioned whichever take it did not describe wrongly.
   wakeAck: 'Here.',
+  bubbleMore: 'Show',
+  bubbleLess: 'Hide',
   wakeLoading: 'Starting wake word…',
   wakeFailed: 'Wake word unavailable: {why}',
   wakeOff: 'Wake word off',
@@ -776,6 +863,29 @@ function main() {
   let expanded = false
   let pinned = false
   let running = false
+  /**
+   * The panel a wake opened on its own, so a turn that heard nothing can close it again.
+   *
+   * Only the opening time is kept. Anything that would make a *message* arrive — the user's turn or
+   * an answer, streamed or settled — clears it, which is what "there was an exchange after all"
+   * means; the age covers the other accident, a result arriving long after the user has reopened the
+   * same panel by hand for something else.
+   */
+  let wakePanelAuto
+  /** How long a wake's empty turn may take before its ending stops counting as that turn's. */
+  const WAKE_PANEL_FOLD_MS = 120_000
+  /**
+   * How long an open card may sit with nothing new in it before it puts itself away.
+   *
+   * The card normally closes when the pointer leaves it (`scheduleCollapse`). That covers the card
+   * the user opened by hand and then walked away from, but not one that opened itself — a card
+   * raised by an arriving message or by a wake, with the pointer somewhere else entirely, never
+   * sees a `pointerleave` it could close on. It then stays over the desktop indefinitely: a hole
+   * the user cannot click through and cannot explain. Measured from the last thing that arrived in
+   * it, so a conversation in progress keeps it up by itself.
+   */
+  const CARD_IDLE_MS = 60_000
+  let cardIdleTimer
   let attachedSelection = ''
   let tccGateVisible = false
   let processGroup
@@ -1115,7 +1225,15 @@ function main() {
   // The wake word is the phrase said TWICE, so the hint has to say it twice too: a user told to say
   // 「大肥鱼」 once is being sent at a word the model was trained to ignore. Kept in step with
   // `WAKE_SPOKEN_NAMES` in `src/wake.ts` by `tests/wake-names.test.ts`.
-  const KEYWORD_NAMES = { hey_jarvis: 'Hey Jarvis', dafeiyu: '大肥鱼大肥鱼' }
+  const KEYWORD_NAMES = {
+    hey_jarvis: 'Hey Jarvis',
+    dafeiyu: '大肥鱼大肥鱼',
+    xiaodi: '小弟小弟',
+    xiaohui: '小慧小慧',
+    dacheng: '大成大成',
+    laode: '老德老德',
+    heilaode: '嘿老德',
+  }
   let wakeKeyword = ''
   // One dictation at a time: the recorder lives on the engine's microphone.
   let dictationBusy = false
@@ -1156,6 +1274,24 @@ function main() {
     // the microphone is open, and only this page's meter reads it.
     onScore: (update) => { applyWakeScore(update) },
   })
+  // The acknowledgement, in the voice the ball reads with. The three shipped takes are recorded in
+  // one fixed timbre, so a cloned voice answering with them would be a different person saying
+  // "我在" — a wake that the user hears in someone else's voice. A cloned voice therefore speaks
+  // the line through the same service the replies use, and the caption comes back from the engine
+  // so the bubble never shows words the speakers did not say.
+  wake.setSpokenAck(() => {
+    if (!String(speaker.voice || '').startsWith('volc-')) return false
+    const line = WAKE_ACK_LINES[Math.floor(Math.random() * WAKE_ACK_LINES.length)]
+    // The line together with the promise of its playback: the engine holds the microphone shut
+    // until that settles, so recognition cannot start on top of "我在" still being spoken — which is
+    // exactly what the recorded takes used to guarantee through their own audio element.
+    const done = speaker.speak(line, 'wake-ack', { minChars: 1 })
+    return { line, done: done ?? Promise.resolve() }
+  })
+  // The clips first, the service only when a voice ships no clips: the set is re-pointed whenever
+  // the menu changes the voice, and the engine then plays a file the page preloaded at start.
+  syncWakeVoiceSet = () => { wake.setVoiceSet(ackSetFor(speaker.voice)) }
+  syncWakeVoiceSet()
   let historyItems = []
   const blocks = new Map()
   // Last message per block key: the locale refresh re-renders from it.
@@ -1545,6 +1681,37 @@ function main() {
   let bubbleStream = ''
   let bubbleStreamText = ''
   let bubbleStreamAt = 0
+  /**
+   * The words of a turn being written in the main window, kept for the voice rather than the card.
+   *
+   * Only the answer feeds it. The reasoning does not, and that is a decision rather than an omission:
+   * read out loud, a model's deliberation is a paragraph of self-address — "让我想想，先看有没有音色
+   * 选项……结论是……" — that nobody wants narrated between two useful sentences. The card never drew
+   * it either, so the voice and the card now agree on what a turn "said". Collected here and read
+   * out once the turn ends; reset by the user's own message, which is the only thing that starts a
+   * new exchange over there.
+   */
+  let otherSpeech = ''
+  let otherSpeechKey = 0
+  /**
+   * Whether the turn's reasoning is read as well.
+   *
+   * Off by request. Kept as a switch rather than deleted so the host's `reason` broadcast still has
+   * a listener to explain itself, and turning it back on is one word.
+   */
+  const SPEAK_THINKING = false
+
+  /**
+   * The ball's messages of the exchange in progress.
+   *
+   * A turn is not one message. A tool-calling answer narrates what it is about to do, then what it
+   * found, then finally answers — one assistant block each, and the main window writes its own
+   * narration per attempt. All of them used to land in the card as separate messages, so the card
+   * read like a transcript of the model thinking out loud and the answer itself was somewhere near
+   * the bottom. Keeping the rows of the current exchange is what lets a later message demote the
+   * earlier ones: they were narration, and narration folds.
+   */
+  let bubbleTurnBalls = []
 
   /** One line of text: rendered replies carry newlines, indentation and runs of spaces. */
   function oneLine(text) {
@@ -1613,6 +1780,57 @@ function main() {
   }
 
   /**
+   * Fold one message down to two dim lines, with a toggle under it.
+   *
+   * This is what a message becomes when a later message of the same exchange replaces it: it was
+   * the model narrating what it was about to do, not the answer. The text is not thrown away — the
+   * toggle opens it — because the reason the ball said it is sometimes worth reading, and because
+   * deleting it would make the card lie about how the answer was reached.
+   *
+   * The toggle is a button rather than "click the bubble": the bubble is selectable text now (see
+   * `#bubble-log` in floating.css), and a click that folded a paragraph would be the same gesture
+   * that places a caret.
+   */
+  function foldBubbleRow(row) {
+    if (row === undefined || row.dataset.folded === '1') return
+    row.dataset.folded = '1'
+    const toggle = document.createElement('button')
+    toggle.type = 'button'
+    toggle.className = 'bubble-more'
+    toggle.textContent = messages.bubbleMore
+    toggle.setAttribute('aria-expanded', 'false')
+      toggle.addEventListener('click', (event) => {
+        event?.stopPropagation?.()
+        const open = !row.hasAttribute('data-open')
+        row.toggleAttribute('data-open', open)
+        toggle.textContent = open ? messages.bubbleLess : messages.bubbleMore
+        toggle.setAttribute('aria-expanded', String(open))
+        // The height change itself is picked up by the `ResizeObserver` on the panel (see
+        // `syncHitTest`), which is what keeps a grown reply's bottom half clickable.
+      })
+    row.append(toggle)
+  }
+
+  /**
+   * A new exchange begins: nothing said before it is narration of it.
+   *
+   * Called where a turn actually starts — the user's sentence, and the greeting that opens a wake
+   * turn — so that the *previous* answer is not demoted by the next turn's first message.
+   */
+  function beginBubbleTurn() {
+    bubbleTurnBalls = []
+    // A new exchange is not the one whose panel was waiting to be folded back: whatever a wake
+    // opened for is already over once something else starts talking.
+    wakePanelAuto = undefined
+  }
+
+  /** Remember this row as the current exchange's latest message, demoting everything before it. */
+  function registerBubbleRow(row) {
+    for (const previous of bubbleTurnBalls) foldBubbleRow(previous)
+    bubbleTurnBalls = [row]
+  }
+
+  /**
    * One message in the bubble: `me` on the right, `ball` on the left.
    *
    * Every message does two things beyond drawing itself — it takes the momentary state row down,
@@ -1623,6 +1841,13 @@ function main() {
     // A message is a new bubble, so whatever answer was still growing stops growing here. This is
     // also what lets the twin check below see the sentence the stream just finished with.
     settleBubbleStream()
+    // A card that is showing a message is not an empty one waiting to be folded back (see
+    // `foldWakePanel`). The wake's own greeting is pushed before that marker is set, so it never
+    // clears a marker it should not.
+    wakePanelAuto = undefined
+    // The user's own words are what a turn is: anything before this one was another exchange's
+    // narration and must keep the shape it had.
+    if (role === 'me') beginBubbleTurn()
     const body = clipBubble(oneLine(text))
     if (body === '') return
     // The same finished answer can arrive twice: see `BUBBLE_TWIN_MS`.
@@ -1632,9 +1857,16 @@ function main() {
       return
     }
     dropBubbleStatus()
-    createBubble(role).text.textContent = body
+    const bubble = createBubble(role)
+    bubble.text.textContent = body
+    // The ball's second message in one exchange demotes the first: a reply that a later reply
+    // replaced was narration.
+    if (role === 'ball') registerBubbleRow(bubble.row)
     followBubbleLog()
     openBubbleForLine()
+    // The card has something new to read, so its idle clock starts from here rather than from when
+    // it opened (see `noteCardActivity`).
+    noteCardActivity()
   }
 
   /** Empty the log — a new conversation is not the old one with more lines under it. */
@@ -1644,6 +1876,7 @@ function main() {
     bubbleStream = ''
     bubbleStreamText = ''
     bubbleStreamAt = 0
+    beginBubbleTurn()
     bubbleLog.replaceChildren()
     bubbleLog.hidden = true
   }
@@ -1676,13 +1909,23 @@ function main() {
    */
   function appendBubbleStream(text) {
     if (typeof text !== 'string' || text === '') return
+    // An answer is arriving in the card, so the exchange a wake opened for is real after all.
+    wakePanelAuto = undefined
     dropBubbleStatus()
     bubbleStream = `${bubbleStream}${text}`
-    if (bubbleStreamRow === undefined) bubbleStreamRow = createBubble('ball')
+    if (bubbleStreamRow === undefined) {
+      bubbleStreamRow = createBubble('ball')
+      // A new attempt of the same turn only starts its own bubble once the last stream settled, so
+      // a row appearing here means the previous narration is behind us: it folds.
+      registerBubbleRow(bubbleStreamRow.row)
+    }
     bubbleStreamRow.text.textContent = clipBubble(oneLine(bubbleStream))
     followBubbleLog()
     bubbleLog.hidden = false
     if (!expanded) openBubbleForLine()
+    // Words are still arriving, so the card is still being written for: the idle clock restarts on
+    // every chunk, which is what makes it a measure of silence rather than of how long a card lives.
+    noteCardActivity()
   }
 
   /** The answer being written elsewhere has stopped: the bubble it grew in stays, as a message. */
@@ -1695,6 +1938,46 @@ function main() {
     bubbleStreamAt = Date.now()
     bubbleStream = ''
     bubbleStreamRow = undefined
+    // The answer is finished, and finishing is itself the last event in this card: from here the
+    // clock runs on whether the user picks it up again.
+    noteCardActivity()
+  }
+
+  /**
+   * Is something selected inside the conversation?
+   *
+   * Two things read this. The collapse timer, because a selection is somebody reading what the ball
+   * said and closing the card under their pointer would take the text away mid-drag; and the right-
+   * click handler, because a message has to be picked before a menu can offer to copy it.
+   */
+  function bubbleHasSelection() {
+    const selection = typeof document.getSelection === 'function' ? document.getSelection() : null
+    if (selection === null || selection.isCollapsed) return false
+    const node = selection.anchorNode
+    if (node === null || node === undefined) return false
+    const parent = node.nodeType === 1 ? node : node.parentNode
+    return parent !== null && parent !== undefined && bubbleLog.contains(parent)
+  }
+
+  /**
+   * Right-click on a message picks that message, so the menu it opens has something to copy.
+   *
+   * Electron draws no menu for a bare right-click — the helper builds one, and it only offers "复制"
+   * when a selection exists (see the `context-menu` handler in `src/main.ts`). So the selection has to
+   * be there first: right-clicking a bubble copies that bubble, and right-clicking after a drag copies
+   * whatever was dragged, without either gesture having to be aimed at a button.
+   */
+  function pickBubbleMessage(event) {
+    if (bubbleHasSelection()) return
+    const target = event?.target
+    const text = target instanceof Element ? target.closest('.bubble-text') : null
+    if (text === null) return
+    const selection = typeof document.getSelection === 'function' ? document.getSelection() : null
+    if (selection === null) return
+    const range = document.createRange()
+    range.selectNodeContents(text)
+    selection.removeAllRanges()
+    selection.addRange(range)
   }
 
 
@@ -1727,10 +2010,15 @@ function main() {
     // face has to land on this frame, not on the far side of the helper's slide.
     void wakeShowBall()
     playWakeFrame()
-    // The clip says "我在" out loud and the panel said nothing at all, so a woken ball looked mute
-    // on screen. The bubble gets the same sentence the clip is saying, as the ball's own message:
-    // the point of the card is that the user can see what the ball just said.
-    pushBubble('ball', messages.wakeAck)
+    // The clip says its sentence out loud and the panel said nothing at all, so a woken ball looked
+    // mute on screen. The bubble gets that same sentence — read out of the take that is playing
+    // (`wake.voiceText()`), never typed here — as the ball's own message: the point of the card is
+    // that the user can see what the ball just said. The takes do not all say the same thing, so a
+    // caption written once in this file described one of them and mislabelled the rest.
+    // The greeting opens a new exchange, so it is not narration of the last one: without this
+    // turn boundary the woken ball would fold whatever it had just answered.
+    beginBubbleTurn()
+    pushBubble('ball', wake.voiceText() ?? messages.wakeAck)
     // Where the turn goes next. `main` is the default and the one the composer's own switch is
     // for: the host is handed the wake, it raises the main window, and that window's page presses
     // the microphone it already has — its recorder, its transcription, its own waveform. The ball
@@ -1747,23 +2035,82 @@ function main() {
       if (continuousEnabled() && speaker.enabled && speaker.autoPlay) continuousVoice.dictated()
       // After the acknowledgement, not before it. The main window records in its own process, so
       // its microphone would hear "我在" through the speakers and put it in the transcript; waiting
-      // for the clip to end is what keeps the greeting out of the user's own sentence. With no clip
-      // to play, whenVoiceDone settles at once and the microphone opens on the same breath — except
-      // for the small gap below, because the clip's last sample and the microphone's first frame
-      // are not the same instant either.
-      void wake.whenVoiceDone(2_000).then(() => {
+      // for the greeting to end is what keeps it out of the user's own sentence. A clip reports that
+      // end itself; a cloned voice's line comes back as the promise of its playback, so the same
+      // wait covers a greeting that is still being synthesised. The cap is generous rather than
+      // tight because that promise includes the round trip to the speech service — a stuck one must
+      // not keep the microphone shut, but a slow service must not have the mic open over it either.
+      void wake.whenVoiceDone(6_000).then(() => {
         setTimeout(() => { api.mainVoiceStart() }, MAIN_VOICE_GAP_MS)
       })
       return
     }
     // A detection that the user cannot see is not a feature. Opening the panel shows
     // the badge and puts the composer in reach, which is where the next step starts.
-    if (wake.autoExpand() && !expanded && !pinned && !running && !asking()) void setExpanded(true)
+    if (wake.autoExpand() && !expanded && !pinned && !running && !asking()) {
+      // Remembered so a turn that heard nothing can be folded back (see `foldWakePanel`). The marker
+      // is set after the open resolves, so the greeting this wake pushed first is not itself read as
+      // "something arrived": anything pushed after it clears the marker instead.
+      void setExpanded(true).then(() => { wakePanelAuto = { at: Date.now() } })
+    }
     // OFF BY REQUEST: the ball no longer records the turn it just heard. The main window's
     // composer records it instead, with the microphone it already has and the switch beside it, so
     // a second recorder here would only fight for the same device. Restore this line to bring the
     // panel's own dictation back.
     // void startDictation({ wake: true })
+  }
+
+  /**
+   * Fold back the panel a wake opened, because the exchange it opened for is already over.
+   *
+   * The ball expands on the wake and the main window does the recording, so a turn that heard
+   * nothing, was called off, or failed leaves a card holding nothing but the greeting — and a card
+   * that stays open on an exchange that never happened reads as a ball still waiting for words.
+   * Three things keep it up: a pinned or busy panel, a card that gained a message since it opened
+   * (the user's own turn or an answer, in which case there *was* an exchange), and an ending that
+   * arrived too late to belong to this wake.
+   */
+  function foldWakePanel(outcome) {
+    const marked = wakePanelAuto
+    wakePanelAuto = undefined
+    if (marked === undefined) return
+    // `sent` and `draft` left something behind — a conversation to watch, or words waiting in the
+    // main window's box — and the card is where that is read.
+    if (outcome === 'sent' || outcome === 'draft') return
+    if (Date.now() - marked.at > WAKE_PANEL_FOLD_MS) return
+    if (!expanded || pinned || running || asking()) return
+    void setExpanded(false)
+  }
+
+  /**
+   * Start the card's own clock over again, because something arrived in it.
+   *
+   * Called from everything that makes the card worth looking at — a message pushed, a streamed
+   * answer growing, the card opening — so the wait is always sixty seconds of silence measured from
+   * the last thing the user could read. One clock, not one per message: each call replaces the last.
+   */
+  function noteCardActivity() {
+    if (cardIdleTimer !== undefined) clearTimeout(cardIdleTimer)
+    cardIdleTimer = setTimeout(foldIdleCard, CARD_IDLE_MS)
+  }
+
+  /**
+   * The card has gone quiet for {@link CARD_IDLE_MS}: put it away, unless someone is using it.
+   *
+   * The busy cases re-arm instead of closing, because they are "not yet" rather than "never" — a
+   * running turn finishes, a question gets answered, a hand lifts. `hovering` re-arms for the same
+   * reason: a pointer resting on the card is somebody reading it, and `leaveUi` already closes the
+   * card one animation after the hand goes, so closing from here would only take it away under the
+   * cursor that is still using it. A held selection is the same case as in `scheduleCollapse`.
+   */
+  function foldIdleCard() {
+    cardIdleTimer = undefined
+    if (!expanded || docked !== undefined) return
+    if (pinned || running || asking() || dragging || hovering || bubbleHasSelection()) {
+      noteCardActivity()
+      return
+    }
+    void setExpanded(false)
   }
 
   /**
@@ -4557,24 +4904,124 @@ function main() {
    * assumed. The main process polls the pointer instead, and only needs to be told where things
    * are; that changes when something moves or shows, not when the pointer does.
    *
-   * Reported in screen coordinates, which is the space the main process polls in.
+   * Reported in the page's own coordinates — the same space `sendPointer` converts the cursor into.
+   * The window's own position is *not* folded in here, and that is the fix for a class of phantom
+   * blockers: this used to add `window.screenX`/`screenY` at report time, so a report taken while
+   * the helper was still moving or resizing the window stayed offset by the distance it travelled,
+   * for as long as nothing else resized the page. That rectangle then captured clicks over empty
+   * desktop with nothing drawn in it. The main process knows where the window is on every poll and
+   * converts there instead, so a rect reported once stays correct wherever the window goes.
    */
+  /**
+   * Whether an element can actually be clicked right now.
+   *
+   * `hidden` alone is not the question. `#panel` is taken off the screen by `body.docked` with
+   * `visibility: hidden`, and by its own opacity ramp before the collapse timer removes it. Both
+   * leave the element laid out, so `getBoundingClientRect` still returns the card's box — and that
+   * box was being reported as a capture region over desktop that draws nothing. That is a spot
+   * where every click lands on the ball's window and nothing at all happens, which is precisely
+   * how "the card is gone but something is still in the way" was described.
+   *
+   * `checkVisibility` is the browser's own answer and knows about both the visibility property and
+   * opacity; the fallback is the same question asked of the computed style.
+   */
+  function visibleToMouse(element) {
+    if (typeof element.checkVisibility === 'function') {
+      try {
+        return element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+      } catch {
+        /* a build whose `checkVisibility` takes no options falls through to the style test */
+      }
+    }
+    const style = getComputedStyle(element)
+    if (style.display === 'none') return false
+    if (style.visibility === 'hidden' || style.visibility === 'collapse') return false
+    return Number.parseFloat(style.opacity === '' ? '1' : style.opacity) > 0
+  }
+
+  // Said once per element, not once per report: a hidden box that keeps a rect is exactly the bug
+  // this filter exists for, and one line in the log turns "clicks do nothing here" into a place and
+  // a size.
+  const invisibleNoted = new Set()
+  function noteInvisible(element) {
+    const id = element.id === '' ? 'element' : element.id
+    if (invisibleNoted.has(id)) return
+    invisibleNoted.add(id)
+    const rect = element.getBoundingClientRect()
+    api.note?.(`overlay: #${id} is on screen nowhere (${Math.round(rect.width)}x${Math.round(rect.height)} at ${Math.round(rect.left)},${Math.round(rect.top)}), so it does not capture clicks`)
+  }
+
+  /**
+   * Whether an element is drawn as a circle (or a pill) rather than as its box.
+   *
+   * Read off the computed corner radius rather than kept in a list: the ball and the stop cap are
+   * `border-radius: 50%`, and the card's own radius is much smaller than half its box, so the test
+   * is the same one the browser uses to decide where the shape's edge is.
+   */
+  function isRound(element, rect) {
+    const style = getComputedStyle(element)
+    const radii = [style.borderTopLeftRadius, style.borderTopRightRadius, style.borderBottomRightRadius, style.borderBottomLeftRadius]
+    const short = Math.min(rect.width, rect.height)
+    // A radius written as a percentage stays a percentage in the computed style ("50%"), so it has
+    // to be resolved against the box before it can be compared with half of it. Read per corner,
+    // and short of the box rather than wide: a pill's corners are half its height, not half its
+    // length.
+    return radii.every((radius) => radiusPixels(radius, short) >= short / 2 - 1)
+  }
+
+  function radiusPixels(radius, short) {
+    const text = radius === '' ? '0' : radius
+    const value = Number.parseFloat(text)
+    if (!Number.isFinite(value)) return 0
+    return text.trim().endsWith('%') ? (value / 100) * short : value
+  }
+
+  // What the last report said, in words: the helper already logs the geometry, but geometry alone
+  // never answered "what is blocking me" — a named region does, and only a change costs a line.
+  let hitTestLabels = ''
   function syncHitTest() {
     if (typeof api.setHitTest !== 'function') return
     const regions = []
+    const labels = []
     for (const element of [ball, panel, stop, dockTab]) {
       // `offsetParent` is null while the panel is hidden, and a zero-sized rect would otherwise
       // capture a strip of nothing.
       if (element.hidden || element.offsetParent === null) continue
+      // Laid out but not drawn: the docked card, or one whose fade has finished. Its box is not a
+      // thing the user can see, so it must not be a thing the user's click can hit.
+      if (!visibleToMouse(element)) {
+        noteInvisible(element)
+        continue
+      }
       const rect = element.getBoundingClientRect()
       if (rect.width === 0 || rect.height === 0) continue
-      regions.push({ x: rect.left + window.screenX, y: rect.top + window.screenY, width: rect.width, height: rect.height })
+      labels.push(`${element.id} ${Math.round(rect.width)}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)}`)
+      // The ball and the stop cap are drawn as circles, and a circle's bounding square is not the
+      // circle: its four corners are about 60x60 of empty pixels on the ball alone, and every click
+      // that lands there is swallowed by the overlay with nothing on screen to explain it. Reported
+      // as what it is drawn as, so the corner belongs to whatever is behind the ball.
+      regions.push({
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+        ...(isRound(element, rect) ? { round: true } : {}),
+      })
     }
     // A drag in progress outruns the ball: the pointer is down and moving away, and the ball is
     // following it. Were the window to go click-through at that moment the drag would stop
-    // responding exactly when it started, so the ball's rect is held for the duration.
-    if (pointer !== undefined || dragging) regions.push({ x: window.screenX, y: window.screenY, width: window.innerWidth, height: window.innerHeight })
+    // responding exactly when it started, so the window itself is held for the duration — but only
+    // for as long as the gesture keeps proving it is alive. See `gestureHold`.
+    if (gestureHold()) {
+      regions.push({ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight })
+      labels.push(`whole window ${window.innerWidth}x${window.innerHeight} (a drag is in progress)`)
+    }
     api.setHitTest(regions)
+    const text = labels.join(' + ')
+    if (text !== hitTestLabels) {
+      hitTestLabels = text
+      api.note?.(`overlay: capturing ${text === '' ? 'nothing' : text}`)
+    }
   }
 
   /**
@@ -4678,6 +5125,13 @@ function main() {
 
   async function setExpanded(next, force = false) {
     if (pageClosed()) return
+    // The idle clock belongs to an open card, so it is dropped here and re-armed below only when the
+    // card is actually open: a timer left running across a close would fire into a card that is not
+    // there, and a chip of it surviving into the next open would count the time it was shut.
+    if (cardIdleTimer !== undefined) {
+      clearTimeout(cardIdleTimer)
+      cardIdleTimer = undefined
+    }
     if (collapseTimer !== undefined) {
       clearTimeout(collapseTimer)
       collapseTimer = undefined
@@ -4712,6 +5166,9 @@ function main() {
       syncGif()
       syncWake()
       syncHitTest()
+      // Opening is the first moment there is a card to be idle with; a card opened by a message
+      // gets its clock restarted by that message anyway (see `pushBubble`).
+      noteCardActivity()
       return
     }
     if (!force && (pinned || running || asking())) return
@@ -4757,6 +5214,12 @@ function main() {
     if (collapseTimer !== undefined) clearTimeout(collapseTimer)
     collapseTimer = setTimeout(() => {
       collapseTimer = undefined
+      // A selection in the conversation is somebody reading, not somebody done: let the card stay
+      // while the text is held, and re-arm so that letting go still closes it the way it always did.
+      if (bubbleHasSelection()) {
+        scheduleCollapse()
+        return
+      }
       void setExpanded(false)
     }, COLLAPSE_MS)
   }
@@ -6498,7 +6961,9 @@ function main() {
     if (!dragging) {
       if (Math.hypot(event.screenX - pointer.startX, event.screenY - pointer.startY) <= 4) return
       dragging = true
-      // The lift plays once, then the hang loop takes over for the rest of the carry.
+      // The carry has just become one, so the window has to hold itself *now*, before the next move
+      // outruns a ball-sized rect. A press alone never reports it (see `gestureHold`).
+      syncHitTest()
       // Started here rather than on pointerdown because a press that never moves is a click,
       // not a pickup — the ball is not carried and must not wear the carry face.
       startDragIntro()
@@ -6578,6 +7043,57 @@ function main() {
   })
   ball.addEventListener('pointercancel', (event) => { void finishPointer(event) })
   ball.addEventListener('lostpointercapture', (event) => { void finishPointer(event) })
+
+  /**
+   * Whether the window has to hold itself for a carry that is in progress.
+   *
+   * Only a carry: `dragging` is set by the hand-off itself, after a pointer has moved far enough to
+   * mean it, and the ball's own rect already captures every press that was merely a press. Holding
+   * on `pointer` alone was the wrong half of this — a press that does not move would put an
+   * invisible sheet the size of the overlay over the desktop for as long as the hand rested, and a
+   * press whose release never arrived kept it there: clicks landed nowhere with nothing on screen
+   * to explain them.
+   *
+   * A carry still needs it, because the ball is only as big as it looks and the hand outruns it
+   * within a frame or two. The timestamp covers the case the flag cannot: a hold whose release never
+   * came — the window lost focus mid-drag, a native menu opened under the hand — goes quiet, and a
+   * window held on that belief is exactly the invisible rectangle this guards against. Nothing else
+   * is torn down, so a hand that is still down re-arms on its next move, before the click it aims at.
+   */
+  let gestureAt = 0
+  const GESTURE_HOLD_MS = 600
+  function gestureHold() {
+    return dragging && Date.now() - gestureAt < GESTURE_HOLD_MS
+  }
+  // Capture phase and passive: this only observes, and the handlers below are the ones that act.
+  for (const target of [ball, dockTab]) {
+    for (const type of ['pointerdown', 'pointermove', 'pointerup']) {
+      target.addEventListener(type, () => {
+        const was = gestureHold()
+        gestureAt = Date.now()
+        // A hold that had lapsed is back: report the window again before the hand can outrun the
+        // rectangles, exactly as a fresh press does.
+        if (!was) syncHitTest()
+      }, true)
+    }
+  }
+  let holdReported = false
+  setInterval(() => {
+    if (pointer === undefined && !dragging) {
+      holdReported = false
+      return
+    }
+    if (gestureHold()) {
+      holdReported = false
+      return
+    }
+    if (holdReported) return
+    holdReported = true
+    // The window goes back to capturing over the elements it has drawn, and the fact that it had to
+    // is written down: a click that was eaten before this ran has no other trace.
+    syncHitTest()
+    api.note?.('overlay: a gesture went quiet; the window stopped capturing the whole of itself')
+  }, 700)
 
   dockTab.addEventListener('pointerdown', (event) => {
     if (!isPrimaryButton(event)) return
@@ -6942,6 +7458,9 @@ function main() {
   prompt.addEventListener('input', syncComposerHeight)
   // Typing in the ball's own composer shows the typing frame for a few seconds.
   prompt.addEventListener('input', noteTyping)
+  // Words being written into the card are the card being used, so the idle clock starts over: half
+  // a sentence on screen is not a card nobody needs any more.
+  prompt.addEventListener('input', noteCardActivity)
   prompt.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || event.shiftKey || isComposing(event)) return
     event.preventDefault()
@@ -6991,6 +7510,9 @@ function main() {
     prompt.focus()
   })
   stop.addEventListener('click', () => { api.stop() })
+  // A right-click on a message picks it first: the helper only builds a copy menu when a selection
+  // exists, and Electron draws nothing for a bare right-click. See `pickBubbleMessage`.
+  bubbleLog.addEventListener('contextmenu', pickBubbleMessage)
   questionCancel.addEventListener('click', cancelQuestion)
   questionSkip.addEventListener('click', skipQuestion)
   questionContinue.addEventListener('click', continueFlow)
@@ -7055,6 +7577,9 @@ function main() {
       // message arrived.
       if (outcome === 'user') {
         playNodFrame()
+        // A new exchange starts over there, so the words collected for the last one are already
+        // spoken or already dropped — either way they are not this turn's.
+        otherSpeech = ''
         // The user's own sentence, as the main window sent it. This is the message the dictation
         // used to write into the composer — which is hidden with the rest of the chat chrome — so
         // the bubble is where "我听到你说的是这句" can actually be read. It closes the answer that
@@ -7068,7 +7593,20 @@ function main() {
       // A chunk of the answer being written in the main window. The host coalesces it (see
       // `announceOtherText`), so this is a few updates per second and the bubble reads like a subtitle.
       if (outcome === 'text') {
+        // `spoken` is the untrimmed copy, present only when the host cut the tail for the card. The
+        // card keeps the window it was given; the voice needs every word of the turn.
+        const words = typeof payload?.spoken === 'string' ? payload.spoken : payload?.text
+        if (typeof words === 'string') otherSpeech = `${otherSpeech}${words}`
         appendBubbleStream(payload?.text)
+        return
+      }
+      // The model thinking, over there, before it answers. Neither the card nor the voice takes it:
+      // the card has no room for a deliberation next to a reply, and the voice reading one out is
+      // what `SPEAK_THINKING` was switched off for — it is the agent talking to itself, not the
+      // answer. The branch stays so a `reason` message has a stated answer instead of falling
+      // through to the face code below, which is where it used to be mistaken for a face.
+      if (outcome === 'reason') {
+        if (SPEAK_THINKING && typeof payload?.text === 'string') otherSpeech = `${otherSpeech}${payload.text}`
         return
       }
       // A turn ended somewhere else, with a reason. Four of the six endings arrive this way; the two that are not
@@ -7076,6 +7614,20 @@ function main() {
       // "something happened over there worth a face".
       if (outcome === 'ended') {
         settleBubbleStream()
+        // The turn is over, so what it said can be said in one piece: the answer, and the reasoning
+        // only if `SPEAK_THINKING` was turned back on. `speak` is the same path the ball's own
+        // replies take, so the mute, the read-aloud switch and the end-of-reading hook all apply.
+        const said = otherSpeech.trim()
+        otherSpeech = ''
+        if (said !== '' && speaker.enabled && speaker.autoPlay) {
+          otherSpeechKey += 1
+          speaker.speak(said, `other:${otherSpeechKey}`)
+          // The one line that answers "did the ball try to read this turn" without listening:
+          // silence with this present is a speech-service problem, silence without it is a gate.
+          if (typeof api.note === 'function') api.note(`voice: reading ${said.length} chars from another session`)
+        } else if (typeof api.note === 'function') {
+          api.note(`voice: nothing read (${said.length} chars, enabled=${speaker.enabled}, autoPlay=${speaker.autoPlay})`)
+        }
         void playTurnEndFrame(typeof payload?.category === 'string' ? payload.category : '')
         return
       }
@@ -7150,10 +7702,25 @@ function main() {
     })
   }
   if (typeof api.onSpeech === 'function') {
+    /**
+     * The voice the last settings message carried, once one has arrived.
+     *
+     * `null` until the first push: at launch the voice goes from the query parameter to the stored
+     * one, and a timbre sample for that would talk at every reload. After that, a change is a menu
+     * click, and a sentence in the new voice is the only proof the click did anything.
+     */
+    let voiceSeen = null
     api.onSpeech((settings) => {
       if (settings === null || typeof settings !== 'object') return
       const wasEnabled = speaker.enabled
+      const changedVoice = voiceSeen !== null
+        && typeof settings.voice === 'string'
+        && settings.voice !== voiceSeen
+      if (typeof settings.voice === 'string') voiceSeen = settings.voice
       speaker.configure(settings)
+      if (changedVoice && speaker.enabled && speaker.autoPlay) {
+        speaker.speak('这是现在的音色，听着还习惯吗？', 'voice-sample')
+      }
       // Continuous conversation is fed by automatic reading: no reading, no cue to hand the
       // microphone back, and a stored turn that waits for one would outlive the feature.
       if (speaker.enabled === false || speaker.autoPlay === false) continuousVoice.cancel()
@@ -7175,6 +7742,9 @@ function main() {
     event.preventDefault()
     api.openExternal(href)
   })
+  // Scrolling back through the card is reading it, which is the same claim the hover makes: the
+  // idle clock restarts so a long answer cannot fold itself while somebody is halfway down it.
+  transcript.addEventListener('scroll', noteCardActivity, { passive: true })
   api.onQuestion((payload) => { showQuestion(payload) })
   api.onQuestionClear((id) => { clearQuestion(id) })
   api.onQuestionError((payload) => {
@@ -7202,6 +7772,24 @@ function main() {
         if (payload.dictation !== null && typeof payload.dictation === 'object') {
           wake.configure({ dictation: payload.dictation })
         }
+      } else if (type === 'keyword') {
+        // The decoder engine's whole decision happens in the helper process; this is its answer.
+        wake.heardKeyword(typeof payload.keyword === 'string' ? payload.keyword : '', payload)
+      } else if (type === 'engine-error') {
+        // A decoder that would not load. Shown where every other wake failure is shown, rather than
+        // left in a console the user cannot see.
+        wake.fail(payload.detail)
+      } else if (type === 'voice-result') {
+        // The main window's recorder said how the turn it was handed ended. `sent` is a conversation
+        // to watch; anything else is the panel going back down (`foldWakePanel`).
+        //
+        // `routed` is the exception the pinned conversation needs: the words were delivered to
+        // another session, so the reply being read now is not one this window will follow, and the
+        // continuous exchange must end here rather than hand the microphone back on top of it. Left
+        // armed, it reopened the microphone as soon as the reading started, and the agent's own
+        // voice became the next user turn.
+        if (payload.routed === true) continuousVoice.cancel()
+        foldWakePanel(typeof payload.outcome === 'string' ? payload.outcome : '')
       }
     })
   }

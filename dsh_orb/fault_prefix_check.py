@@ -27,7 +27,7 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).parent
-PY = r"D:/tools/indextts/py311/python.exe"
+PY = r"D:/tools/py311/python.exe"
 sys.path.insert(0, str(HERE))
 
 import fault_prefix  # noqa: E402

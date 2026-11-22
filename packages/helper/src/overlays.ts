@@ -185,8 +185,15 @@ export async function attachOverlays(deps: OverlayDeps): Promise<{
         return true
       }
       if (record.type === 'observation-frame') {
-        showFrame(frame, record.bounds)
-        raiseChrome()
+        // OFF BY REQUEST: nothing is drawn around the region the agent is working in. The ribbon was
+        // a coloured band around somebody else's window, and read as noise rather than as "this is
+        // being observed" — it showed up on every wake that touched another window and explained
+        // nothing. The window still exists and is hidden here, because the ack below it is what the
+        // host gates capture and posted input on: a silent overlay would read as a stalled one and
+        // stall the turn. Restore the two calls below to bring the frame back.
+        // showFrame(frame, record.bounds)
+        // raiseChrome()
+        if (!frame.isDestroyed() && frame.isVisible()) frame.hide()
         ack(record.id)
         return true
       }

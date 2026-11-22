@@ -19,7 +19,7 @@ raw windows would overstate every rule equally and hide the difference the user 
 
 Run with the interpreter the rest of the wake-word pipeline uses (see `wake_pipeline.py`):
 
-    D:\\tools\\indextts\\py311\\python.exe wake_rule_probe.py [--limit 40]
+    D:\\tools\\py311\\python.exe wake_rule_probe.py [--limit 40]
 """
 
 from __future__ import annotations

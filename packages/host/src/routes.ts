@@ -10,12 +10,12 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { AVATAR_PRESETS, avatarPresetPath, isAvatarPresetId } from './avatar-presets.ts'
 import { normalizeCatalog, type ModelCatalog } from './catalog.ts'
 import {
   DICTATION_NO_SPEECH_MS,
   isAgentModelSelection,
   isSpeechEndpoint,
+  isSpeechVoice,
   MAX_AVATAR_BYTES,
   MAX_SILENCE_MS,
   MIN_SILENCE_MS,
@@ -32,6 +32,14 @@ import { discoverWakeAssets, readWakeDirectory, resolveWakeAsset, wakeAssetMime 
 const PREFIX = '/.dsh-orb'
 const HELPER_HEADER = 'x-dsh-orb-helper'
 const WAKE_PREFIX = `${PREFIX}/wake-assets/`
+/**
+ * The longest sentence one voice turn may hand to {@link OrbControl.sendVoiceText}.
+ *
+ * A dictation ceiling, not a document's: the recorder stops after `maxSeconds` and the transcriber
+ * returns a sentence. Anything far past this is a caller that is not the page, and a conversation
+ * turn is the wrong place to discover it.
+ */
+const MAX_VOICE_TEXT = 6_000
 
 interface RouteContext {
   readonly webServer: {
@@ -74,6 +82,14 @@ export interface MainVoiceCommand {
   readonly continuous: boolean
   /** The pause between a finished reply and that re-opening, milliseconds. */
   readonly followUpMs: number
+  /**
+   * The conversation these words belong to, when one is pinned for voice turns.
+   *
+   * Present means "post the transcript to the host": the page then writes nothing into the composer
+   * of the window the user is looking at, because the turn is not that window's. Absent is the
+   * ordinary hand-off, unchanged — the words land in the visible conversation.
+   */
+  readonly sendTo?: string
 }
 
 /** Side effects that have to reach the live ball. */
@@ -105,6 +121,19 @@ export interface OrbControl {
    */
   takeMainVoice(): MainVoiceCommand | null
   /**
+   * How the turn the main window ran ended, once it is over.
+   *
+   * The other half of {@link takeMainVoice}: a hand-off the page heard nothing on is a panel the
+   * ball opened for nothing, and only the page knows the difference between "no words" and "words
+   * on their way". `sent` and `draft` leave something in the main window; `empty`, `closing` and
+   * `failed` are the panel folding back.
+   *
+   * `routed` marks a turn whose words were delivered to another conversation: the ball then ends
+   * the continuous exchange instead of handing the microphone back, because the reply it is reading
+   * came from a window this page cannot watch.
+   */
+  noteVoiceResult(outcome: string, routed?: boolean): void
+  /**
    * Transcribe one utterance the main window's page recorded itself.
    *
    * The composer's microphone button runs the ball's recorder — it opens the device, measures the
@@ -112,6 +141,17 @@ export interface OrbControl {
    * produced by the same service as the ball's. Returns the reason on failure rather than throwing.
    */
   transcribe(audio: Buffer): Promise<{ ok: true; text: string } | { ok: false; reason: string }>
+  /**
+   * Send one voice turn's words into the pinned conversation, as a new turn there.
+   *
+   * The counterpart of `MainVoiceCommand.sendTo`: the page recorded the sentence and transcribed
+   * it, and this puts it where the user asked every wake-word turn to go, without switching any
+   * window. Never throws — a missing conversation comes back as `ok: false` with a reason the
+   * page can read out.
+   */
+  sendVoiceText(text: string): Promise<{ ok: boolean; reason?: string }>
+  /** Which conversation that lookup currently finds, for the diagnosis route. */
+  voiceTargetInfo(): Promise<{ title: string; sessionId: string | null }>
   helperStatus?(): string
 }
 
@@ -181,6 +221,25 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
     sendJson(res, 200, deps.control.takeMainVoice() ?? { start: false })
     return
   }
+  if (method === 'GET' && path === `${PREFIX}/voice-target`) {
+    // One line to answer "where will my voice turn go", without speaking into a microphone: the
+    // title that is looked for and the conversation it currently resolves to, or null.
+    sendJson(res, 200, await deps.control.voiceTargetInfo())
+    return
+  }
+  if (method === 'POST' && path === `${PREFIX}/voice-send`) {
+    // The page recorded a wake turn and the hand-off named a conversation. The words arrive here
+    // rather than in the composer, so nothing is typed into a window the user is not using.
+    const body = asRecord(await readJson(req))
+    const text = typeof body?.text === 'string' ? body.text.trim() : ''
+    if (text === '' || text.length > MAX_VOICE_TEXT) {
+      sendJson(res, 400, { ok: false, reason: 'empty-or-too-long' })
+      return
+    }
+    const result = await deps.control.sendVoiceText(text)
+    sendJson(res, result.ok ? 200 : 409, result)
+    return
+  }
   if (method === 'GET' && path === `${PREFIX}/models`) {
     sendJson(res, 200, await catalog(deps))
     return
@@ -213,15 +272,6 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
     await sendAvatar(deps.store, method, res)
     return
   }
-  if ((method === 'GET' || method === 'HEAD') && path.startsWith(`${PREFIX}/avatar/preset/`)) {
-    const id = decodeURIComponent(path.slice(`${PREFIX}/avatar/preset/`.length))
-    const file = avatarPresetPath(id)
-    if (file === undefined || !await sendFile(res, method, file, 'image/gif')) {
-      res.writeHead(404)
-      res.end()
-    }
-    return
-  }
   if (!orbSupported()) {
     sendJson(res, 403, { error: 'unsupported' })
     return
@@ -248,6 +298,25 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
       return
     }
     sendJson(res, 200, result.ok ? { text: result.text } : { error: result.reason })
+    return
+  }
+  if (method === 'POST' && path === `${PREFIX}/main-voice-result`) {
+    // Whoever recorded the turn posts its ending here. The ball cannot see the main window's
+    // microphone, so this line is the only thing that tells it the exchange it opened for is over
+    // without a word — see `OrbControl.noteVoiceResult`.
+    const body = await readJson(req)
+    const outcome = body !== null && typeof body === 'object' && typeof (body as { outcome?: unknown }).outcome === 'string'
+      ? (body as { outcome: string }).outcome
+      : ''
+    if (outcome === '') {
+      sendJson(res, 400, { error: 'invalid-outcome' })
+      return
+    }
+    // The turn's words went to another conversation, so the ball must not keep the continuous
+    // exchange alive for it; see `OrbControl.noteVoiceResult`.
+    const routed = (body as { routed?: unknown }).routed === true
+    deps.control.noteVoiceResult(outcome, routed)
+    sendJson(res, 200, { ok: true })
     return
   }
   if (method === 'POST' && path === `${PREFIX}/client-report`) {
@@ -381,17 +450,6 @@ async function handle(deps: RouteDeps, req: IncomingMessage, res: ServerResponse
     sendJson(res, 200, await snapshot(deps))
     return
   }
-  if (method === 'POST' && path === `${PREFIX}/avatar/preset`) {
-    const preset = asRecord(await readJson(req))?.preset
-    if (!isAvatarPresetId(preset)) {
-      sendJson(res, 400, { error: 'invalid-preset' })
-      return
-    }
-    deps.store.selectAvatarPreset(preset)
-    await deps.control.publishChrome()
-    sendJson(res, 200, await snapshot(deps))
-    return
-  }
   if (method === 'POST' && path === `${PREFIX}/avatar/restore`) {
     deps.store.restoreAvatar()
     await deps.control.publishChrome()
@@ -416,8 +474,6 @@ async function snapshot(deps: RouteDeps): Promise<{
   supported: boolean
   ballEnabled: boolean
   avatarUrl: string
-  avatarPresetId: string | null
-  avatarPresets: { id: string; url: string }[]
   overlay: AgentModelSelection
   background: AgentModelSelection
   selectionEnabled: boolean
@@ -437,10 +493,6 @@ async function snapshot(deps: RouteDeps): Promise<{
     supported: orbSupported(),
     ballEnabled: deps.store.ballEnabled(),
     avatarUrl: `${PREFIX}/avatar?v=${version}`,
-    avatarPresetId: selection.kind === 'preset' ? selection.id : null,
-    // No version on the gallery URLs: the files are the same on every render, and a
-    // bump would make the page refetch every multi-megabyte GIF on any avatar change.
-    avatarPresets: AVATAR_PRESETS.map((preset) => ({ id: preset.id, url: `${PREFIX}/avatar/preset/${preset.id}` })),
     overlay: models.overlay,
     background: models.background,
     selectionEnabled: deps.store.selectionEnabled(),
@@ -530,14 +582,9 @@ async function catalog(deps: RouteDeps): Promise<ModelCatalog> {
   }
 }
 
-/** The profile's avatar: a built-in preset, the uploaded bytes, or the shipped GIF. */
+/** The profile's avatar: the uploaded bytes, or the shipped GIF. */
 async function sendAvatar(store: ProfileStore, method: string, res: ServerResponse): Promise<void> {
-  const selection = store.avatarSelection()
-  if (selection.kind === 'preset') {
-    const file = avatarPresetPath(selection.id)
-    if (file !== undefined && await sendFile(res, method, file, 'image/gif')) return
-  }
-  const custom = selection.kind === 'custom' ? store.readAvatar() : undefined
+  const custom = store.avatarSelection().kind === 'custom' ? store.readAvatar() : undefined
   if (custom !== undefined) {
     sendImage(res, method, custom.bytes, custom.mime)
     return
@@ -623,7 +670,7 @@ function booleanField(value: unknown): boolean | undefined {
 function speechUpdate(value: unknown, current: SpeechSettings): SpeechSettings | undefined {
   const record = asRecord(value)
   if (record === undefined) return undefined
-  const next: { enabled: boolean; autoPlay: boolean; endpoint: string } = { ...current }
+  const next: { enabled: boolean; autoPlay: boolean; endpoint: string; voice: string } = { ...current }
   if ('enabled' in record) {
     if (typeof record.enabled !== 'boolean') return undefined
     next.enabled = record.enabled
@@ -635,6 +682,12 @@ function speechUpdate(value: unknown, current: SpeechSettings): SpeechSettings |
   if ('endpoint' in record) {
     if (!isSpeechEndpoint(record.endpoint)) return undefined
     next.endpoint = record.endpoint
+  }
+  // The voice is the one field whose empty value is meaningful — it means "whatever the service
+  // was started with" — so it is validated rather than required.
+  if ('voice' in record) {
+    if (!isSpeechVoice(record.voice)) return undefined
+    next.voice = record.voice
   }
   return next
 }

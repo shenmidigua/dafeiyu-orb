@@ -264,3 +264,151 @@ FILLER = [
     "我打算明天去一趟。",
     "他说的话我一句也没听懂。",
 ]
+
+# ------------------------------------------------------------------------------------------------
+# 别的唤醒词：同一套家族，按每个名字自己的音节写出来
+#
+# 一个唤醒词不是一个字符串，而是一个家族——「说一遍」「漏一个音节」「两半之间插话」「同音字」
+# 四组必须一起到场，否则模型记住的是清单而不是规则。大肥鱼那几轮就是这么过来的：第 111 行起
+# 记着每漏掉一组要付什么代价，这里不再重复论证，只照那套骨架给另外三个名字各自写一份。
+#
+# 三个名字都是两字名叠一遍（四个音节），比「大肥鱼大肥鱼」短，同一只 28 槽的环装得下；不同的
+# 地方在音节结构，所以漏音节的形状按各自的两个字拼出来，而不是从大肥鱼那七条里改名字。
+#
+# 同音字那一组是各写各的，模板写不出「小弟」和「小弟弟」之间的距离——那三个字里有一个是真词，
+# 是这三个名字里最难的一条负样本，模型没有理由拒绝它，除非它被见过。
+# ------------------------------------------------------------------------------------------------
+
+# 说一遍的各种样子。逗号写与不写是两条：不写的那条念起来最接近叠词，也就是最难的那条负样本。
+_SINGLE_SHAPES = [
+    "{n}",
+    "嘿，{n}",
+    "嗯，{n}",
+    "诶，{n}",
+    "那个，{n}",
+    "我说，{n}",
+    "{n}呢",
+    "{n}啊",
+    "{n}吗",
+    "{n}你好",
+    "{n}在不在",
+    "我要叫{n}",
+    "这是{n}的声音",
+    "{n}是谁",
+    "{n}好玩吗",
+    "把{n}叫过来",
+    "{n}今天怎么样",
+    "你说{n}",
+    "我找{n}",
+    # 停顿不写成一个逗号：同一个意思，离叠词更近一步
+    "嘿{n}",
+    "嗯{n}",
+    "那个{n}",
+]
+
+# 两半之间插话。不插话的两半是叠词，插了话的仍然是两半——这正是要教的那条规则。
+_INTERRUPTED_SHAPES = [
+    "{d}一二三{d}",
+    "{d}一二{d}",
+    "{d}那个{d}",
+    "{d}，那个，{d}",
+    "{d}嗯{d}",
+    "{d}然后{d}",
+    "{d}是不是{d}",
+]
+
+# 正样本的外框：同一个名字，前面带一次招呼。只放前缀——正样本按自己说完的那一帧裁开
+# （`wake_dataset.prepare_positive`），后缀会让「说完」和「唤醒词说完」变成两个位置。
+_CARRIER_SHAPES = [
+    "{d}",
+    "喂，{d}",
+    "那个，{d}",
+    "嗯，{d}",
+    "来，{d}",
+]
+
+
+def _truncations(name: str) -> list:
+    """漏掉一个音节的叠词。
+
+    两字名叠一遍是四个音节，漏一个就剩三个。漏哪一个、漏在前半还是后半，是三个轴，四条
+    把每种组合都说到；对称地只写一两条，模型就只会拒绝那一侧。
+    """
+    first, second = name[0], name[1]
+    return [
+        f"{first}{second}{first}",   # 最后那个字掉了
+        f"{first}{first}{second}",   # 前半句掉了第二个字
+        f"{second}{first}{second}",  # 最前面那个字掉了
+        f"{first}{second}{second}",  # 后半句掉了第一个字
+    ]
+
+
+def _family(name: str, confusions: list) -> dict:
+    doubled = name + name
+    return {
+        "positive": [doubled],
+        "carriers": [shape.format(d=doubled) for shape in _CARRIER_SHAPES],
+        "adversarial": (
+            [shape.format(n=name) for shape in _SINGLE_SHAPES]
+            + _truncations(name)
+            + [shape.format(d=doubled) for shape in _INTERRUPTED_SHAPES]
+            + list(confusions)
+        ),
+    }
+
+
+# 每个名字最贴近的同音字。列的是「用普通话说这句话时，嘴和耳朵都容易混成它」的字，不是随便
+# 换成另一个汉字——同音字这一组离正样本越近，边界才越准，离得远的那一组只是凑数。
+XIAODI = _family("小弟", [
+    "小迪", "小笛", "小敌", "小底", "小递",
+    "小弟弟",   # 真词，也是三个名字里最难的一条负样本
+    "小妹妹",
+    "晓弟",
+])
+
+XIAOHUI = _family("小慧", [
+    "小会", "小惠", "小灰", "小辉", "小回", "小绘",
+    "晓慧",
+    "小慧慧",
+])
+
+DACHENG = _family("大成", [
+    "大城", "大诚", "大程", "大呈", "大橙", "大乘",
+    "达成",   # 它本身也是一个常用词，会被说得比名字更随意
+    "大成成",
+])
+
+
+def profile(keyword: str) -> dict:
+    """The three lists a keyword's training set is built from.
+
+    Every keyword the orb offers has to be here, because the dataset is generated from this table
+    and nothing else: a keyword missing from it is a keyword that cannot be trained, which is the
+    failure mode this function exists to make loud rather than quiet.
+    """
+    found = PROFILES.get(keyword)
+    if found is None:
+        raise SystemExit(f"no phrase profile for {keyword!r}; known: {sorted(PROFILES)}")
+    return found
+
+
+# 关键字 → 一份家族。dafeiyu 用的是上面手写的那几组，其余三个是这里生成的。
+PROFILES = {
+    "dafeiyu": {
+        "positive": POSITIVE,
+        "carriers": POSITIVE_CARRIERS,
+        "adversarial": ADVERSARIAL,
+    },
+    "xiaodi": XIAODI,
+    "xiaohui": XIAOHUI,
+    "dacheng": DACHENG,
+}
+
+# 中文名字，给菜单和设置页用。放在这里而不是页面里，是因为它必须和上面那张表一起改：
+# 一个能训练的名字，就应该是一个能显示、能选的名字。
+DISPLAY_NAMES = {
+    "dafeiyu": "大肥鱼",
+    "xiaodi": "小弟",
+    "xiaohui": "小慧",
+    "dacheng": "大成",
+}

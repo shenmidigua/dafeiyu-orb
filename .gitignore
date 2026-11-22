@@ -114,3 +114,7 @@ dsh_orb/assets-orig/
 dsh_orb/voices-orig/
 dsh_orb/backup-*/
 *.bak-vol2
+
+# Snapshots taken in place before an edit (assets and tests). The live file is the record.
+packages/helper/assets/*.bak-*
+packages/helper/tests/*.bak-*

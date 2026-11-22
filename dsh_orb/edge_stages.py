@@ -12,7 +12,7 @@ reply pays the handshake three times: measured at 5.43s in hand versus 1.88s for
 single request. Real Edge holds one connection open and sends each sentence down it, which would make
 the second and later sentences cost only their own synthesis. Worth confirming before building on it.
 
-Runs with the interpreter the proxy itself uses: D:\\tools\\indextts\\py311\\python.exe
+Runs with the interpreter the proxy itself uses: D:\\tools\\py311\\python.exe
 """
 
 from __future__ import annotations

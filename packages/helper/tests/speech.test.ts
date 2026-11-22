@@ -69,6 +69,33 @@ describe('plainForSpeech', () => {
     assert.equal(spoken.includes('example.com'), false)
   })
 
+  it('does not read a source cited in brackets', () => {
+    // The real shape: a sentence, then its sources in one bracket group. The URLs are for the eye —
+    // read out they are English syllables that repeat nothing the sentence said — and the bracket
+    // must not survive them, or the reading ends on a stray "（、）" pause.
+    const spoken = plainForSpeech('济南今天晴，白天最高 7 度上下（ https://www.qweather.com/weather/jinan-101120101.html 、 https://www.nmc.cn/publish/forecast/ASD/jinan.html ）。')
+    assert.equal(/http|qweather|nmc/i.test(spoken), false, `no URL should survive: ${JSON.stringify(spoken)}`)
+    assert.equal(/[（(][）)\s、,，]*[）)]/.test(spoken), false, 'and no emptied bracket either')
+    assert.match(spoken, /济南今天晴/, 'the sentence itself is still read')
+    assert.match(spoken, /7 度/, 'including its numbers')
+  })
+
+  it('drops a bare URL and an ASCII parenthesis with the same hand', () => {
+    assert.equal(plainForSpeech('看这里 https://example.com/x?y=1 就知道了').includes('example'), false)
+    assert.equal(plainForSpeech('数据来自 (https://example.com/a) 这个站').includes('example'), false)
+    assert.equal(plainForSpeech('数据来自（https://example.com/a）').trim(), '数据来自')
+  })
+
+  it('does not read a square-bracket marker or what is inside it', () => {
+    // "[17173]" is a label on the page, not words in the sentence: read out it is a run of digits
+    // that tells the listener nothing. Both bracket styles go, and so does everything between them.
+    const spoken = plainForSpeech('[17173] 上新了，去看看')
+    assert.equal(/17173|[\[\]]/.test(spoken), false, `no marker should survive: ${JSON.stringify(spoken)}`)
+    assert.match(spoken, /上新了/, 'the sentence around it is still read')
+    assert.equal(plainForSpeech('按【公告】说的办').includes('公告'), false)
+    assert.equal(plainForSpeech('按【公告】说的办').includes('【'), false)
+  })
+
   it('unwraps emphasis rather than leaving stray markers', () => {
     // The markers go and nothing is inserted — `**重要**的事` becomes `重要的事`, with no space
     // left behind where the asterisks were.
@@ -78,6 +105,16 @@ describe('plainForSpeech', () => {
 
   it('removes list bullets and heading hashes', () => {
     assert.equal(plainForSpeech('## 标题\n- 第一项\n- 第二项'), '标题\n第一项\n第二项')
+  })
+
+  it('speaks the name in English while the screen keeps it in Chinese', () => {
+    // 德拉曼 is a transliteration, and the service spells it out syllable by syllable; the character
+    // answers to the English name. The substitution is for the ear only — `plainForSpeech` is the
+    // last step before the request, so the panel and the bubble never see it.
+    assert.equal(plainForSpeech('我是德拉曼。'), '我是Delamain。')
+    assert.equal(plainForSpeech('德拉曼在此，请您吩咐。'), 'Delamain在此，请您吩咐。')
+    // Every occurrence, not just the first: a sentence may name the character twice.
+    assert.equal(plainForSpeech('德拉曼，德拉曼2 都在'), 'Delamain，Delamain2 都在')
   })
 
   it('returns empty for input that is not a string', () => {
@@ -572,6 +609,34 @@ describe('speaker configuration', () => {
   it('ignores a blank endpoint rather than pointing the speaker at nothing', () => {
     const body = method('setEndpoint')
     assert.ok(body.includes("endpoint.trim() === ''"), 'an empty string must not become the endpoint')
+  })
+
+  it('does not read a mirrored turn’s reasoning out loud', () => {
+    // Asked for and then taken back: the reasoning of a turn written in another window is the model
+    // talking to itself, and read aloud it lands between two useful sentences. The gate stays so the
+    // decision is visible, and so putting it back is one word rather than a re-derivation.
+    assert.ok(shellSource.includes('const SPEAK_THINKING = false'), 'reasoning narration is off')
+    assert.ok(shellSource.includes('if (SPEAK_THINKING &&'), 'the branch is gated, not removed')
+    assert.ok(shellSource.includes("outcome === 'reason'"), 'a reason message still has its own branch')
+  })
+
+  it('sends the chosen voice with every sentence', () => {
+    // The service routes on this field — one URL, several engines — so a sentence sent without it
+    // would be read in whatever that process was launched with, whatever the menu said.
+    const body = method('request')
+    assert.ok(body.includes('voice: this.voice'), 'the voice has to travel in the request body')
+    // Empty means "the service default", and an empty field must not be sent: the service treats a
+    // present-but-empty voice as an id it does not know.
+    assert.ok(body.includes("this.voice === ''"), 'an empty voice has to be left out, not sent blank')
+  })
+
+  it('plays a sample when the voice changes, but not on the launch push', () => {
+    // A new timbre is otherwise inaudible until the next reply, so the change speaks for itself —
+    // but only on a real change: sampling the stored voice at every launch would make reloads talk.
+    assert.ok(shellSource.includes('voiceSeen !== null'), 'the first push must not count as a change')
+    assert.ok(shellSource.includes("speaker.speak('这是现在的音色"), 'a change has to be audible')
+    assert.ok(shellSource.includes("'voice-sample'"),
+      'the sample is keyed, so its stop control and its state can find it')
   })
 
   it('tracks which reply is playing, and clears it when playback ends', () => {

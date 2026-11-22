@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 
-PY311 = r"D:\tools\indextts\py311"
+PY311 = r"D:\tools\py311"
 
 
 def disk() -> None:

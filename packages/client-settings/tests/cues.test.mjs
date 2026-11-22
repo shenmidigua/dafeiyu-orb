@@ -67,7 +67,10 @@ describe('the main window speaks the ball\'s cue language', () => {
     assert.match(page, /markListening\(true\)[\s\S]{0,400}?tone\(CUE_OPEN, 1\)[\s\S]{0,200}?await recordUtterance\(limits\)/, 'opening the microphone')
     // Only for words that stay in the box: a turn that sends says so with the sending cue instead,
     // and the two used to ring together.
-    assert.match(page, /if \(!send\) tone\(CUE_HEARD, 0\.8\)/, 'a sentence came back')
+    // Only for words that stay in the box: a turn that sends says so with the sending cue instead,
+    // and the two used to ring together. A turn routed to another conversation is a sending turn
+    // too, whichever door opened it, so it is excluded here for the same reason.
+    assert.match(page, /if \(!send && sendTo === ''\) tone\(CUE_HEARD, 0\.8\)/, 'a sentence came back')
     assert.match(page, /tone\(CUE_EMPTY, 0\.64\)/, 'a recording with no words')
     assert.match(page, /tone\(CUE_SHUT, 0\.48\)/, 'the user ended the exchange')
     assert.match(page, /tone\(CUE_SENT, 0\.45\)/, 'a sent transcript')

@@ -33,7 +33,7 @@ import onnxruntime as ort
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from wake_features import OrbFeatures, pcm16_from_wav  # noqa: E402
-from wake_dataset import warm_windows  # noqa: E402
+from wake_dataset import feature_stem, phrase_dirs, warm_windows  # noqa: E402
 
 DATA = pathlib.Path(r"C:\Users\digua\wakeword\data")
 FEATURE_DIR = DATA / "features"
@@ -86,29 +86,40 @@ def score_clips(session, extractor, files: list[pathlib.Path], rng, pool_audio: 
 
 
 def main() -> int:
-    if not MODEL.exists():
-        raise SystemExit(f"{MODEL} does not exist; run wake_train.py first")
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phrase", default="dafeiyu",
+                        help="which wake word to evaluate (see wake_phrases.PROFILES)")
+    args = parser.parse_args()
+    phrase = args.phrase
+    stem = feature_stem(phrase)
+    model = MODEL if phrase == "dafeiyu" else FEATURE_DIR / f"{phrase}.onnx"
+    report = REPORT if phrase == "dafeiyu" else FEATURE_DIR / f"{phrase}-eval.json"
+    checkpoint = FEATURE_DIR / f"{phrase}.pt"
+    positive_dir, negative_dir = phrase_dirs(phrase)
+
+    if not model.exists():
+        raise SystemExit(f"{model} does not exist; run wake_train.py --phrase {phrase} first")
 
     # The held-out fold comes from the trainer's own checkpoint rather than being assumed, so this
     # file cannot silently evaluate a model on the clips it was fitted to.
-    checkpoint = FEATURE_DIR / "dafeiyu.pt"
     if not checkpoint.exists():
-        raise SystemExit(f"{checkpoint} missing; run wake_train.py first")
+        raise SystemExit(f"{checkpoint} missing; run wake_train.py --phrase {phrase} first")
     import torch
     held_out_fold = torch.load(checkpoint, map_location="cpu").get("fold")
 
-    positives = sorted((DATA / "positives").glob("positive-*.wav"))
-    negatives = sorted((DATA / "negatives").glob("adversarial-*.wav"))
-    filler = sorted((DATA / "negatives").glob("filler-*.wav"))
+    positives = sorted(positive_dir.glob("positive-*.wav"))
+    negatives = sorted(negative_dir.glob("adversarial-*.wav"))
+    filler = sorted(negative_dir.glob("filler-*.wav"))
 
     # Fold arrays are positional over the clips that survived feature extraction — 1455 of the 1470
     # positive wavs, the short ones having produced no window at all. So clips are matched by filename
     # through the manifests rather than by position in the directory listing, which would shift by the
     # dropped clips and quietly score trained-on audio as held out.
-    positive_folds = np.load(FEATURE_DIR / "folds-positive.npy")
-    negative_folds = np.load(FEATURE_DIR / "folds-negative.npy")
-    positive_names = json.loads((FEATURE_DIR / "positive-names.json").read_text(encoding="utf-8"))
-    negative_names = json.loads((FEATURE_DIR / "negative-names.json").read_text(encoding="utf-8"))
+    positive_folds = np.load(FEATURE_DIR / f"{stem}folds-positive.npy")
+    negative_folds = np.load(FEATURE_DIR / f"{stem}folds-negative.npy")
+    positive_names = json.loads((FEATURE_DIR / f"{stem}positive-names.json").read_text(encoding="utf-8"))
+    negative_names = json.loads((FEATURE_DIR / f"{stem}negative-names.json").read_text(encoding="utf-8"))
 
     def select(files: list[pathlib.Path], names: list[str], folds: np.ndarray, only_held_out: bool):
         """Filter to the clips whose fold matches, looking the fold up by filename."""
@@ -123,9 +134,13 @@ def main() -> int:
                 keep.append(path)
         return keep
 
-    session = ort.InferenceSession(str(MODEL), providers=["CPUExecutionProvider"])
+    # `model`, not the module constant. It was `MODEL` here — dafeiyu's file — for one afternoon, and
+    # the tell was that two differently-trained 小弟 models printed an identically bad report: both
+    # runs were scoring dafeiyu against 小弟's clips. Every number was correct and every number was
+    # about the wrong file, which is exactly the failure `wake_deploy.py` was written to catch.
+    session = ort.InferenceSession(str(model), providers=["CPUExecutionProvider"])
     extractor = OrbFeatures(ncpu=4)
-    print(f"  model {MODEL.name}, held-out fold {held_out_fold}")
+    print(f"  model {model.name}, held-out fold {held_out_fold}")
     print("  every number below is from clips the model never saw.")
 
     print("  scoring held-out positives ...")
@@ -213,12 +228,16 @@ def main() -> int:
           f"filler clip FP {chosen['filler_clip_fp']:.1%}, "
           f"{chosen['false_alarms_per_hour_of_speech']:.1f} false alarms/hour of speech)")
 
-    report = {"model": str(MODEL), "held_out_fold": held_out_fold,
-              "clips": {"positive": len(held_positive), "near_miss": len(held_adversarial),
-                        "filler": len(held_filler)},
-              "clip_auc": pooled_auc, "thresholds": rows, "chosen": chosen}
-    REPORT.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"  report: {REPORT}")
+    # The dict and the path are two different things named `report` for one afternoon, and the
+    # `--phrase` work is what made that visible: the same run that used to write dafeiyu-eval.json
+    # now writes a per-keyword file, so the path stopped being a constant and started sharing the
+    # name the payload had.
+    payload = {"model": str(model), "phrase": phrase, "held_out_fold": held_out_fold,
+               "clips": {"positive": len(held_positive), "near_miss": len(held_adversarial),
+                         "filler": len(held_filler)},
+               "clip_auc": pooled_auc, "thresholds": rows, "chosen": chosen}
+    report.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"  report: {report}")
     return 0
 
 

@@ -132,8 +132,19 @@ describe('ball menu', () => {
       chimeQuietFrom: 0,
       chimeQuietTo: 7,
       speechEnabled: true,
+      // The voice row names the timbre that is live, and lists the ones on offer.
+      speechVoice: 'zh-CN-XiaoxiaoNeural',
+      speechVoices: [
+        { voice: 'stella', zh: 'stella（默认女声）', en: 'stella (default female)' },
+        { voice: 'zh-CN-XiaoxiaoNeural', zh: '晓晓（温柔女声）', en: 'Xiaoxiao (warm female)' },
+      ],
       wakeEnabled: false,
       wakeAvailable: true,
+      wakeKeyword: 'hey_jarvis',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: false },
+      ],
       wakeWord: 'Hey Jarvis',
       dictationReady: true,
       openMain: true,
@@ -144,7 +155,9 @@ describe('ball menu', () => {
       setMillifraction: (enabled) => { actions.push(`fraction:${enabled}`) },
       setReply: (enabled) => { actions.push(`reply:${enabled}`) },
       setChime: (enabled) => { actions.push(`chime:${enabled}`) },
+      setSpeechVoice: (voice) => { actions.push(`voice:${voice}`) },
       setWake: (enabled) => { actions.push(`wake:${enabled}`) },
+      setWakeWord: (keyword) => { actions.push(`word:${keyword}`) },
       dictate: () => { actions.push('dictate') },
       disable: () => { actions.push('disable') },
     })
@@ -155,6 +168,7 @@ describe('ball menu', () => {
       '千分比坐标',
       '极简回复（≤80 字）',
       '整点报时（0–7 点静音）',
+      '音色 · 晓晓（温柔女声）',
       '语音唤醒（Hey Jarvis）',
       '语音输入（现在说一句）',
       'separator',
@@ -171,15 +185,27 @@ describe('ball menu', () => {
     assert.equal(template[5]?.type, 'checkbox')
     assert.equal(template[5]?.checked, true)
     template[5]?.click?.({ checked: false })
-    template[6]?.click?.({ checked: true })
+    // The wake row is now a submenu: the switch on top, the phrase choices below it. A phrase whose
+    // model is not on disk is shown but disabled, so a half-trained word cannot be picked.
+    assert.equal(template[6]?.submenu?.length, 2)
+    assert.equal(template[6]?.submenu?.find((item) => item.label === '晓晓（温柔女声）')?.checked, true)
+    assert.equal(template[6]?.submenu?.find((item) => item.label === 'stella（默认女声）')?.checked, false)
+    template[6]?.submenu?.find((item) => item.label === 'stella（默认女声）')?.click?.({ checked: true })
+    assert.equal(template[7]?.submenu?.[0]?.type, 'checkbox')
+    assert.equal(template[7]?.submenu?.[0]?.checked, false)
+    assert.equal(template[7]?.submenu?.[1]?.type, 'separator')
+    const phrases = template[7]?.submenu ?? []
+    assert.equal(phrases.find((item) => item.label === 'Hey Jarvis')?.checked, true)
+    assert.equal(phrases.find((item) => item.label === '大肥鱼大肥鱼（模型未训练）')?.enabled, false)
+    template[7]?.submenu?.[0]?.click?.({ checked: true })
     // Voice input needs the wake engine running, so the row follows that state.
-    assert.equal(template[7]?.enabled, true)
-    template[7]?.click?.({ checked: false })
-    template[9]?.click?.({ checked: false })
+    assert.equal(template[8]?.enabled, true)
+    template[8]?.click?.({ checked: false })
+    template[10]?.click?.({ checked: false })
     const background = template[2]?.submenu?.find((item) => item.label === '✓ Flash')
     assert.equal(background?.submenu?.find((item) => item.label === 'Max')?.checked, true)
     background?.submenu?.[0]?.click?.({ checked: true })
-    assert.deepEqual(actions, ['open', 'fraction:true', 'reply:true', 'chime:false', 'wake:true', 'dictate', 'disable', 'background'])
+    assert.deepEqual(actions, ['open', 'fraction:true', 'reply:true', 'chime:false', 'voice:stella', 'wake:true', 'dictate', 'disable', 'background'])
     // With the engine off the row explains itself instead of recording nothing.
     const noEngine = contextMenuTemplate({
       catalog,
@@ -192,8 +218,19 @@ describe('ball menu', () => {
       chimeQuietFrom: 0,
       chimeQuietTo: 7,
       speechEnabled: true,
+      // The voice row names the timbre that is live, and lists the ones on offer.
+      speechVoice: 'zh-CN-XiaoxiaoNeural',
+      speechVoices: [
+        { voice: 'stella', zh: 'stella（默认女声）', en: 'stella (default female)' },
+        { voice: 'zh-CN-XiaoxiaoNeural', zh: '晓晓（温柔女声）', en: 'Xiaoxiao (warm female)' },
+      ],
       wakeEnabled: false,
       wakeAvailable: true,
+      wakeKeyword: 'hey_jarvis',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: false },
+      ],
       wakeWord: 'Hey Jarvis',
       dictationReady: false,
       openMain: true,
@@ -204,12 +241,13 @@ describe('ball menu', () => {
       setMillifraction: () => {},
       setReply: () => {},
       setChime: () => {},
+      setSpeechVoice: () => {},
       setWake: () => {},
       dictate: () => { actions.push('should-not-run') },
       disable: () => {},
     })
-    assert.equal(noEngine[7]?.label, '语音输入（需先开启语音唤醒）')
-    assert.equal(noEngine[7]?.enabled, false)
+    assert.equal(noEngine[8]?.label, '语音输入（需先开启语音唤醒）')
+    assert.equal(noEngine[8]?.enabled, false)
     assert.equal(noEngine[4]?.checked, true)
     assert.equal(noEngine[5]?.checked, false)
     const english = contextMenuTemplate({
@@ -223,8 +261,19 @@ describe('ball menu', () => {
       chimeQuietFrom: 22,
       chimeQuietTo: 6,
       speechEnabled: true,
+      // The voice row names the timbre that is live, and lists the ones on offer.
+      speechVoice: 'zh-CN-XiaoxiaoNeural',
+      speechVoices: [
+        { voice: 'stella', zh: 'stella（默认女声）', en: 'stella (default female)' },
+        { voice: 'zh-CN-XiaoxiaoNeural', zh: '晓晓（温柔女声）', en: 'Xiaoxiao (warm female)' },
+      ],
       wakeEnabled: false,
       wakeAvailable: true,
+      wakeKeyword: 'hey_jarvis',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: false },
+      ],
       wakeWord: 'Hey Jarvis',
       openMain: false,
     }, false, {
@@ -234,7 +283,9 @@ describe('ball menu', () => {
       setMillifraction() {},
       setReply() {},
       setChime() {},
+      setSpeechVoice() {},
       setWake() {},
+      setWakeWord() {},
       disable() {},
     })
     assert.equal(english[0]?.label, 'Open Main Window')
@@ -243,7 +294,8 @@ describe('ball menu', () => {
     // The window wraps midnight here: the label has to say so, or the user reads 22–6 as a range
     // that is silent in the afternoon.
     assert.equal(english[5]?.label, 'Hourly chime (quiet 22–6)')
-    assert.equal(english[6]?.label, 'Voice wake word (Hey Jarvis)')
+    assert.equal(english[6]?.label, 'Voice · Xiaoxiao (warm female)')
+    assert.equal(english[7]?.label, 'Voice wake word (Hey Jarvis)')
     assert.equal(english.at(-1)?.label, 'Disable floating ball')
   })
 
@@ -260,6 +312,11 @@ describe('ball menu', () => {
       replyMaxChars: 120,
       wakeEnabled: true,
       wakeAvailable: true,
+      wakeKeyword: 'dafeiyu',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: true },
+      ],
       wakeWord: '大肥鱼大肥鱼',
       dictationReady: true,
       openMain: true,
@@ -270,11 +327,45 @@ describe('ball menu', () => {
       setMillifraction() {},
       setReply() {},
       setWake() {},
+      setWakeWord() {},
       dictate() {},
       disable() {},
     })
     const row = template.find((item) => item.label?.startsWith('语音唤醒'))
     assert.equal(row?.label, '语音唤醒（大肥鱼大肥鱼）')
+    // The radio group states which phrase is live, so a user can see it without saying it.
+    assert.equal(row?.submenu?.find((item) => item.label === '大肥鱼大肥鱼')?.checked, true)
+    assert.equal(row?.submenu?.find((item) => item.label === 'Hey Jarvis')?.checked, false)
+    const picked: string[] = []
+    const picking = contextMenuTemplate({
+      catalog: { groups: [] },
+      overlay: { provider: 'deepseek-official', model: 'plain' },
+      background: { provider: 'deepseek-official', model: 'plain' },
+      millifractionEnabled: false,
+      replyEnabled: true,
+      replyMaxChars: 120,
+      wakeEnabled: true,
+      wakeAvailable: true,
+      wakeKeyword: 'dafeiyu',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'xiaodi', spoken: '小弟小弟', available: true },
+      ],
+      wakeWord: '大肥鱼大肥鱼',
+      openMain: true,
+    }, true, {
+      openMain() {},
+      setOverlay() {},
+      setBackground() {},
+      setMillifraction() {},
+      setReply() {},
+      setWake() {},
+      setWakeWord: (keyword) => { picked.push(keyword) },
+      disable() {},
+    })
+    const choice = picking.find((item) => item.label?.startsWith('语音唤醒'))
+    choice?.submenu?.find((item) => item.label === '小弟小弟')?.click?.({ checked: true })
+    assert.deepEqual(picked, ['xiaodi'])
     assert.equal(template.find((item) => item.label?.startsWith('极简回复'))?.label, '极简回复（≤120 字）')
   })
 
@@ -288,6 +379,11 @@ describe('ball menu', () => {
       replyMaxChars: 80,
       wakeEnabled: false,
       wakeAvailable: false,
+      wakeKeyword: 'hey_jarvis',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: false },
+      ],
       wakeWord: 'Hey Jarvis',
       openMain: false,
     }, true, {
@@ -297,12 +393,15 @@ describe('ball menu', () => {
       setMillifraction() {},
       setReply() {},
       setWake() {},
+      setWakeWord() {},
       disable() {},
     })
     const row = template.find((item) => item.label?.startsWith('语音唤醒'))
     assert.equal(row?.label, '语音唤醒（未找到本地模型）')
     assert.equal(row?.enabled, false)
-    assert.equal(row?.checked, false)
+    // Nothing under the row can be chosen either: the switch and every phrase are disabled together.
+    assert.equal(row?.submenu?.[0]?.enabled, false)
+    assert.equal(row?.submenu?.some((item) => item.type === 'radio' && item.enabled === true), false)
   })
 
   it('keeps the chime row honest about its voice and its silent hours', () => {
@@ -323,7 +422,12 @@ describe('ball menu', () => {
         speechEnabled: speech,
         wakeEnabled: false,
         wakeAvailable: false,
-        wakeWord: 'Hey Jarvis',
+        wakeKeyword: 'hey_jarvis',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: false },
+      ],
+      wakeWord: 'Hey Jarvis',
         openMain: true,
       }, true, {
         openMain() {},
@@ -332,7 +436,9 @@ describe('ball menu', () => {
         setMillifraction() {},
         setReply() {},
         setChime() {},
+        setSpeechVoice() {},
         setWake() {},
+      setWakeWord() {},
         disable() {},
       }).find((item) => item.label?.startsWith('整点报时'))
     const live = build({ enabled: true, quietFrom: 0, quietTo: 7 }, true)
@@ -361,6 +467,11 @@ describe('ball menu', () => {
       replyMaxChars: 60,
       wakeEnabled: false,
       wakeAvailable: false,
+      wakeKeyword: 'hey_jarvis',
+      wakeKeywords: [
+        { keyword: 'hey_jarvis', spoken: 'Hey Jarvis', available: true },
+        { keyword: 'dafeiyu', spoken: '大肥鱼大肥鱼', available: false },
+      ],
       wakeWord: 'Hey Jarvis',
       openMain: true,
     }, true, {
@@ -370,6 +481,7 @@ describe('ball menu', () => {
       setMillifraction() {},
       setReply: (value) => { clicked.push(value) },
       setWake() {},
+      setWakeWord() {},
       disable() {},
     })
     const on = build(true).find((item) => item.label?.startsWith('极简回复'))
@@ -381,6 +493,62 @@ describe('ball menu', () => {
     assert.equal(off?.checked, false)
     off?.click?.({ checked: true })
     assert.deepEqual(clicked, [false, true])
+  })
+
+  it('names the voice in use and offers the rest, but only when something can speak', () => {
+    // The row exists because the timbre is a one-click preference nobody should have to find in
+    // a JSON file; these are the four states it can be in, and each has to say the truth without
+    // relying on the user having heard anything yet.
+    const picked: string[] = []
+    const voices = [
+      { voice: 'stella', zh: 'stella（默认女声）', en: 'stella (default female)' },
+      { voice: 'zh-CN-YunxiNeural', zh: '云希（年轻男声）', en: 'Yunxi (young male)' },
+    ]
+    const build = (speech: boolean, voice: string, offered: typeof voices) =>
+      contextMenuTemplate({
+        catalog: { groups: [] },
+        overlay: { provider: 'deepseek-official', model: 'plain' },
+        background: { provider: 'deepseek-official', model: 'plain' },
+        millifractionEnabled: false,
+        replyEnabled: true,
+        replyMaxChars: 80,
+        speechEnabled: speech,
+        speechVoice: voice,
+        speechVoices: offered,
+        wakeEnabled: false,
+        wakeAvailable: false,
+        wakeKeyword: 'hey_jarvis',
+        wakeKeywords: [],
+        wakeWord: 'Hey Jarvis',
+        openMain: true,
+      }, true, {
+        openMain() {},
+        setOverlay() {},
+        setBackground() {},
+        setMillifraction() {},
+        setReply() {},
+        setChime() {},
+        setSpeechVoice: (next) => { picked.push(next) },
+        setWake() {},
+        setWakeWord() {},
+        disable() {},
+      }).find((item) => item.label?.startsWith('音色'))
+
+    const live = build(true, 'stella', voices)
+    assert.equal(live?.label, '音色 · stella（默认女声）')
+    assert.equal(live?.enabled, true)
+    assert.equal(live?.submenu?.find((item) => item.label === 'stella（默认女声）')?.checked, true)
+    assert.equal(live?.submenu?.find((item) => item.label === '云希（年轻男声）')?.checked, false)
+    live?.submenu?.find((item) => item.label === '云希（年轻男声）')?.click?.({ checked: true })
+    // An empty voice is a real state: it means the service reads in whatever it was started with.
+    assert.equal(build(true, '', voices)?.label, '音色 · 跟随服务默认')
+    // Without read-aloud there is nothing to choose a voice for, and the row says why.
+    const off = build(false, 'stella', voices)
+    assert.equal(off?.label, '音色（需先开启朗读）')
+    assert.equal(off?.enabled, false)
+    // And a build that offers no voices at all cannot open a submenu of nothing.
+    assert.equal(build(true, 'stella', [])?.enabled, false)
+    assert.deepEqual(picked, ['zh-CN-YunxiNeural'])
   })
 
   it('keeps every wake hook the ball page uses present in its markup and stylesheet', () => {

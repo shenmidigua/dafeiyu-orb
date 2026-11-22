@@ -6,7 +6,7 @@ question is whether the per-request fixed cost (a websocket, a TLS handshake, a 
 the splitting a net loss. Measured rather than assumed, because the answer decides whether
 MIN_SENTENCE_CHARS in speech.js should move.
 
-Run with the same interpreter the proxy uses: D:\\tools\\indextts\\py311\\python.exe
+Run with the same interpreter the proxy uses: D:\\tools\\py311\\python.exe
 """
 
 from __future__ import annotations

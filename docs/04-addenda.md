@@ -261,3 +261,83 @@ Windows 上的实测反馈:在浏览器里点球、输入、回车提交后,**Ag
 - **测试**：`bubble-line.test.ts` 重写为 `bubble-log.test.ts`（29 例，用一个能 `append`/`remove` 的假 DOM 直接跑页面函数）：左右分列、顺序、12 条上限、空白折叠、超长只留尾部、空串不画、四种打开条件、状态行替换/被消息摘掉/自己过期/`hold 0` 常驻、流式只有一个气泡、新消息关闭旧流、同一句不画两遍、清空；另有接线断言（唤醒/听写/回复/跨会话）与样式断言（左右规则、自动高度、`#transcript` 不绘制、提问时让位）。`panel-bubble.test.ts` 与 `speech.test.ts` 的断言同步改写（后者把 `showBubbleLine` 桩换成 `pushBubble`）。
 - **静态实测**：装配后的真 html+css 无头渲染三张——三轮对话（我在。/ 现在几点了 / 现在是下午三点整。）高度约 190、左右分明；五条长对话卡片长到约 460 的截图框内全部可见；超长回答顶到 420 后被裁。
 - **装配**：`pnpm build` → `assemble.mjs --out buildstage\package` → `pack_and_install.py`（`INSTALL VERIFIED`）→ `restart_helper.py`（球窗在、`stream.log` 里 `ready:"complete"`）。
+
+## 19. 气泡里的字要能选中、能复制(2026-11-20)
+
+用户试了一句:这聊天窗口里的文字不能复制。查下来是**两个原因叠在一起**,只修一个还是会觉得"没反应":
+
+- **文字根本选不中**。整页的基础规则是 `html, body { user-select: none }`——球是一个盖在别人桌面上的半透明浮层,一次误拖就把背后的标签选上,确实像 bug。但对话记录里的字是用户自己的东西,该按 `#transcript` 从前的待遇来:所以 `#bubble-log, .bubble-text` 单独声明 `user-select: text` / `-webkit-user-select: text` / `cursor: text`。光标形状也是说明的一部分,不加提示的话没人知道这里能拖。
+- **右键没有菜单**。`src/main.ts` 的 `context-menu` 处理器在 `hasSelection` 时直接 `return`,注释写的预期是"原生菜单会出来"。**Electron 不提供默认右键菜单**:渲染进程没有自己的菜单,主进程不 `popup` 就什么都不会出现。于是即便选中了字,右键也是死的那一下。现在选中状态会显式给一个菜单——`role: 'copy'` / `role: 'selectAll'`,走 Chromium 自己的编辑命令,和 Ctrl+C 是同一条路,所以两者行为一致。`electron.d.ts` 的 `MenuItemOptions` 相应补上 `role`,否则类型检查会挡。
+- **右键即选中这一条**。裸右键原本打开球自己的菜单(复制不到东西)。现在 `#bubble-log` 上挂 `pickBubbleMessage`:右键落在某条消息上时,先把这条消息的 `.bubble-text` 选中(`range.selectNodeContents`),再让主进程按"有选中"给出复制菜单。于是"右键一条消息就复制这一条"成立;而已经拖选过的情况不覆盖选择——右键照旧复制你拖的那一段,而不是整条。
+- **选中时卡片不许自己收**。卡片本来会在消息过后 `COLLAPSE_MS` 自动收起,而拖选正是发生在"读这几行"的时候——收起来就把正在拖的字抽走了。`scheduleCollapse` 的定时器到点时先问 `bubbleHasSelection()`:选着就重新排一次,松手后照旧收。判断看的是 `anchorNode` 是否落在 `#bubble-log` 里、且 selection 未 collapsed——collapse 那条很关键,单击留下的是个光标,把它当选中会让卡片再也不收。
+- **测试**:`bubble-log.test.ts` 增到 34 例。`bubbleHasSelection` 是真跑页面函数(假 selection + 假 DOM 的 `contains`/`parentNode`),覆盖"没选/光标/选区在消息里/选区在消息元素上/选区在别处"五种;另加四条断言级:样式里有 `user-select: text`、`pickBubbleMessage` 的三个关键动作与 `contextmenu` 接线、`scheduleCollapse` 的让路分支、`main.ts` 里 `hasSelection → 菜单(role: copy / selectAll)`。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py`;`tsc --noEmit -p packages/helper` 通过。
+- **仍由真机验收的**:拖选是否顺手、右键菜单是否只出一次(渲染进程的 `contextmenu` 与主进程的 `context-menu` 事件谁先到,决定了"先选中再出菜单"是否稳定;若不稳,症状是弹出球自己的菜单,和改动前一样,不会更糟)。
+
+## 20. 气泡里的过程文字折叠起来 (2026-11-20)
+- **问题**:用户看到气泡里"有些冗余的、类似于思考过程的文字",要求"那些都折叠起来就行了"。先说清楚不是推理泄漏:`speakWhenFinished` 明写 `if (block?.kind !== 'assistant') return`,`speakTurnReply` 也只收 assistant 的 key;跨会话那条受 `news.kind === 'typing'` 门控,而 `streamNews` 把 `reasoning-delta` 归 `'thinking'`、`text-delta` 才归 `'typing'`。四条 push 路径都不带推理。
+- **真正的原因**:一轮不是一个消息。会用工具的答复先旁白"我准备做什么",再旁白"我找到了什么",最后才给答案——`settleTurnReply`/`speakReply` 一个 assistant 块落一条气泡;主窗口每次 attempt 也各自旁白一遍,跨会话一个 turn 里多次 attempt 各自 settle 成一条。于是卡片读起来像模型在自言自语,答案被压在最底下。
+- **判定规则**:同一轮里被后一条球侧消息取代的那条 = 过程叙述。`pushBubble` 收到 `role === 'ball'` 时登记行,`registerBubbleRow` 先把上一批折起来再把自己记成这一轮的最新一条;`appendBubbleStream` 新建流式气泡时同样登记(新的 attempt 意味着上一次 attempt 的旁白已经过去)。用户自己的话不折——`pushBubble('me')` 是**换成**新一轮(`beginBubbleTurn`),所以上一轮的答案不会被下一句话折掉;唤醒应答也是新一轮,`applyWakeStatus` 里在 push 前显式 `beginBubbleTurn()`,否则被唤醒的球会把刚答完的那句折起来。
+- **折叠不删除**:两行、暗灰、无气泡形状,下面一个"展开"按钮,点了显示全文并变"收起"(`data-folded` / `data-open`,`aria-expanded` 同步)。删掉更省事,但卡片就会谎称答案是从天上掉下来的;过程有时候正是用户要回头看的东西。
+- **按钮而不是点气泡**:气泡里的字现在是可选中的(`#bubble-log` 的 `user-select: text`),而"点一下折起来"与"点一下放光标"是同一个手势,必有一个要输。所以折叠只由按钮触发,并且 `stopPropagation`,不让点击漏到选中逻辑上。
+- **高度**:展开/收起是高度变化,`#panel` 上的 `ResizeObserver` 已经在 `syncHitTest`(见第 19 节那条),所以这里不额外调用——否则等于两处都管同一件事。
+- **测试**:`bubble-log.test.ts` 45 例。新增 9 例:前一条被折、上一轮答案不被新一轮折、一个 turn 内被取代的 attempt 被折、半截流式答复不折、自己的话不折、按钮开合与 `aria-expanded` 与文案切换、同一条只折一次、`clear` 后不残留旧行;另有接线断言(`applyWakeStatus` 里 `beginBubbleTurn()` 的位置、`pushBubble` 的 `me`/`ball` 分支、`appendBubbleStream` 的登记)与样式断言(列向排布、12.5px、两行裁切、按钮 `cursor: pointer`)。`FakeNode` 因此补了 `attrs`/`hasAttribute`/`setAttribute`/`toggleAttribute`/`addEventListener`/`fire`,用例是真去点那个按钮,不是断言它存在。
+- **静态验证**:`bubble-preview/fold.py` 用仓库自己的 css 画一条折着、一条展开的过程行(截图 `chat-fold.png`),确认暗灰无框、两行带省略、按钮位置对。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py`;`tsc --noEmit -p packages/helper` 通过;全量 675 例 671 过,4 条既有红不变(`continuous-conversation` 的 import 断言、`speak-frame` 三例 `running is not defined`)。
+- **仍由真机验收的**:一轮里折几条才刚好——工具多的答复可能连着折三四条,若显得太空,把规则收紧到"只折最后一条之前的那一条"是一行改动。
+
+## 21. 第二段唤醒应答的字少了「呢」 (2026-11-20)
+- **用户听出来的**:唤醒应答有一段的音频说的是「我在呢」,气泡里的字幕却是「我在」。字幕不是写死在页面里的一句话,而是按"哪一段 clip 在放"去 `WAKE_VOICE_TEXTS` 里查表(见第 16 节的由来);所以错的是表里那一格,不是显示逻辑。
+- **先测再改**:三段 clip 是 24 kHz,而宿主的 speechToText 只收 16 kHz 单声道 PCM16(直接喂报 `Invalid speech WAV`),所以先把 `assets/voices/c1..c3.wav` 重采样成 16 kHz,再用 DSH 自己的 worker(`dsh_orb/stt-test.mjs`,本机 SenseVoice int8)逐段读回来: c1「我在。」、c2「我在呢。」、c3「我在你说。」(识别把「听」吞了,按已知的合成文本记作「我在听你说。」)。表原来写的是 `['我在。','我在。','我在听你说。']`——第二格是从另外两格推出来的,没人听过。
+- **改法**:`WAKE_VOICE_TEXTS` 第二格改成「我在呢。」,并把"这三句是测出来的、不是猜的;重录一段要重新听一遍"写进注释。`messages.wakeAck: '我在。'` 保持不动——它只是"一段 clip 都没放出来、只响了提示音"时的兜底,不是任何一段的字幕。
+- **测试**:`wake-voice.test.ts` 新增一例,逐格钉住三个 take 的字(长度与 `WAKE_VOICES` 对齐、三格都不为空、第二格必须是「我在呢。」)。以后再有人按另外两格"顺手统一"就会被这条例挡住。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py`;装好的 `dist/helper/assets/wake.js` 里已是 `['我在。','我在呢。','我在听你说。']`,页面 `ready:"complete"`。
+
+## 22. 唤醒词从「一个」变成「可选几个」 (2026-11-20)
+- **诉求**:用户先说「再训练几个提示词」随即自己纠正成唤醒词,点了名:小弟小弟、小慧小慧、大成大成,并要求「让这些唤醒词作为可选项」。这不是加三个字符串,而是三个 openWakeWord 分类器加一个能切换它们的入口。
+- **一个词为什么不能只是字符串**:页面按 `<keyword>.onnx` 取模型(`wake.ts` 的 `keywordFile`,`hey_jarvis` 是版本化的例外),模型自己决定它认哪一个音节序列;helper 的 `serveWakeAssets` 还按**当前那一个** keyword 生成白名单(`allowedFiles`),所以新词必须是新文件,不能是旧文件的别名。`RING_SLOTS` 沿用默认 28:先用 8 条 smoke 正样本跑 `features --phrase xiaodi`,打印「phrase needs 10..11 of the ring's 28 slots」,高于 `MIN_PHRASE_SLOTS=9`,前缀窗口也有 10–11 个可退,所以 `wake_features.WINDOW_FRAMES` 和页面槽位都不用动。
+- **训练链路复用大肥鱼的骨架**:`wake_phrases.py` 加 `PROFILES`/`DISPLAY_NAMES`,每个两字叠词按同一套家族展开——说一遍 22 种形状、漏音节 4 条、两半之间插话 7 条、同音字各写各的(小弟→小迪/小笛/小敌/小底/小递/小弟弟/小妹妹/晓弟,小慧→小会/小惠/小灰/小辉/小回/小绘/晓慧/小慧慧,大成→大城/大诚/大程/大呈/大橙/大乘/达成/大成成)。`wake_dataset.py`/`wake_train.py`/`wake_eval.py` 都加 `--phrase`:目录走 `data/phrases/<keyword>/{positives,negatives}`,特征与 folds 走 `<keyword>-` 前缀,`dafeiyu` 保持无前缀老路径,这样已经上线的模型仍可复现。缺文件就大声失败,不去读别人的数据。
+- **网格取舍**:新词默认 `COMPACT_RATES`(-15%/0/+15%)只叠 +0Hz 音高 → 210 条正样本、1722 条近似负样本;大肥鱼那套 `--full`(1470/4018)留着,要用得接受约三倍合成时间。理由是语速才是「人累了/急了」真正变的东西,音高只是同一声源的滤波变化,而声音已经 14 个。
+- **filler 不属于任何一个词**:「今天天气不错」对哪个唤醒词都不是目标,所以 `link_shared_filler()` 把 `data/negatives/filler-*.wav` 硬链接(不是复制)进新词的 negatives,每词省下约四十分钟合成。
+- **TTS 链路先修**:`wake_tts.py` 原先把 `edge_server.py` 源码 exec 成模块取 `WSS/TOKEN`,而该服务 2026-11-16 被重写、协议搬进 vendored `edge_tts`,于是合成第一步就 `AttributeError`。改成 `sys.path` 前置 `D:\tools\edgetts\vendor` 直接 `import edge_tts`,与朗读服务同一份库、同一份声音 id;空音频抛错而不是写出 0 字节 wav。
+- **并发**:8 并发会同时握手,端点回一部分空音频,于是重试风暴(两分钟只写 61 条);`WORKERS` 降到 4,吞吐相同、重试消失。
+- **一条只信退出码的流水线**:`dsh_orb/train_new_words.ps1` 按 `wake_retrain.sh` 的规矩逐段跑 synth → features → train → eval,每段整份输出进 `new-words-chain.log`,退出码决定是否继续——合成阶段是破坏性的(开跑前先清空这一组),`tail` 吃过一次亏:管道退出码是最后一条命令的,失败被藏在已经滚过去的输出里。另外数据已齐时**跳过** synth:重跑会把四十分钟做出来的 210 条正样本删掉,症状只是数据集悄悄少了一半。
+- **部署这一步要能指定名字**:`wake_deploy.py` 的目标文件名原本取 `orb-wake.json` 里**当前配置的** keyword,几词并存时那会把小弟的模型写成 `dafeiyu.onnx`,顺手毁掉正在工作的那个。所以加 `--as`,目标 = `<as>.onnx`,备份名仍按被替换的文件走。
+- **入口在右键菜单**:唤醒那一行从单个 checkbox 变成子菜单——上面是开关,分隔线下面是唤醒词单选组(`menu.ts` 的 `WakeKeywordOption[]`)。`ContextMenuState` 因此多两个字段 `wakeKeyword`(用来跟单选态比对)与 `wakeKeywords`(名字 + `available`);`available` 在 helper 侧按 `existsSync(join(assetDirectory, keywordFile(keyword)))` 现算,所以刚部署的模型不必重启就出现在菜单里,而半训练的词显示成「（模型未训练）」并置灰——看得见地缺,而不是点下去什么也不发生。没有模型目录时,整行连子菜单一起禁用。
+- **换词必须重拉 helper,这是唯一一个不能就地生效的开关**:页面 `assets/wake.js` 的 `load()` 有 `if (this.models !== undefined) return` 的缓存守卫,ONNX 只在启动时载入一次;白名单也按单个 keyword 生成。所以 host 的 `setWakeKeyword` = 写文件 → `publishChrome()` → `halt()` + `start()`——复用「停用悬浮球」的那一对,而不是再发明一种重拉。代价是球消失约一秒、本轮记录丢失,这一点写进方法注释。keyword 没变时什么都不做,点当前那一行不该闪一下。
+- **两份名字表仍然要一致**:`WAKE_SPOKEN_NAMES`(`src/wake-names.ts`)与页面 `KEYWORD_NAMES`(`assets/shell.js`)现在各五个词,由 `tests/wake-names.test.ts` 钉住。名字是「说一遍不行、要说两遍」的提示语,少一个字就把用户送到一个模型训练时特意当负样本的词上。
+- **测试**:`menu.test.ts` 8 例,新增的是子菜单结构(开关 + 分隔线 + 单选组)、当前词打勾、缺模型的行 `enabled === false`、点一个词把 keyword 交给 `setWakeWord`、以及没有模型目录时开关与每个词一起禁用。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`);host 侧改了 `orb.ts`/`preferences.ts`,所以要 `restart_dsh.py` 让插件重新加载。`tsc --noEmit` 两个包都干净;全量 676 例 672 过,4 条既有红不变。
+- **训练是一条链,评估是另一条**:第一次跑完,xiaodi 的报告是「held-out AUC 0.78,任何阈值都只召回 15%」,看起来是数据不够。其实是两个 bug 叠在一起:① `wake_eval.py` 里按 phrase 解析出 `model`,但真正建 session 的那行还写着模块常量 `MODEL`(`dafeiyu.onnx`),于是两次不同训练的小弟模型打出**一模一样**的报告——每个数字都对,每个数字都在说另一个文件(这正是 `wake_deploy.py` 存在要防的那类错);② 紧凑网格把一个正样本和四千多条负样本放在一起,正样本权重还是 1.0,模型学到的是「对什么也别响应」。修法:session 用 `model`;`wake_train.py` 的 `POSITIVE_WEIGHT` 从常数改成按网格规模的规则(不到一千条正样本给 6.0,大肥鱼的 1470 条仍是 1.0),`--positive-weight` 可覆盖。修完小弟: AUC 0.9975,正样本 p50 1.000,0.999 阈值下召回 100%、近似词误报 5%、填充句 0%、每小时 0 次误报。
+- **阈值跟着模型走**:`orb-wake.json` 只有一个 `threshold`,几个词并存时它属于「最后选中的那个」。小弟测出来是 0.999、小慧是 0.75、大肥鱼是 0.95,拿别人的数去跑不是更松就是更紧,而松的那一侧正好是「近似词误触发」。所以 `wake_deploy.py` 部署完在模型旁边写 `<keyword>.json`(内容 `{threshold}`,取自 `features/<keyword>-eval.json` 的 `chosen`),host 换词时读它、`store.setWakeThreshold` 写回;没有这个副文件就沿用当前值,不猜。
+- **仍由真机验收的**:切换后第一次唤醒要不要额外提示「正在换词」——现在只有球消失一秒这唯一的反馈。
+
+## 23. 第三段唤醒应答是「我在，你说。」不是「我在听你说。」 (2026-11-20)
+- **听出来的**:用户说字幕写成了「我在听你说」,不对,应该是「我在,你说」。这正是第 21 节那条修法的反面:当时为了让字幕跟音频对上,把三段 clip 拿 ASR 读回来,`c3` 读成「我在你说」,于是按语义补成了「我在听你说。」——补进去的是一个**并没被说出来的字**。
+- **识别器丢的是标点,不是词**:那一段真正说的是「我在,你说。」(我在这儿,你说吧),ASR 把停顿吃掉了,`我在你说` 就是这句话去掉逗号。听感上的「一口气说完」和书写上的缺一个逗号,当时看成了「少了『听』字」。改法只动字幕,不动音频:clip 里没有「听」可删,只需要把逗号放回去。
+- **改法**:`WAKE_VOICE_TEXTS` 第三格 `'我在听你说。'` → `'我在，你说。'`,并在表头注释里写清这条教训——把 ASR 的一行原样读回人类句子时,不要替它补词,只补它必然会丢的标点。
+- **测试**:`wake-voice.test.ts` 那条「describes every take」把第三格钉成 `'我在，你说。'`,注释里记下这次是补了词而不是补标点。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py`;9 例全过。
+
+## 24. 删掉很早版本的「内置动图」头像 (2026-11-20)
+- **是谁的**:设置页里那 6 张 GIF(指点/干饭/比心/欢呼/托腮/微笑)是早期加的,用户看图后才想起来:「这个相关的代码没有删掉啊,前端还是有这些选项,都删掉吧……动图,前端,后端,相关的都删掉。」
+- **删的是整条链,不是藏按钮**:前端删掉选择组(`presetGallery`、`avatarBuiltin`/`avatarPresetNames` 两份文案、`.dsh-orb-set-preset*` 的 CSS);后端删掉 `avatar-presets.ts`(整份)、`helper-path.ts` 的 `presetAvatarDir`、设置快照里的 `avatarPresets`/`avatarPresetId`、`GET /.dsh-orb/avatar/preset/:id` 与 `POST /.dsh-orb/avatar/preset` 两条路由、`ProfileStore.selectAvatarPreset`;helper 删掉 `AvatarChoice` 的 `preset` 分支与 `loadAvatar` 里那条路径;资源删掉 `assets/avatars/`(6 个 GIF,约 12 MB),装配树里也不再带它。
+- **保留的**:上传自定义图片(`POST /.dsh-orb/avatar`)、恢复默认(`POST /.dsh-orb/avatar/restore`)、以及 `avatarMessage` 的 `default`/`custom` 两态。头像功能还在,只是不再有那 6 张存货。
+- **老档案不迁移**:装过那版的档案里 `orb-avatar.json` 还写着 `{kind:'preset',preset:...}`。`avatarSelection()` 直接忽略这个记录——有上传图就是上传图,没有就是自带 GIF。不做迁移脚本:一个已经删掉的功能不该让人开机时卡在它留下的状态上,测试里专门钉了这一条。
+- **helper 也不认这个 kind 了**:`readAvatarChoice` 现在只返回 `default` 或 `custom`。`preset` 送进来一律当 `default`,因为那些 GIF 已经不在包里、路由也删了——让页面去加载一个不存在的相对路径,不如落到自带图。
+- **测试**:host 的路由测试改成断言两条旧路由都是 404、快照里没有这两个字段;`preferences` 的用例改成「旧档案读成 default」;`runtime` 的 avatar 用例改走 `writeAvatar`;helper 的 `avatar.test.ts` 增加一条「preset 也读成 default」;设置页的 `section.test.mjs` 断言页面上没有那组缩略图、也不会发出 `/avatar/preset` 请求。
+- **一处环境限制**:`packages/bundle/tests/install.test.mjs` 在本机跑不起来,原因是 `symlinkSync` 报 `EPERM`(Windows 未开开发者模式/无管理员权限),与本次改动无关——它连临时目录里的 `node_modules` 都软链不了。
+- **装配**:`pnpm build` → `assemble.mjs`(确认 `dist/helper/assets/avatars` 已不在产物里)→ `pack_and_install.py`(`INSTALL VERIFIED`)→ 重启 DSH;两个包 `tsc` 干净,全量 675 例 671 过、4 条既有红不变,设置页 42 例全过。
+
+## 25. 「小弟小弟」在真机上唤不醒：阈值没有余量，判定窗口也多要了一个 (2026-11-20)
+- **现象**:三个新词里,用户两次反馈「小 D 小 D(小弟小弟)和小慧小慧一次都没唤醒成功」。配置侧全部正常:`orb-wake.json` 的 `keyword` 是 `xiaodi`、`enabled` 为真,`stream.log` 里有正常的 `wake turn:` 交接行,没有任何模型加载或 404。也就是说引擎在跑、麦克风在通,问题出在**分数**上。
+- **为什么训练报告看不出这个问题**:`xiaodi-eval.json` 的 0.999 阈值召回 100%、误唤醒 0 次/小时,但那批留出集是 14 个 TTS 音色的合成音频。嗓子、房间噪声、音量电平这三件事在合成语料里一件都不存在,报告里的余量是真机上的零余量。
+- **四次实测,四次降阈值**:0.999 时十几次一次没醒;0.55 十几次醒一次;0.45 约五成;0.35 六七成;0.30 加两窗口规则后十次全中。这条曲线说明真机上 `小弟小弟` 的峰值分数大致在 0.3–0.5 之间,而不是训练集里的 0.99。
+- **还差的那一半不是分数,是窗口数**:`CONSECUTIVE_WINDOWS` 从 3 改成 **2**。原来的 3 是在 TTS 上量出来的——合成音把分数顶住五个窗口,第三个窗口一分钱不花;真人的两字叠词说得稍快一点只顶住两到三个窗口,于是「分数够了但第三窗掉下去」的那一遍就成了漏唤醒。少一个窗口顺带把唤醒延迟从约 0.39 s 降到约 0.26 s(窗口步长 128 ms)。
+- **代价写在明面上**:真机阈值 0.30 对应 TTS 评测里约 8.6 次/小时误唤醒、近似词误报 18%,再叠上少一个窗口,只会更高。所以这是一个「先能用」的值,不是终值;若误唤醒变多,正确的回调方向是阈值回到 0.4、窗口数保持 2,而不是继续降阈值。
+- **实测记录**:2026-11-20 14:47:59–14:53:03 连续 13 次 `wake: the ball handed a turn`,间隔 10–20 秒,与用户自述「十次都能唤醒」一致;此后约 5 分钟空闲期无自发唤醒。空闲不误醒不等于有人说话时不误醒,那条要靠用户放视频/聊天来验。
+- **阈值现在由副文件管**:`dsh-voice-dialog/assets/xiaodi.json` 与 `orb-wake.json` 同步为 `{threshold: 0.30}`。只改一边会被 `applyKeywordThreshold` 在下次换词时覆盖回去——这正是这次踩到的坑:诊断期间直接把 `orb-wake.json` 写成 0.55,菜单里点过一次「大肥鱼大肥鱼」之后 `keyword` 和 `threshold` 一起被换掉,界面立刻报「语音唤醒（未找到本地模型）」(其实是 `assetDirectory` 也被写成空串)。
+- **顺手留下的工具**(不进包、不参与装配):`dsh_orb/wake_probe.py` 用 `OrbFeatures(scale=1.0)`(与 `wake.js` 同一条前端)给一段 wav 逐窗口打分,并以 128 ms 步长打印曲线;`dsh_orb/wake_capture.py` 按 `rms>0.01` 触发自动切段,省掉「等我喊开始」这种对不齐的配合。两者抓到的默认设备音频峰值只有 0.065(基本是底噪),所以真机分数是从「能不能醒」反推的,不是直接量到的。
+- **诊断日志为什么一条都没打出来**:`runModels` 里加的 `console.log('wake <keyword>: score ...')` 依赖页面 console 转发,而 `stream.log` 里的 `page:` 前缀只来自主窗口;球自己的渲染进程 console 根本不到日志。这一行现在是死代码,下次动 `wake.js` 时一并删掉。
+- **没做的事**:没有用真实录音重训,也没有做加噪/变速增强。当前结论只对 `xiaodi` 成立,`xiaohui`(0.75)与 `dacheng`(0.85)仍是 TTS 上选出来的阈值,大概率要各自重走一遍这条曲线。
+- **装配**:`pnpm build` → `assemble.mjs` → `pack_and_install.py`(`INSTALL VERIFIED`)→ `restart_helper.py`(阈值与窗口数都在 helper 侧,换词必须重启,因为 `wake.js` 的 `load()` 有 `this.models !== undefined` 的缓存守卫)。

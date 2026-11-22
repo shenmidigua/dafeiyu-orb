@@ -1,26 +1,28 @@
-"""Build the training set for the 大肥鱼 wake word — the phrase said twice.
+"""Build a training set for a wake word — each phrase said twice.
 
-Three groups of audio, for three different jobs:
+Every keyword in `wake_phrases.PROFILES` is built the same way, from three groups of audio:
 
-  * **positives** — the wake word itself, in every Chinese voice the endpoint has, across seven
-    speaking rates and three pitches. Roughly 1500 clips. Rate and pitch are free speaker variation:
-    the same voice at -25% and +20 Hz is a different acoustic object, and a wake word has to survive
-    exactly that drift.
-  * **adversarial** — the near-misses from `wake_phrases.ADVERSARIAL`. These are what the model would
-    otherwise conflate with the target, and they are the reason the phrase was checked for
-    separability before any of this was built.
+  * **positives** — the wake word itself, in every Chinese voice the endpoint has, across speaking
+    rates and pitches. Rate and pitch are free speaker variation: the same voice at -25% and +20 Hz
+    is a different acoustic object, and a wake word has to survive exactly that drift.
+  * **adversarial** — the near-misses from that keyword's profile. These are what the model would
+    otherwise conflate with the target, and they are the reason a phrase is checked for separability
+    before any of this is built.
   * **filler** — ordinary Chinese speech, synthesised as long paragraphs and then cut into clips. In
     real use the wake word is surrounded by talking, so this is where the false-accept rate is
     actually decided.
 
-Everything is synthesised on one endpoint, through a pool of connections: a turn costs a fraction of
-a second but a handshake costs more than one, so a single connection would make this take an hour
-instead of minutes.
+Filler does not depend on the wake word — 今天天气不错 is nobody's wake word — so it is synthesised
+once, in 大肥鱼's tree, and linked into every other keyword's negatives. That buys back most of an
+hour of synthesis per phrase and changes nothing about the data.
+
+Everything is synthesised on one endpoint through a pool of connections, because a wake word's
+training set is thousands of short clips.
 
 Usage:
-    wake_dataset.py synth [--limit N]   # synthesise audio into data/positives, data/negatives
-    wake_dataset.py features            # turn that audio into data/features/*.npy
-    wake_dataset.py stats               # report what was built
+    wake_dataset.py synth --phrase xiaodi [--limit N]
+    wake_dataset.py features --phrase xiaodi
+    wake_dataset.py stats --phrase xiaodi
 """
 
 from __future__ import annotations
@@ -28,8 +30,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import pathlib
 import random
+import shutil
 import sys
 import wave
 
@@ -47,8 +51,41 @@ POSITIVE_DIR = DATA / "positives"
 NEGATIVE_DIR = DATA / "negatives"
 FEATURE_DIR = DATA / "features"
 
+
+def phrase_dirs(keyword: str) -> tuple[pathlib.Path, pathlib.Path]:
+    """Where a keyword's clips live: (positives, negatives).
+
+    `dafeiyu` keeps the directories it was built in, so the model that ships today can still be
+    reproduced from the same files. Every other keyword gets its own tree under
+    `data/phrases/<keyword>`: the synthesis stage *clears a group before writing it*, so two phrases
+    sharing one directory would erase each other, and the feature stage reads the directory rather
+    than the plan — it would happily train on a mixture of two wake words.
+    """
+    if keyword == "dafeiyu":
+        return POSITIVE_DIR, NEGATIVE_DIR
+    root = DATA / "phrases" / keyword
+    return root / "positives", root / "negatives"
+
+
+def feature_stem(keyword: str) -> str:
+    """How a keyword's feature files are named, ahead of `positive`/`negative`/`prefix`.
+
+    Empty for `dafeiyu`, because those files were written before there was a second keyword. The
+    stem is what keeps the two models' arrays in one directory without either one being able to open
+    the other's: `wake_train.py` reads `<stem>positive.npy`, so a keyword with no features fails
+    loudly on a missing file instead of training on somebody else's data.
+    """
+    return "" if keyword == "dafeiyu" else f"{keyword}-"
+
+
 # The endpoint tolerates this many concurrent sessions; measured, not guessed — see the run notes.
-WORKERS = 8
+#
+# Eight was the number when the generator held one websocket per worker and kept it open. Since
+# `wake_tts` speaks through `edge_tts` (one session per utterance, 2026-11-20), eight concurrent
+# sessions are eight *new* handshakes at once and the endpoint answers a share of them with
+# `NoAudioReceived`; four keeps the same throughput because a turn is now mostly handshake, and it
+# stopped the retry storm that made a 1470-clip stage look stalled at sixty clips.
+WORKERS = 4
 
 # A session that the endpoint closes is not recoverable, so a failed turn is re-tried on a fresh one.
 # See the worker in `synthesise` for the run that made this necessary.
@@ -164,17 +201,39 @@ PREFIX_WINDOWS_PER_VARIANT = 1
 
 PITCHES = ["-10Hz", "+0Hz", "+15Hz"]
 
+# 新增的唤醒词用的紧凑网格。
+#
+# 大肥鱼那一版是 14 个声音 × 5 个外框 × 7 个语速 × 3 个音高 = 1470 条正样本，外加 4018 条近似
+#
+# 负样本。三个名字要一起训的话，那张网格是三个半小时的合成。这里的取舍是**只砍轴，不砍多样性**：
+#
+#   * 语速留 -15% / 0 / +15%。它是最有用的一条轴——一个人困的时候和着急的时候差的就是这个；
+#   * 音高只留 +0Hz。合成出来的音高变化只是同一个声源的滤波器在动，它买到的「换一个人」远不如
+#
+#     多几个声音买到的多，而这套数据里已经有十四个声音了；
+#   * 声音、外框、近似负样本一条都不减。前两个决定泛化，最后一个决定误唤醒。
+#
+# 结果是每个新名字 210 条正样本 + 1722 条近似负样本。要更接近大肥鱼那一版的覆盖，`--full` 把
+#
+# 网格换回完整的 1470/4018，代价是时间。
+COMPACT_RATES = ["-15%", "+0%", "+15%"]
+COMPACT_PITCHES = ["+0Hz"]
 
-def positive_tasks() -> list[tuple[str, str, str, str]]:
+
+def positive_tasks(keyword: str = "dafeiyu", full: bool = False) -> list[tuple[str, str, str, str]]:
     """(text, voice, rate, pitch) — the wake word, said every way the endpoint can say it."""
+    phrases = wake_phrases.profile(keyword)
+    complete = full or keyword == "dafeiyu"
+    rates = wake_tts.RATES if complete else COMPACT_RATES
+    pitches = PITCHES if complete else COMPACT_PITCHES
     return [(carrier, voice, rate, pitch)
             for voice in wake_tts.VOICES
-            for carrier in wake_phrases.POSITIVE_CARRIERS
-            for rate in wake_tts.RATES
-            for pitch in PITCHES]
+            for carrier in phrases["carriers"]
+            for rate in rates
+            for pitch in pitches]
 
 
-def adversarial_tasks() -> list[tuple[str, str, str, str]]:
+def adversarial_tasks(keyword: str = "dafeiyu", full: bool = False) -> list[tuple[str, str, str, str]]:
     """Near-misses, at every rate the positives use, so the boundary is learned and not just the
     neighbourhood.
 
@@ -214,10 +273,12 @@ def adversarial_tasks() -> list[tuple[str, str, str, str]]:
     "the truncations at three pitches cost 34.8" is one observation, not a measurement of the effect
     size.
     """
+    complete = full or keyword == "dafeiyu"
+    rates = wake_tts.RATES if complete else COMPACT_RATES
     return [(text, voice, rate, "+0Hz")
             for voice in wake_tts.VOICES
-            for text in wake_phrases.ADVERSARIAL
-            for rate in wake_tts.RATES]
+            for text in wake_phrases.profile(keyword)["adversarial"]
+            for rate in rates]
 
 
 def paragraph_plan(rng: random.Random) -> list[tuple[str, str]]:
@@ -470,7 +531,7 @@ def pool_slice(pool_audio: list[np.ndarray], rng: random.Random, length: int) ->
 # --------------------------------------------------------------------------------------------
 
 def extract(directory: pathlib.Path, out_path: pathlib.Path, keep: str,
-            pool_dir: pathlib.Path | None = None) -> int:
+            pool_dir: pathlib.Path | None = None, prefix_stem: str = "prefix") -> int:
     """Turn every WAV in `directory` into windows and stack them into one array.
 
     `keep` decides which windows of a clip survive:
@@ -633,30 +694,67 @@ def extract(directory: pathlib.Path, out_path: pathlib.Path, keep: str,
         # split's fold table onto this one rather than dealing these clips its own, which is what puts
         # a clip's phrase and its own prefix windows on the same side of the held-out fence.
         prefix_stacked = np.vstack(prefix_batches).astype(np.float32)
-        np.save(out_path.with_name("prefix.npy"), prefix_stacked)
-        np.save(out_path.with_name("prefix-clips.npy"),
+        np.save(out_path.with_name(f"{prefix_stem}.npy"), prefix_stacked)
+        np.save(out_path.with_name(f"{prefix_stem}-clips.npy"),
                 np.concatenate([np.full(batch.shape[0], index, dtype=np.int32)
                                 for index, batch in enumerate(prefix_batches)]))
-        out_path.with_name("prefix-names.json").write_text(
+        out_path.with_name(f"{prefix_stem}-names.json").write_text(
             json.dumps(names, ensure_ascii=False), encoding="utf-8")
     return stacked.shape[0]
 
 
+def link_shared_filler(negative_dir: pathlib.Path) -> int:
+    """Point this keyword's negatives at 大肥鱼's filler instead of synthesising it again.
+
+    Filler is ordinary Chinese sentences, and none of them is any keyword's target: 今天天气不错 is
+    exactly as negative for 小弟 as it is for 大肥鱼. Synthesising it per phrase would be paying the
+    same forty minutes three times for the same bytes.
+
+    Linked, not copied, because it *is* the same bytes: a hard link keeps one copy on disk and lets
+    the feature stage read the directory as if the clips were this phrase's own. Where the filesystem
+    refuses a link (a different volume, a non-NTFS path), the copy is the fallback and the result is
+    the same data, only larger.
+    """
+    negative_dir.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for path in sorted(NEGATIVE_DIR.glob("filler-*.wav")):
+        target = negative_dir / path.name
+        if target.exists():
+            continue
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)
+        linked += 1
+    return linked
+
+
 def command_synth(args: argparse.Namespace) -> int:
     rng = random.Random(0)
+    keyword = args.phrase
+    positive_dir, negative_dir = phrase_dirs(keyword)
     # (label, directory, tasks, what `--limit` divides by). The divisor is how much smaller the group
     # is than the positives, so a smoke run keeps the same proportions.
     groups = {
-        "positives": ("positive", POSITIVE_DIR, positive_tasks(), 1),
-        "adversarial": ("adversarial", NEGATIVE_DIR, adversarial_tasks(), 4),
-        "filler": ("filler", NEGATIVE_DIR, paragraph_plan(rng), 16),
+        "positives": ("positive", positive_dir, positive_tasks(keyword, args.full), 1),
+        "adversarial": ("adversarial", negative_dir, adversarial_tasks(keyword, args.full), 4),
+        "filler": ("filler", negative_dir, paragraph_plan(rng), 16),
     }
-    wanted = args.only.split(",") if args.only else list(groups)
+    # Filler is shared (see `link_shared_filler`): for any keyword but 大肥鱼 it is linked into place
+    # rather than synthesised, and it is not part of a default run because there is nothing to run.
+    shared_filler = keyword != "dafeiyu"
+    wanted = args.only.split(",") if args.only else [
+        name for name in groups if not (shared_filler and name == "filler")]
     for name in wanted:
         if name not in groups:
             raise SystemExit(f"unknown group {name!r}; expected one of {sorted(groups)}")
 
     print("  planned: " + ", ".join(f"{len(groups[name][2])} {name}" for name in wanted))
+    if shared_filler:
+        # Before anything is synthesised, so the negatives a stage reports on disk are the set the
+        # feature stage will actually read.
+        print("== filler ==")
+        print(f"  linked {link_shared_filler(negative_dir)} shared clips from {NEGATIVE_DIR}")
 
     # Prove the endpoint answers *before* anything is deleted. The clear below is one-way — it removes
     # every clip in the group before writing a single replacement — so a refusal arriving at that
@@ -697,26 +795,29 @@ def command_synth(args: argparse.Namespace) -> int:
         print(f"  {count} clips")
 
     print()
-    print(f"  positives on disk: {wav_count(POSITIVE_DIR)}")
-    print(f"  negatives on disk: {wav_count(NEGATIVE_DIR)}")
+    print(f"  positives on disk: {wav_count(positive_dir)}")
+    print(f"  negatives on disk: {wav_count(negative_dir)}")
     return 0
 
 
-def command_features(_: argparse.Namespace) -> int:
+def command_features(args: argparse.Namespace) -> int:
+    keyword = args.phrase
+    positive_dir, negative_dir = phrase_dirs(keyword)
+    stem = feature_stem(keyword)
     # The warm-up pool is filler only, for every split. Positives must not be warmed up with their own
     # phrase — the ring is what precedes the wake word, and nobody says the wake word twice in a row
     # to build up to saying it. Filler also cannot leak a label: it is negative material, but it only
     # ever appears in the part of the signal that is deliberately not being scored.
-    print("== positives ==")
-    positives = extract(POSITIVE_DIR, FEATURE_DIR / "positive.npy", keep="positive",
-                        pool_dir=NEGATIVE_DIR)
+    print(f"== positives ({keyword}) ==")
+    positives = extract(positive_dir, FEATURE_DIR / f"{stem}positive.npy", keep="positive",
+                        pool_dir=negative_dir, prefix_stem=f"{stem}prefix")
     print(f"  {positives} windows")
     # Adversarial and filler are pooled: both are "speech that is not the wake word", and the
     # distinction between them is only useful when generating, where it can be re-derived from the
     # filename.
     print("== negatives ==")
-    negatives = extract(NEGATIVE_DIR, FEATURE_DIR / "negative.npy", keep="sample",
-                        pool_dir=NEGATIVE_DIR)
+    negatives = extract(negative_dir, FEATURE_DIR / f"{stem}negative.npy", keep="sample",
+                        pool_dir=negative_dir)
     print(f"  {negatives} windows")
 
     print()
@@ -725,7 +826,7 @@ def command_features(_: argparse.Namespace) -> int:
     # clips, and `wake_train.py` adds them to the negative side of the loss. Keeping the number visible
     # is how a change to PREFIX_SLOTS is noticed as a change to the training set rather than as a
     # detail of the feature stage.
-    prefix_path = FEATURE_DIR / "prefix.npy"
+    prefix_path = FEATURE_DIR / f"{stem}prefix.npy"
     if prefix_path.exists():
         prefix = np.load(prefix_path, mmap_mode="r")
         print(f"  prefix negatives: {prefix.shape[0]} windows "
@@ -735,22 +836,33 @@ def command_features(_: argparse.Namespace) -> int:
     return 0
 
 
-def command_stats(_: argparse.Namespace) -> int:
-    print(f"  positives: {wav_count(POSITIVE_DIR)} wav")
-    print(f"  negatives: {wav_count(NEGATIVE_DIR)} wav")
+def command_stats(args: argparse.Namespace) -> int:
+    keyword = args.phrase
+    positive_dir, negative_dir = phrase_dirs(keyword)
+    stem = feature_stem(keyword)
+    print(f"  phrases: {sorted(wake_phrases.PROFILES)}")
+    print(f"  positives: {wav_count(positive_dir)} wav")
+    print(f"  negatives: {wav_count(negative_dir)} wav")
     for name in ("positive", "negative", "prefix"):
-        path = FEATURE_DIR / f"{name}.npy"
+        path = FEATURE_DIR / f"{stem}{name}.npy"
         if path.exists():
             array = np.load(path, mmap_mode="r")
-            print(f"  {name}.npy: {array.shape}  {path.stat().st_size/2**20:.1f} MiB")
+            print(f"  {stem}{name}.npy: {array.shape}  {path.stat().st_size/2**20:.1f} MiB")
         else:
-            print(f"  {name}.npy: missing")
+            print(f"  {stem}{name}.npy: missing")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["synth", "features", "stats"])
+    parser.add_argument("--phrase", default="dafeiyu",
+                        help="which wake word to build (see wake_phrases.PROFILES); each one has "
+                             "its own clips and its own feature files")
+    parser.add_argument("--full", action="store_true",
+                        help="use the whole rate/pitch grid (1470 positives) instead of the compact "
+                             "one (210) that a new phrase gets by default; costs about three times "
+                             "the synthesis")
     parser.add_argument("--limit", type=int, default=0,
                         help="generate only a small slice, to prove the pipeline end to end")
     parser.add_argument("--only", default="",

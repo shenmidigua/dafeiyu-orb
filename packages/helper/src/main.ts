@@ -1,23 +1,25 @@
-/**
+﻿/**
  * Floating ball window. The official dsh process owns the session; this process only draws and forwards one socket.
  */
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, screen, shell } from 'electron'
 import { spawn } from 'node:child_process'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { createConnection, type Socket } from 'node:net'
+import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readAvatarChoice, type AvatarChoice } from './avatar.ts'
 import { collectChromeWindowIds, type NativeHandleWindow } from './chrome-windows.ts'
 import { FloatingPlacement, initialBallOrigin, initialWindowBounds } from './geometry.ts'
 import { createMemePicker, type MemePicker } from './memes.ts'
-import { contextMenuTemplate } from './menu.ts'
+import { contextMenuTemplate, type SpeechVoiceOption, type WakeEngineOption, type WakeKeywordOption } from './menu.ts'
 import { attachOverlays, denyWindowPermissions } from './overlays.ts'
 import { type MenuCatalog, type MenuSelection } from './model-menu.ts'
 import {
+  keywordFile,
   readWakeConfig,
   registerWakeScheme,
   serveWakeAssets,
@@ -26,7 +28,9 @@ import {
   type DictationConfig,
   type WakeConfig,
 } from './wake.ts'
+import { ENGINE_KEYWORDS, WAKE_ENGINES, type WakeEngineId } from './wake-engines.ts'
 import { spokenName } from './wake-names.ts'
+import { SherpaKws } from './wake-sherpa.ts'
 
 const socketAddress = process.env.DSH_ORB_SOCKET ?? ''
 const token = process.env.DSH_ORB_TOKEN ?? ''
@@ -35,7 +39,7 @@ const webPort = process.env.DSH_ORB_WEB_PORT ?? ''
  * The helper's own asset folder.
  *
  * `main.js` runs from `lib/`, so this resolves to the sibling `assets/` in the workspace and to
- * `dist/helper/assets/` in an installed package — the same base `loadFile` below uses. The spoken
+ * `dist/helper/assets/` in an installed package 鈥?the same base `loadFile` below uses. The spoken
  * wake clips live in `assets/voices` and are served from here, not from the host's model folder.
  */
 const assetsRoot = fileURLToPath(new URL('../assets', import.meta.url))
@@ -54,8 +58,8 @@ let wake: WakeConfig = readWakeConfig()
 registerWakeScheme()
 
 // The wake confirmation is a media element now, and Chromium refuses to start one with sound until
-// the page has seen a user gesture. A profile that resumes listening at launch has seen none — the
-// wake word itself is not a gesture — so the helper opts its own window out of that gate. Every
+// the page has seen a user gesture. A profile that resumes listening at launch has seen none 鈥?the
+// wake word itself is not a gesture 鈥?so the helper opts its own window out of that gate. Every
 // sound this process makes is one the user asked the ball to make, and the switch is process-wide,
 // which is the same page the reply reader plays in.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
@@ -78,7 +82,7 @@ interface ChromeState {
    * The recorder's tuning, when the message carried one.
    *
    * `undefined` means the host is older than this field or the message was malformed, and the launch
-   * value has to stand — as opposed to an empty object, which would reset the pause to something the
+   * value has to stand 鈥?as opposed to an empty object, which would reset the pause to something the
    * user never chose.
    */
   dictation?: DictationConfig
@@ -119,11 +123,72 @@ interface ReplySettings {
  * The defaults are off: a profile that has never opened the settings page has no TTS service
  * behind it, and a play button that always fails is worse than no button. The endpoint travels
  * with the switch so moving the service to another port needs no rebuild.
+ *
+ * `voice` rides along for the same reason: the service routes on it per request, so the menu can
+ * change the timbre without restarting anything.
  */
 interface SpeechSettings {
   enabled: boolean
   autoPlay: boolean
   endpoint: string
+  voice: string
+}
+
+/**
+ * The voices the menu offers, in the order it offers them.
+ *
+ * Two families, and the order is deliberate: the hosted pair first because that is what this
+ * machine has been reading with, then the Edge voices — one per useful timbre rather than all
+ * eight, since a menu is a choice, not an inventory. Every row was synthesised successfully
+ * through `/speak` before it was listed.
+ */
+const SPEECH_VOICES: readonly SpeechVoiceOption[] = [
+  { voice: 'stella', zh: 'stella（默认女声）', en: 'stella (default female)' },
+  { voice: 'tide', zh: 'tide（低沉男声）', en: 'tide (low male)' },
+  { voice: 'zh-CN-XiaoxiaoNeural', zh: '晓晓（温柔女声）', en: 'Xiaoxiao (warm female)' },
+  { voice: 'zh-CN-XiaoyiNeural', zh: '晓伊（活泼女声）', en: 'Xiaoyi (bright female)' },
+  { voice: 'zh-CN-YunxiNeural', zh: '云希（年轻男声）', en: 'Yunxi (young male)' },
+  { voice: 'zh-CN-YunjianNeural', zh: '云健（浑厚男声）', en: 'Yunjian (deep male)' },
+  { voice: 'zh-CN-YunyangNeural', zh: '云扬（播报男声）', en: 'Yunyang (anchor male)' },
+  { voice: 'zh-CN-liaoning-XiaobeiNeural', zh: '晓北（东北话）', en: 'Xiaobei (Northeastern)' },
+]
+
+/**
+ * Cloned voices, listed in a file rather than in the table above.
+ *
+ * A cloned voice is created on a console, never in this repository: its id, its name, and which of
+ * them exist all change without this package changing. So the profile keeps the list — one JSON
+ * object of `{ "speaker": "S_...", "zh": "...", "en": "..." }` rows at
+ * `~/.dsh/profiles/desktop/orb-voices.json` — and the menu is assembled from it on every open. Edit
+ * the file and reopen the menu; there is nothing to rebuild.
+ *
+ * Rows missing an `S_`-style id are dropped rather than offered: a menu entry that reads a voice
+ * named `undefined` is worse than the entry not being there.
+ */
+function clonedVoices(): readonly SpeechVoiceOption[] {
+  const path = join(homedir(), '.dsh', 'profiles', 'desktop', 'orb-voices.json')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    // No file is the ordinary case: an orb that has never cloned a voice has nothing here.
+    return []
+  }
+  const rows = (parsed as { voices?: unknown }).voices
+  if (!Array.isArray(rows)) return []
+  const voices: SpeechVoiceOption[] = []
+  for (const row of rows) {
+    if (typeof row !== 'object' || row === null) continue
+    const record = row as { speaker?: unknown, zh?: unknown, en?: unknown }
+    const speaker = typeof record.speaker === 'string' ? record.speaker.trim() : ''
+    if (!/^(S_|icl_|custom_speaker_id|[A-Za-z0-9_]+_bigtts)/.test(speaker)) continue
+    const zh = typeof record.zh === 'string' && record.zh.trim() !== '' ? record.zh.trim() : speaker
+    const en = typeof record.en === 'string' && record.en.trim() !== '' ? record.en.trim() : speaker
+    // The label is the name the voice was given, verbatim: a cloned voice is a person to whoever
+    // speaks with it — "德拉曼" — and a prefix in front of that name reads as a different voice.
+    voices.push({ voice: `volc-${speaker}`, zh, en })
+  }
+  return voices
 }
 
 const defaultSelection: MenuSelection = {
@@ -142,7 +207,7 @@ let chrome: ChromeState = {
   wakeEnabled: false,
   openMain: false,
   catalog: { groups: [] },
-  speech: { enabled: false, autoPlay: false, endpoint: 'http://127.0.0.1:8765' },
+  speech: { enabled: false, autoPlay: false, endpoint: 'http://127.0.0.1:8765', voice: 'stella' },
   chime: { enabled: true, quietFrom: 0, quietTo: 7 },
 }
 /**
@@ -160,7 +225,7 @@ let avatarToken = 0
 let appearance: Appearance = readAppearanceEnv()
 /**
  * The last balance the host reported, in CNY, or `null` when it could not be read. `undefined` means
- * the host has said nothing yet — the page treats both as "not known" and keeps its ordinary resting
+ * the host has said nothing yet 鈥?the page treats both as "not known" and keeps its ordinary resting
  * loop, which is the only safe reading of a number nobody has.
  */
 let balance: { cny: number | null; at?: number } | undefined
@@ -185,16 +250,18 @@ let placement: FloatingPlacement | undefined
 /**
  * Whether the window is currently capturing the mouse, which is the inverse of whether it is
  * click-through. Starts false to match the transparent-to-clicks window built at startup, and is
- * owned by the pointer poll — see {@link setHitTest}.
+ * owned by the pointer poll 鈥?see {@link setHitTest}.
  */
 let hitTestOver = false
 /**
  * The screen rectangles that capture the mouse: the ball, the open panel, the stop cap and the
  * docked tab, as last laid out by the page. Empty until the page reports, which means the window
- * is click-through until then — the safe direction, since a ball that cannot be clicked is a
+ * is click-through until then 鈥?the safe direction, since a ball that cannot be clicked is a
  * smaller problem than a window that eats every click on the desktop.
  */
-let hitTestRegions: Array<{ x: number; y: number; width: number; height: number }> = []
+let hitTestRegions: Array<{ x: number; y: number; width: number; height: number; round?: boolean }> = []
+/** The last reported geometry, so the trace is one line per change rather than one per press. */
+let lastHitTestShape = ''
 let hitTestTimer: ReturnType<typeof setInterval> | undefined
 let live: Socket | undefined
 let quitting = false
@@ -212,7 +279,15 @@ app.on('window-all-closed', () => {
 
 void app.whenReady().then(async () => {
   if (process.platform === 'darwin') app.dock?.hide()
-  wakeReady = wakeAvailable(wake)
+  wakeReady = wakeAvailable(wake, assetsRoot)
+  // One line per launch saying what the wake subsystem thinks it has. A phrase that is in the menu
+  // but never starts is otherwise indistinguishable from a microphone that never opened, and those
+  // two have completely different causes.
+  noteWakeTrace(
+    `wake: launch ready=${wakeReady} engine=${wake.engine} keyword=${wake.keyword} `
+    + `wanted=${wakeWanted} assets=${assetsRoot} `
+    + `keywordFile=${existsSync(kws.keywordFile(wake.keyword))}`,
+  )
   serveWakeAssets(wake, assetsRoot)
   win = openWindow()
   try {
@@ -248,14 +323,48 @@ void app.whenReady().then(async () => {
   connect(0)
 })
 
-// ── wake word ────────────────────────────────────────────────────────────────
+// 鈹€鈹€ wake word 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 //
-// The engine lives in the ball's page (`assets/wake.js`); this process only owns the
-// switch, the model route, and the status relay. Nothing here scores audio.
+// Two engines, one at a time, chosen by the menu and stored in `orb-wake.json`:
+//
+// - `openwake`: the page scores openWakeWord's classifier chain itself (`assets/wake.js`); nothing
+//   here touches audio.
+// - `sherpa`: the keyword spotter is a native addon, so it lives in this process and the page only
+//   forwards the frames its microphone already produces (`orb:wake-feed`). One IPC call per 80 ms
+//   frame 鈥?2.5 KB of float samples 鈥?and back comes one message per detection.
+
+/**
+ * The decoder engine, created once.
+ *
+ * The detection is pushed to the page rather than handled here: the confirmation clip, the chime, the
+ * ball's visible state and the recorder all belong to the page, which already owns them for the
+ * other engine. This process only answers "was the phrase said".
+ */
+const kws = new SherpaKws(assetsRoot, (keyword, detail) => {
+  // One line per detection, because this engine's decisions are invisible from outside: the page
+  // shows a chime, and nothing else says which phrase the decoder matched or when it started. The
+  // same line is what "did it fire on the real microphone" gets counted from.
+  noteWakeTrace(`wake: keyword spotter heard "${keyword}" at ${detail.startTime.toFixed(2)}s`)
+  if (win === undefined || win.isDestroyed()) return
+  win.webContents.send('orb:wake', {
+    type: 'keyword',
+    keyword,
+    score: detail.score,
+    startTime: detail.startTime,
+  })
+})
+
+/** Frames are 2560 bytes; anything far larger is not the ball's worklet but a mistake. */
+const MAX_WAKE_FRAME_BYTES = 64 * 1024
 
 ipcMain.handle('orb:wake-config', (event) => {
   if (!fromBall(event)) return wakePayload(false)
-  return wakePayload(wakeWanted && wakeReady)
+  const enabled = wakeWanted && wakeReady
+  // The page starts its microphone on the strength of this answer, so what it was told is worth a
+  // line: `ready=false` there means "no models", not "no microphone", and only one of those is fixed
+  // by changing the keyword back.
+  noteWakeTrace(`wake: config asked, answering enabled=${enabled} ready=${wakeReady}`)
+  return wakePayload(enabled)
 })
 
 ipcMain.handle('orb:wake-enable', async (event) => {
@@ -274,6 +383,52 @@ ipcMain.handle('orb:wake-enabled', async (event, enabled) => {
 })
 
 /**
+ * One microphone frame for the decoder engine, sent by the page.
+ *
+ * Sent fire-and-forget rather than invoked: the page produces a frame every 80 ms and must not wait
+ * on this process to score it, or a slow frame would back up the audio the recorder needs.
+ *
+ * The spotter starts on the first frame instead of in `enableWake()`. That keeps the "is it running"
+ * question in one place 鈥?the page has already opened the microphone and is already feeding 鈥?and it
+ * means a profile left on the decoder engine after its models went missing still shows a plain
+ * listening state, with the failure arriving as one console line and one status message.
+ * @param event - the IPC event, checked to come from the ball.
+ * @param samples - 16 kHz mono float samples, one worklet frame.
+ */
+ipcMain.on('orb:wake-feed', (event, samples) => {
+  if (!fromBall(event) || wake.engine !== 'sherpa' || !wakeWanted) return
+  const frame = samples instanceof Float32Array ? samples : undefined
+  if (frame === undefined || frame.byteLength > MAX_WAKE_FRAME_BYTES) return
+  if (!kws.running()) {
+    const detail = kws.start(wake.keyword)
+    if (detail !== '') {
+      noteWakeTrace(`wake: keyword spotter did not start: ${detail}`)
+      if (win !== undefined && !win.isDestroyed()) {
+        win.webContents.send('orb:wake', { type: 'engine-error', detail })
+      }
+      return
+    }
+    // Once per start, and the only positive evidence that the native addon loaded: `start()` returns
+    // a message on failure and silence on success, which is indistinguishable in a log from a
+    // spotter that was never asked to start.
+    noteWakeTrace(`wake: keyword spotter listening for "${wake.keyword}"`)
+  }
+  kws.feed(frame)
+})
+
+/**
+ * The page dropped its audio buffers, so drop the decoder's state with them.
+ *
+ * The page resets at every edge where audio must not be re-heard: the moment the ball speaks, and the
+ * end of an utterance. Leaving a matched prefix in the decoder across one of those made a phrase that
+ * had already been recognised fire again on audio that was only ever played back.
+ */
+ipcMain.on('orb:wake-reset', (event) => {
+  if (!fromBall(event) || wake.engine !== 'sherpa') return
+  kws.reset()
+})
+
+/**
  * Live engine state, for the ball's status line and for the host's own log.
  * @param event - the IPC event, checked to come from the ball.
  * @param status - `{ state, detail, keyword, threshold, frames, peak }` as reported.
@@ -282,16 +437,19 @@ ipcMain.handle('orb:wake-report', (event, status) => {
   if (!fromBall(event)) return false
   const record = status !== null && typeof status === 'object' ? status as Record<string, unknown> : {}
   const state = typeof record.state === 'string' ? record.state : ''
+  // The page's own verdict, mirrored into the trace: its failure detail only reached this process's
+  // stderr, which nothing writes down, so "the microphone never opened" had no cause in the log.
+  noteWakeTrace(`wake: page says state=${state === '' ? '?' : state} detail=${typeof record.detail === 'string' ? record.detail : ''}`)
   if (state === 'error' && typeof record.detail === 'string' && record.detail !== '') {
     console.error(`dsh-orb helper: wake word stopped: ${record.detail}`)
   }
   return true
 })
 
-// ── read-aloud service ───────────────────────────────────────────────────────
+// 鈹€鈹€ read-aloud service 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 //
 // The TTS model takes ~33 s to load and holds ~5 GB of VRAM, so the service has to be resident
-// rather than started per request — and starting it is not something the page can do, because the
+// rather than started per request 鈥?and starting it is not something the page can do, because the
 // page is a `file://` document whose CSP only lets it talk to the local port once something is
 // listening there. So the launch belongs to this process, and it happens on demand: the first
 // play that finds nothing answering starts the service and waits for it.
@@ -301,21 +459,38 @@ ipcMain.handle('orb:wake-report', (event, status) => {
 
 /**
  * How long a freshly launched service may take to answer before the wait is treated as a failure.
- * Comfortably past the measured ~33 s model load, because the first start also reads 5 GB cold.
+ *
+ * Sized for a local model load — the retired IndexTTS engine needed ~33 s warm and minutes on a
+ * cold, contended GPU (see the note on `speechLaunch`). The Edge proxy the default launcher points
+ * at answers in about a second, so nothing normal comes near this ceiling; it exists for the case
+ * where someone points `DSH_ORB_TTS_LAUNCH` at a heavyweight engine again.
  */
 const SPEECH_START_TIMEOUT_MS = 180_000
 /** Health probes are local and cheap; anything slower than this is not our service answering. */
 const SPEECH_PROBE_TIMEOUT_MS = 1_500
-/** Gap between health probes while the model loads. */
+/** Gap between health probes while the engine starts. */
 const SPEECH_PROBE_INTERVAL_MS = 2_000
 
+/**
+ * The launcher this process runs when nothing is listening on the speech endpoint.
+ *
+ * The path is historical: the local IndexTTS model used to live in `D:\tools\indextts` and this
+ * file was its entry point. The model was removed from disk on 2026-11-21 — 4.94 GB of VRAM for
+ * minutes per sentence on an 8 GB laptop GPU — and what is left there is a `.cmd` that only
+ * forwards to the Edge proxy in `D:\tools\edgetts`. The path was kept, not moved, so an existing
+ * profile's `DSH_ORB_TTS_LAUNCH`, the licence-free default below, and the habit of typing it all
+ * still resolve.
+ *
+ * Reasoning about a future local engine belongs here rather than in a code change: point the
+ * environment variable at the new launcher and nothing in this process needs to know.
+ */
 const speechLaunch = (process.env.DSH_ORB_TTS_LAUNCH
   ?? 'D:\\tools\\indextts\\start_server.cmd').trim()
 
 /**
  * The command interpreter to run the launcher with.
  *
- * Absolute, because a bare `cmd.exe` depends on PATH — and this process's PATH does not reliably
+ * Absolute, because a bare `cmd.exe` depends on PATH 鈥?and this process's PATH does not reliably
  * carry System32, so `spawn` failed with ENOENT. Node reports that through an `error` event rather
  * than by throwing, which is why the launch looked like it had begun and then simply never finished.
  */
@@ -389,23 +564,22 @@ async function launchSpeech(endpoint: string): Promise<SpeechEnsureResult> {
       resolve(value)
     }
     try {
-      // `cmd.exe` so the configured value can be a command line rather than a single executable —
-      // and deliberately **not** `detached`. Detaching was tried first and it is what put a black
+      // `cmd.exe` so the configured value can be a command line rather than a single executable 鈥?      // and deliberately **not** `detached`. Detaching was tried first and it is what put a black
       // console window on screen.
       //
       // A detached process is created without a console. `cmd.exe` is a console program, so it runs
-      // console-less and the `python.exe` inside it allocates a console of its own — and a console a
+      // console-less and the `python.exe` inside it allocates a console of its own 鈥?and a console a
       // process allocates for itself is not covered by the hide request that travelled with
       // `CreateProcess`. Measured here by starting the same `cmd.exe -> python.exe` pair once per
       // flag set (`dsh_orb/window_flags_probe.py`):
       //
-      //   DETACHED_PROCESS                  1 visible ConsoleWindowClass window   ← the black box
-      //   STARTF_USESHOWWINDOW + SW_HIDE    0 windows, 0 conhost processes        ← what we want
+      //   DETACHED_PROCESS                  1 visible ConsoleWindowClass window   鈫?the black box
+      //   STARTF_USESHOWWINDOW + SW_HIDE    0 windows, 0 conhost processes        鈫?what we want
       //   CREATE_NO_WINDOW                  0 windows, 1 conhost, none visible
       //   CREATE_NEW_CONSOLE + SW_HIDE      0 windows, 1 conhost, none visible
       //
       // `windowsHide: true` without `detached` is the second row: no extra launcher, no extra
-      // process, nothing to see. Dropping `detached` costs nothing either — Windows does not kill a
+      // process, nothing to see. Dropping `detached` costs nothing either 鈥?Windows does not kill a
       // child when its parent exits, and libuv never set CREATE_BREAKAWAY_FROM_JOB, so a detached
       // child was always going to be in the same job as this one anyway.
       const child = spawn(SHELL, ['/d', '/s', '/c', speechLaunch], {
@@ -484,22 +658,51 @@ ipcMain.handle('orb:dictate', (event, payload) => {
  * layout changes.
  *
  * The page is the only thing that knows where its elements ended up, and that is genuinely a
- * question for it — but it is asked for geometry, not for a verdict on the pointer. The verdict is
+ * question for it 鈥?but it is asked for geometry, not for a verdict on the pointer. The verdict is
  * made here, from the pointer's actual position, because a click-through window delivers no mouse
  * events to the renderer and so the page could never reach one. See {@link setHitTest}.
  */
 ipcMain.on('orb:hit-test', (event, regions) => {
   if (!fromBall(event)) return
   hitTestRegions = Array.isArray(regions)
-    ? regions.filter(isRect).map((region) => ({ x: region.x, y: region.y, width: region.width, height: region.height }))
+    ? regions.filter(isRect).map((region) => ({
+      x: region.x,
+      y: region.y,
+      width: region.width,
+      height: region.height,
+      ...(region.round === true ? { round: true } : {}),
+    }))
     : []
-  // The pointer may already be over the new regions — a panel opening under it, say — and the poll
+  // One line per change of geometry. A region that captures clicks over nothing has no other
+  // trace: the click simply dies, and "which rectangle, inside which window" is the whole
+  // diagnosis. Written only when the set changes, because the page reports on every press.
+  const shape = hitTestRegions
+    .map((region) => `${region.round === true ? 'o' : ''}${Math.round(region.width)}x${Math.round(region.height)}@${Math.round(region.x)},${Math.round(region.y)}`)
+    .join(' ')
+  if (shape !== lastHitTestShape) {
+    lastHitTestShape = shape
+    const bounds = win !== undefined && !win.isDestroyed() ? win.getContentBounds() : undefined
+    noteWakeTrace(`overlay: capture ${hitTestRegions.length} [${shape}] in ${bounds === undefined ? '?' : `${bounds.width}x${bounds.height}`}`)
+  }
+  // The pointer may already be over the new regions 鈥?a panel opening under it, say 鈥?and the poll
   // only runs every 30ms, so re-decide now rather than leaving a frame where a click would fall
   // through a panel that is already there.
-  if (win && !win.isDestroyed()) setHitTest(win, overCapturedRegion(screen.getCursorScreenPoint()))
+  if (win && !win.isDestroyed()) setHitTest(win, overCapturedRegion(win, screen.getCursorScreenPoint()))
 })
 
-function isRect(value: unknown): value is { x: number; y: number; width: number; height: number } {
+/**
+ * One line from the page into the helper's log.
+ *
+ * The page's console never reaches `stream.log`, and the failures worth reading from outside are
+ * the ones with no visual symptom at all: a drag whose release never arrived, which leaves the
+ * overlay capturing the whole window over empty desktop.
+ */
+ipcMain.on('orb:note', (event, line) => {
+  if (!fromBall(event) || typeof line !== 'string' || line === '') return
+  noteWakeTrace(line.slice(0, 400))
+})
+
+function isRect(value: unknown): value is { x: number; y: number; width: number; height: number; round?: boolean } {
   if (value === null || typeof value !== 'object') return false
   const rect = value as Record<string, unknown>
   return ['x', 'y', 'width', 'height'].every((key) => typeof rect[key] === 'number' && Number.isFinite(rect[key]))
@@ -507,7 +710,7 @@ function isRect(value: unknown): value is { x: number; y: number; width: number;
 
 /**
  * The corner the ball is in right now, for the page to wear before it draws anything.
- * Answers a question and changes nothing — see {@link FloatingPlacement.currentDirection}.
+ * Answers a question and changes nothing 鈥?see {@link FloatingPlacement.currentDirection}.
  */
 ipcMain.handle('orb:direction', (event) => {
   if (!fromBall(event) || !placement) return { expanded: false, horizontal: 'left', vertical: 'up', docked: undefined }
@@ -542,7 +745,7 @@ ipcMain.handle('orb:unsnap-smooth', async (event) => {
 })
 
 // The strip's hover. Kept apart from `orb:unsnap-smooth` on purpose: undocking is the user taking
-// the ball back, and a peek is the ball showing itself while the *dock stays put* — the same
+// the ball back, and a peek is the ball showing itself while the *dock stays put* 鈥?the same
 // `DockState` shape, a different promise about the strip that is still behind it.
 ipcMain.handle('orb:dock-peek', async (event) => {
   if (!fromBall(event) || !placement) return { docked: undefined }
@@ -596,7 +799,7 @@ ipcMain.on('orb:stop', (event) => {
   write({ type: 'stop' })
 })
 
-// ── main-window voice ────────────────────────────────────────────────────────
+// 鈹€鈹€ main-window voice 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 //
 // The wake path belongs to the black panel again, so the page does not call these. The hand-off
 // is kept whole: a page that does call it makes the host remember the request, the main DSH
@@ -700,7 +903,7 @@ ipcMain.handle('orb:meme-tool-named', (event, name) => {
  * Note that the page asked for one named tool's face, and what it was told.
  *
  * The page cannot log anywhere a human can read, and a lookup that quietly answers "nothing special" is
- * indistinguishable from a lookup that never happened — which is exactly the question this answers. Off unless
+ * indistinguishable from a lookup that never happened 鈥?which is exactly the question this answers. Off unless
  * `DSH_ORB_TOOL_LOG` names a file, because it is a write on the path of every tool call.
  */
 async function noteToolFaceRequest(name: unknown, answer: unknown): Promise<void> {
@@ -715,19 +918,31 @@ async function noteToolFaceRequest(name: unknown, answer: unknown): Promise<void
 }
 
 /**
+ * Record one wake line where a human can read it.
+ *
+ * The file is `stream.log`, beside the profile, because that is where the rest of the wake chain is
+ * written and where the page's own console lines land. This process's `console.log` does **not**
+ * reach it 鈥?the host logs the page and its own messages, not the helper's stdout 鈥?and every
+ * question about the decoder engine ("did the addon load", "did it hear me") is answered from there.
+ */
+function noteWakeTrace(line: string): void {
+  try {
+    appendFileSync(join(app.getPath('home'), '.dsh', 'dsh-orb', 'stream.log'), `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    // A readout that cannot be written must not change what the ball does.
+  }
+}
+
+/**
  * Record one wake hand-off where a human can read it.
  *
- * A wake that opens no microphone has four possible breaks — the ball never asked, the ask never
- * reached the host, the page never collected, or the page collected and failed — and from the
+ * A wake that opens no microphone has four possible breaks 鈥?the ball never asked, the ask never
+ * reached the host, the page never collected, or the page collected and failed 鈥?and from the
  * outside all four look like "nothing happened". This is the ball's end of that chain; the host's
  * end writes to the same file.
  */
 function noteWakeHandOff(line: string): void {
-  try {
-    appendFileSync(join(app.getPath('home'), '.dsh', 'dsh-orb', 'stream.log'), `${new Date().toISOString()} ${line}\n`)
-  } catch {
-    // As above: a readout that cannot be written must not change what the ball does.
-  }
+  noteWakeTrace(line)
 }
 
 ipcMain.handle('orb:meme-sleep', (event) => {
@@ -894,9 +1109,23 @@ function openWindow(): BrowserWindow {
   }
   created.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   created.webContents.on('context-menu', (event, params) => {
-    // Editable text and an active selection get the native menu (Copy/Paste);
-    // bare right-click still opens the ball's own menu.
-    if (params?.isEditable || params?.hasSelection) return
+    // Electron renders no context menu of its own, so a selection has to be given one explicitly.
+    // Before this, right-click over selected text was a no-op 鈥?the handler returned, nothing
+    // appeared 鈥?and the only way to get a sentence out of the ball's card was to retype it.
+    // `role: 'copy'` runs Chromium's own edit command against the focused selection, which is also
+    // the path Ctrl+C takes, so the two behave identically.
+    if (params?.hasSelection) {
+      const zh = menuZh()
+      Menu.buildFromTemplate([
+        { label: zh ? '复制' : 'Copy', role: 'copy' },
+        { label: zh ? '全选' : 'Select all', role: 'selectAll' },
+      ]).popup({ window: created })
+      return
+    }
+    // Editable text keeps the platform's own menu (cut, copy, paste); nothing in the bubble is
+    // editable now, so this is only ever the question card's text field.
+    if (params?.isEditable) return
+    // A bare right-click opens the ball's own menu.
     event.preventDefault()
     write({ type: 'menu' })
     setTimeout(() => { void showMenu(created) }, 30)
@@ -1025,6 +1254,19 @@ function deliver(message: unknown): void {
     win.webContents.send('orb:history', (record as { items?: unknown }).items)
     return
   }
+  if (record.type === 'voice-result') {
+    // How the turn the main window recorded ended: `sent` left a conversation to watch, and every
+    // other ending is a turn that heard nothing. The page folds back the panel it opened on the
+    // wake for the second kind (`foldWakePanel` in `assets/shell.js`) 鈥?a panel that stays open on
+    // an exchange that never happened reads as a ball that is still waiting.
+    win.webContents.send('orb:wake', {
+      type: 'voice-result',
+      outcome: typeof (record as { outcome?: unknown }).outcome === 'string'
+        ? (record as { outcome: string }).outcome
+        : '',
+    })
+    return
+  }
   if (record.type === 'reset') {
     win.webContents.send('orb:reset')
     return
@@ -1034,7 +1276,7 @@ function deliver(message: unknown): void {
     chrome = readChrome(record)
     // The ball's own menu is not the only place the switch lives any more: the main window's
     // composer has one too, and a flip there has to reach the engine now rather than at the next
-    // launch. `wakeWanted` is what the page was told, so only a real change acts — the host mirrors
+    // launch. `wakeWanted` is what the page was told, so only a real change acts 鈥?the host mirrors
     // this process's own `set-wake` back in every `chrome` message, and acting on that would send
     // the same enabled/disabled notice a second time.
     if (wantedWake === true && !wakeWanted) enableWake()
@@ -1078,7 +1320,7 @@ function deliver(message: unknown): void {
     wait?.((record as { status?: unknown }).status)
   }
   // A message this function does not know is a message the page never sees, and it fails *silently*: the host
-  // sends, the helper drops, and the ball does nothing — which is indistinguishable from a host that never sent
+  // sends, the helper drops, and the ball does nothing 鈥?which is indistinguishable from a host that never sent
   // anything. That is exactly how a face for the six turn endings came to do nothing for a whole round of testing.
   console.error(`dsh-orb helper: undelivered message type=${String(record.type)}`)
 }
@@ -1131,8 +1373,8 @@ function fromBall(event: unknown): boolean {
  *
  * The current value is kept here rather than read back with `isIgnoreMouseEvents`, which cannot be
  * trusted to mean what it looks like: it reports the *forwarding* state that was passed alongside
- * the flag, so a window set to `setIgnoreMouseEvents(true, { forward: true })` — the only mode
- * this window ever uses — reads back in a way that does not distinguish the two states. A plain
+ * the flag, so a window set to `setIgnoreMouseEvents(true, { forward: true })` 鈥?the only mode
+ * this window ever uses 鈥?reads back in a way that does not distinguish the two states. A plain
  * boolean is both unambiguous and assertable from a test.
  */
 /**
@@ -1142,17 +1384,24 @@ function fromBall(event: unknown): boolean {
  * This is decided here rather than by the page, which is the reversal of the obvious arrangement
  * and worth recording why. The page knows where its elements ended up, but it cannot be *asked*:
  * the window is click-through whenever the pointer is off them, and a click-through window on this
- * platform delivers no `mousemove` to the renderer at all — not even with `forward: true`, which
+ * platform delivers no `mousemove` to the renderer at all 鈥?not even with `forward: true`, which
  * was measured, not assumed (the page's own move counter stayed at zero while the pointer crossed
  * the ball). So a page that reports "the pointer is on me" can never find out, and the window
  * stays permanently transparent with a ball nothing can click.
  *
  * The main process has no such problem: `screen.getCursorScreenPoint` reads the pointer whatever the
- * window is doing. What it needs from the page is the *geometry* — where the ball and the panel
- * actually are — which the page can report once per layout, and which does not change while the
+ * window is doing. What it needs from the page is the *geometry* 鈥?where the ball and the panel
+ * actually are 鈥?which the page can report once per layout, and which does not change while the
  * pointer is moving.
  */
-const CAPTURE_MARGIN = 8
+/**
+ * A little slack around a reported rect, for the press that lands while the pointer is still moving
+ * in: the poll is 30 Hz, so the window may only learn the pointer has arrived one frame after it has.
+ *
+ * Small on purpose. Every pixel of it is invisible desktop that swallows a click, which is exactly
+ * the failure this is supposed to prevent, and the ball's own box is already generous.
+ */
+const CAPTURE_MARGIN = 3
 
 function setHitTest(target: BrowserWindow, over: boolean): void {
   if (target.isDestroyed()) return
@@ -1161,7 +1410,7 @@ function setHitTest(target: BrowserWindow, over: boolean): void {
   target.setIgnoreMouseEvents(!over, { forward: true })
   // Tell the page which side of the line the pointer crossed, with its position in the page's own
   // coordinates. The page listens for `pointerenter`/`pointerleave` to open and close the panel,
-  // and on a real hand those are enough — but the events describe movement, and a pointer that
+  // and on a real hand those are enough 鈥?but the events describe movement, and a pointer that
   // jumps (a fast flick, a touchpad tap, a scripted move) can cross the boundary and stop between
   // two of them. Then the last event the page saw was on the far side, and the panel would sit
   // open with the pointer gone, or stay shut with the pointer resting on the ball, until the user
@@ -1188,11 +1437,35 @@ function sendPointer(over: boolean): void {
   win.webContents.send('orb:pointer', { x: point.x - bounds.x, y: point.y - bounds.y })
 }
 
-/** Whether a point is inside any of the regions the page last reported. */
-function overCapturedRegion(point: { x: number; y: number }): boolean {
+/**
+ * Whether a screen point is inside any of the regions the page last reported.
+ *
+ * A region marked `round` is drawn as a circle, so it is tested as one: the corners of the bounding
+ * square are not on the shape, and treating them as captured is a dead spot the user cannot see
+ * anything in — the ball's own corners are about 60x60 each.
+ *
+ * The page reports its rects in its own coordinate space (see {@link syncHitTest} in
+ * `assets/shell.js`), so the window's position is subtracted here, on every call, from the bounds
+ * the window has *now*. A rect reported while the helper was moving or resizing the window is
+ * therefore still correct at the moment of the click, instead of having been frozen at a position
+ * where nothing is drawn.
+ */
+function overCapturedRegion(target: BrowserWindow, point: { x: number; y: number }): boolean {
+  if (target.isDestroyed()) return false
+  const bounds = target.getContentBounds()
+  const x = point.x - bounds.x
+  const y = point.y - bounds.y
   for (const region of hitTestRegions) {
-    if (point.x >= region.x - CAPTURE_MARGIN && point.x <= region.x + region.width + CAPTURE_MARGIN
-      && point.y >= region.y - CAPTURE_MARGIN && point.y <= region.y + region.height + CAPTURE_MARGIN) {
+    if (region.round === true) {
+      const radiusX = region.width / 2 + CAPTURE_MARGIN
+      const radiusY = region.height / 2 + CAPTURE_MARGIN
+      const dx = (x - (region.x + region.width / 2)) / radiusX
+      const dy = (y - (region.y + region.height / 2)) / radiusY
+      if (dx * dx + dy * dy <= 1) return true
+      continue
+    }
+    if (x >= region.x - CAPTURE_MARGIN && x <= region.x + region.width + CAPTURE_MARGIN
+      && y >= region.y - CAPTURE_MARGIN && y <= region.y + region.height + CAPTURE_MARGIN) {
       return true
     }
   }
@@ -1204,15 +1477,15 @@ function overCapturedRegion(point: { x: number; y: number }): boolean {
  *
  * A short poll rather than an event, because there is no event to listen to: the whole point of
  * click-through is that the window is not receiving mouse input. 30Hz is fast enough that the
- * window is capturing before a click can land — a click is a press and a release at the same place,
- * so it needs the state right at the moment of the press — and slow enough to be invisible next to
+ * window is capturing before a click can land 鈥?a click is a press and a release at the same place,
+ * so it needs the state right at the moment of the press 鈥?and slow enough to be invisible next to
  * the work this process already does.
  */
 function startHitTestPoll(): void {
   if (hitTestTimer !== undefined) return
   hitTestTimer = setInterval(() => {
     if (!win || win.isDestroyed() || !win.isVisible()) return
-    setHitTest(win, overCapturedRegion(screen.getCursorScreenPoint()))
+    setHitTest(win, overCapturedRegion(win, screen.getCursorScreenPoint()))
   }, 33)
 }
 
@@ -1221,7 +1494,11 @@ function wakePayload(enabled: boolean): Record<string, unknown> {
   return {
     enabled,
     ready: wakeReady,
-    hasAssets: wake.assetDirectory !== '',
+    // The page branches on this before loading anything: the two engines share the microphone, the
+    // recorder and the confirmation, and nothing else. `threshold` belongs to the classifier and is
+    // meaningless to the decoder, which reads its operating point from `wake-sherpa.ts`.
+    engine: wake.engine,
+    hasAssets: wake.assetDirectory !== '' || wake.engine === 'sherpa',
     keyword: wake.keyword,
     threshold: wake.threshold,
     autoExpandOnWake: wake.autoExpandOnWake,
@@ -1261,6 +1538,7 @@ function enableWake(): boolean {
   }
   wakeWanted = true
   chrome = { ...chrome, wakeEnabled: true }
+  noteWakeTrace(`wake: enabled by the user (ready=${wakeReady}, keyword=${wake.keyword})`)
   win.webContents.send('orb:wake', { type: 'enabled' })
   write({ type: 'set-wake', enabled: true })
   return true
@@ -1269,6 +1547,9 @@ function enableWake(): boolean {
 /** Turn it off: the page releases the microphone, the host remembers that too. */
 function disableWake(): boolean {
   wakeWanted = false
+  // The decoder holds a native stream and a spotter; dropping them here is what makes "off" mean no
+  // decoding at all, rather than a spotter that keeps chewing frames the page no longer sends.
+  kws.stop()
   chrome = { ...chrome, wakeEnabled: false }
   if (win && !win.isDestroyed()) win.webContents.send('orb:wake', { type: 'disabled' })
   write({ type: 'set-wake', enabled: false })
@@ -1378,7 +1659,7 @@ function pushAppearance(): void {
  * The balance message the host sends: `{ cny, at }`, with `cny: null` for "not known".
  *
  * Anything else is "not known" too, and that is the point: this decides which face the ball rests in,
- * and an unreadable message must not be able to invent a number — least of all a zero, which is the
+ * and an unreadable message must not be able to invent a number 鈥?least of all a zero, which is the
  * one value that turns the sad face on.
  */
 function readBalanceMessage(record: unknown): { cny: number | null; at?: number } {
@@ -1475,7 +1756,7 @@ function readReply(value: unknown, fallback: ReplySettings): ReplySettings {
  */
 function readSpeech(value: unknown, fallback: SpeechSettings): SpeechSettings {
   if (typeof value !== 'object' || value === null) return fallback
-  const record = value as { enabled?: unknown; autoPlay?: unknown; endpoint?: unknown }
+  const record = value as { enabled?: unknown; autoPlay?: unknown; endpoint?: unknown; voice?: unknown }
   const endpoint = typeof record.endpoint === 'string' && record.endpoint.trim() !== ''
     ? record.endpoint.trim()
     : fallback.endpoint
@@ -1483,13 +1764,16 @@ function readSpeech(value: unknown, fallback: SpeechSettings): SpeechSettings {
     enabled: typeof record.enabled === 'boolean' ? record.enabled : fallback.enabled,
     autoPlay: typeof record.autoPlay === 'boolean' ? record.autoPlay : fallback.autoPlay,
     endpoint,
+    // Empty is a real value here — it means "whatever the service was started with" — so only a
+    // missing or non-string field falls back.
+    voice: typeof record.voice === 'string' ? record.voice.trim() : fallback.voice,
   }
 }
 
 /**
  * Chime settings from the host, each field falling back independently.
  *
- * The quiet window is clamped to 0–24 here as well as on the host, because the row draws its
+ * The quiet window is clamped to 0鈥?4 here as well as on the host, because the row draws its
  * numbers straight from this record: an out-of-range value from a hand-edited file would be
  * printed in the menu before the page ever had a chance to correct it.
  */
@@ -1527,9 +1811,15 @@ async function showMenu(window: BrowserWindow): Promise<void> {
     // nothing to speak the time, and a checked row that does nothing is the failure this label
     // exists to avoid.
     speechEnabled: chrome.speech.enabled,
+    speechVoice: chrome.speech.voice,
+    speechVoices: [...SPEECH_VOICES, ...clonedVoices()],
     wakeEnabled: wakeWanted && wakeReady,
     wakeAvailable: wakeReady,
     wakeWord: spokenName(wake.keyword),
+    wakeKeyword: wake.keyword,
+    wakeKeywords: wakeKeywordOptions(),
+    wakeEngine: wake.engine,
+    wakeEngines: wakeEngineOptions(),
     // The recorder runs on the wake engine's microphone, so the row needs a live engine.
     dictationReady: wakeWanted && wakeReady && wake.dictation.enabled,
     openMain: chrome.openMain,
@@ -1540,13 +1830,51 @@ async function showMenu(window: BrowserWindow): Promise<void> {
     setMillifraction: (enabled) => { void confirmMillifraction(window, enabled) },
     setReply: (enabled) => { write({ type: 'set-reply', enabled }) },
     setChime: (enabled) => { write({ type: 'set-chime', enabled }) },
+    setSpeechVoice: (voice) => { write({ type: 'set-speech-voice', voice }) },
     setWake: (enabled) => { if (enabled) enableWake(); else disableWake() },
+    setWakeWord: (keyword) => { write({ type: 'set-wake-word', keyword }) },
+    setWakeEngine: (engine) => { write({ type: 'set-wake-engine', engine }) },
     dictate: () => {
       if (win && !win.isDestroyed()) win.webContents.send('orb:dictate')
     },
     disable: () => { write({ type: 'disable' }) },
   })
   Menu.buildFromTemplate(template).popup({ window })
+}
+
+/**
+ * The wake words the menu may offer, each marked with whether its model is on disk.
+ *
+ * Checked here rather than in the host: the asset directory is the helper's, and the page can only
+ * load a file the helper is already serving. Read on every menu open so a freshly deployed model
+ * appears without a relaunch, and a missing one is visibly disabled instead of failing on click.
+ *
+ * The list itself depends on the engine: the decoder has no per-word model to look for (its phrase is
+ * a token line in `assets/kws`), and it has no English phrase at all, so it offers a shorter list.
+ */
+function wakeKeywordOptions(): WakeKeywordOption[] {
+  return ENGINE_KEYWORDS[wake.engine].map((keyword) => ({
+    keyword,
+    spoken: spokenName(keyword),
+    available: keywordAvailable(wake.engine, keyword),
+  }))
+}
+
+/** Whether one phrase has what its engine needs, for the engine currently configured. */
+function keywordAvailable(engine: WakeEngineId, keyword: string): boolean {
+  if (engine === 'sherpa') return existsSync(join(assetsRoot, 'kws', `keywords-${keyword}.txt`))
+  const directory = wake.assetDirectory
+  return directory !== '' && existsSync(join(directory, keywordFile(keyword)))
+}
+
+/** Every engine this build can offer, in menu order, with availability computed per engine. */
+function wakeEngineOptions(): WakeEngineOption[] {
+  return WAKE_ENGINES.map((engine) => ({
+    engine,
+    available: wakeAvailable({ ...wake, engine, keyword: ENGINE_KEYWORDS[engine].includes(wake.keyword)
+      ? wake.keyword
+      : ENGINE_KEYWORDS[engine][0] ?? wake.keyword }, assetsRoot),
+  }))
 }
 
 async function confirmMillifraction(window: BrowserWindow, enabled: boolean): Promise<void> {
@@ -1570,11 +1898,6 @@ async function confirmMillifraction(window: BrowserWindow, enabled: boolean): Pr
 async function loadAvatar(choice: AvatarChoice): Promise<void> {
   const tokenId = ++avatarToken
   if (!win) return
-  if (choice.kind === 'preset') {
-    // A shipped GIF: the page loads the file itself, no socket payload involved.
-    win.webContents.send('orb:avatar', choice.src)
-    return
-  }
   if (choice.kind === 'default') {
     win.webContents.send('orb:avatar', '')
     return

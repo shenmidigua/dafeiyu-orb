@@ -10,6 +10,7 @@ import { installOrbServices, watchOrbPermissions } from './services.ts'
 import { watchAppearance } from './appearance.ts'
 import { OrbRuntime, type OrbContext } from './orb.ts'
 import { registerReplyStyle } from './reply-style.ts'
+import { registerPersona } from './persona.ts'
 
 /** Cordis plugin name. */
 export const name = 'orb-host'
@@ -47,6 +48,10 @@ export function apply(ctx: OrbContext, config: { autoStart?: boolean } = {}): vo
     // The terse-reply contract is a prompt section rather than a preset persona: it belongs to
     // the ball's sessions only, and a section provider is told which agent it is assembling for.
     const detachReplyStyle = registerReplyStyle(ctx, store)
+    // The ball answers in the character of the voice it is reading with, so a cloned voice is not
+    // wearing the plugin's neutral tone. Same section mechanism, ordered just before the reply
+    // contract: who is answering first, the shape of the answer last.
+    const detachPersona = registerPersona(ctx, store)
     // Theme and locale follow the official settings document; a missing
     // settings service leaves the ball on its system defaults.
     const detachAppearance = watchAppearance(ctx, (appearance) => { runtime.setAppearance(appearance) })
@@ -61,6 +66,7 @@ export function apply(ctx: OrbContext, config: { autoStart?: boolean } = {}): vo
       detachPermissions()
       detachRoutes()
       detachReplyStyle()
+      detachPersona()
       detachAppearance()
       runtime.halt()
     }

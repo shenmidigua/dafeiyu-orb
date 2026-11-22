@@ -5,7 +5,7 @@
 
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { isAvatarPresetId } from './avatar-presets.ts'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 const PERMISSION_FILE = 'orb-permission.json'
 const MODELS_FILE = 'orb-agent-models.json'
@@ -15,6 +15,7 @@ const BALL_FILE = 'ball-enabled.json'
 const WAKE_FILE = 'orb-wake.json'
 const SPEECH_FILE = 'orb-speech.json'
 const REPLY_FILE = 'orb-reply.json'
+const PERSONA_FILE = 'orb-persona.json'
 const CHIME_FILE = 'orb-chime.json'
 const AVATAR_FILE = 'orb-avatar'
 const AVATAR_META_FILE = 'orb-avatar.json'
@@ -45,6 +46,14 @@ export type AvatarMime = 'image/gif' | 'image/png' | 'image/webp'
 export interface WakeSettings {
   /** Detection is off until the ball's menu turns it on. */
   readonly enabled: boolean
+  /**
+   * Which engine listens, chosen from the ball's menu.
+   *
+   * `openwake` is openWakeWord's per-word classifier chain; `sherpa` is a sherpa-onnx keyword spotter
+   * that reads a phrase out of a keyword file instead of a trained model. The two are separate
+   * engines on the same microphone, and this field is what decides which one the helper starts.
+   */
+  readonly engine: WakeEngine
   /** openWakeWord keyword name. Only `hey_jarvis` ships a model. */
   readonly keyword: string
   /** Classifier score above which a frame counts, clamped to 0.05–0.99. */
@@ -127,11 +136,24 @@ export const DEFAULT_SILENCE_MS = 2_500
  */
 export const DICTATION_NO_SPEECH_MS = 6_000
 
+/**
+ * The two wake engines, named once.
+ *
+ * A string union rather than an imported helper type: this file is read by the settings page and by
+ * `orb.ts`, and the ids are what `orb-wake.json` carries. `packages/helper/src/wake-engines.ts` holds
+ * the same two ids for the process that runs them.
+ */
+export type WakeEngine = 'openwake' | 'sherpa'
+
 /** What a missing or unreadable `orb-wake.json` means. */
 export const WAKE_DEFAULTS: WakeSettings = {
   enabled: false,
-  keyword: 'hey_jarvis',
-  threshold: 0.5,
+  // The decoder engine is the only one offered any more (see `WAKE_ENGINES` in
+  // `packages/helper/src/wake-engines.ts`), so a profile with no file has to start on it and on a
+  // phrase it can actually listen for: `hey_jarvis` came with the retired classifier.
+  engine: 'sherpa',
+  keyword: 'xiaodi',
+  threshold: 0.55,
   assetDirectory: '',
   autoExpandOnWake: true,
   dictation: {
@@ -147,11 +169,10 @@ export const WAKE_DEFAULTS: WakeSettings = {
   },
 }
 
-/** What the ball shows: the shipped GIF, an uploaded image, or a built-in preset. */
+/** What the ball shows: the shipped GIF, or an uploaded image. */
 export type AvatarSelection =
   | { kind: 'default' }
   | { kind: 'custom'; mime: AvatarMime }
-  | { kind: 'preset'; id: string }
 
 /**
  * Read-aloud settings, owned by the settings page.
@@ -170,6 +191,13 @@ export interface SpeechSettings {
   readonly autoPlay: boolean
   /** Base URL of the local TTS service. */
   readonly endpoint: string
+  /**
+   * Which of the service's voices to read with, or `''` for whatever it was started with.
+   *
+   * Travels with the switches because the service routes on it per request: the ball's menu picks
+   * one, the next sentence is already in it, and nothing restarts.
+   */
+  readonly voice: string
 }
 
 /** What a missing or unreadable `orb-speech.json` means. Off, with the service's own default port. */
@@ -177,6 +205,17 @@ export const SPEECH_DEFAULTS: SpeechSettings = {
   enabled: false,
   autoPlay: false,
   endpoint: 'http://127.0.0.1:8765',
+  voice: '',
+}
+
+/**
+ * A voice id: the service's own name for a timbre.
+ *
+ * ASCII and short, and `''` is allowed because it means "the service default" rather than "no
+ * voice" — the field travels in a request body, so anything longer or stranger is a mistake.
+ */
+export function isSpeechVoice(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 64 && /^[A-Za-z0-9._-]*$/.test(value)
 }
 
 /** Only http(s) URLs, so a typo cannot turn the endpoint into a `file:` read. */
@@ -221,6 +260,17 @@ export const MIN_REPLY_CHARS = 20
 
 /** Above two thousand the contract stops being minimal and the prompt line just reads odd. */
 export const MAX_REPLY_CHARS = 2_000
+
+/**
+ * The prefix the speech service's cloned voices carry in `orb-speech.json`.
+ *
+ * Kept here so the persona lookup can try the id with and without it: the file is hand-edited, and
+ * a user pasting the speaker id from the console writes `S_…` while the ball stores `volc-S_…`.
+ */
+const CLONED_VOICE_PREFIX = 'volc-'
+
+/** A persona longer than this is a document, not a character: refuse it rather than eat the prompt. */
+export const MAX_PERSONA_CHARS = 4_000
 
 /**
  * The hourly chime, stored in `orb-chime.json`.
@@ -409,6 +459,52 @@ export class ProfileStore {
   }
 
   /**
+   * Point the wake engine at another phrase, from the ball's menu.
+   *
+   * Same re-read-then-write shape as {@link setWakeEnabled}, and for the same reason: everything
+   * except the keyword comes from the file as it stands, so a menu click cannot revert the silence
+   * slider the settings page just moved. The keyword is not validated here — `readWakeKeyword`
+   * already normalises it on the way back in, so a value outside the file-stem alphabet lands as a
+   * changed file only until the next read, never as a name the host then tries to spawn with.
+   * @param keyword - the model's file stem, i.e. `<keyword>.onnx` without the extension.
+   */
+  setWakeKeyword(keyword: string): void {
+    this.wakeValue = { ...readWake(this.dir), keyword }
+    writeWake(this.dir, this.wakeValue)
+  }
+
+  /**
+   * Point the wake engine at another engine, from the ball's menu.
+   *
+   * Same re-read-then-write shape as {@link setWakeKeyword}: a menu click must not rewrite a field it
+   * was not asked about. The phrase is not touched here — the caller decides whether the engine change
+   * also costs a phrase change, because only it knows which phrases that engine can actually run.
+   * @param engine - `openwake` or `sherpa`.
+   */
+  setWakeEngine(engine: WakeEngine): void {
+    // The classifier is retired: a request for it is a request this profile cannot honour, so it
+    // leaves the file alone rather than writing an id the next read has to undo. The menu cannot
+    // offer it any more (`WAKE_ENGINES` has one entry), so this is only reachable by hand.
+    if (engine !== 'sherpa') return
+    this.wakeValue = { ...readWake(this.dir), engine }
+    writeWake(this.dir, this.wakeValue)
+  }
+
+  /**
+   * Store the operating point that belongs to the keyword being selected.
+   *
+   * Called together with {@link setWakeKeyword} and with the number the model was measured at,
+   * which is why it is a separate call rather than another field on the same one: the keyword comes
+   * from the menu, the threshold from a file beside the model, and one method taking both would
+   * suggest the caller had to know both before it could name either.
+   * @param threshold - the clip score the model must exceed, in `0..1`.
+   */
+  setWakeThreshold(threshold: number): void {
+    this.wakeValue = { ...readWake(this.dir), threshold }
+    writeWake(this.dir, this.wakeValue)
+  }
+
+  /**
    * Move the "you finished speaking" pause, from the settings page's slider.
    *
    * Same shape as {@link setWakeEnabled}, and for the same reason: the file is re-read before the
@@ -445,6 +541,7 @@ export class ProfileStore {
       enabled: settings.enabled,
       autoPlay: settings.autoPlay,
       endpoint: settings.endpoint,
+      voice: settings.voice,
     })
   }
 
@@ -480,6 +577,19 @@ export class ProfileStore {
       enabled: merged.enabled,
       maxReplyChars: merged.maxReplyChars,
     })
+  }
+
+  /**
+   * The persona written for one voice, or `''` when the profile has none.
+   *
+   * Re-read per prompt assembly for the same reason as {@link reply}: the ball's menu changes the
+   * voice while this process runs, and the answer has to change with it on the next turn. Both the
+   * stored id (`volc-S_…`) and the console's own form (`S_…`) are looked up, because which one is in
+   * the file depends on whether it was written by the menu or by hand.
+   * @param voice - the read-aloud voice id from `orb-speech.json`.
+   */
+  personaFor(voice: string): string {
+    return readPersona(this.dir, voice)
   }
 
   /**
@@ -527,11 +637,15 @@ export class ProfileStore {
 
   /**
    * Avatar the profile currently shows, checked against what is on disk.
-   * An unknown preset id or a half-written upload falls back to the shipped GIF.
+   * A half-written upload falls back to the shipped GIF.
+   *
+   * The built-in animation gallery is gone (2026-11-20): the six shipped GIFs were an early
+   * addition nobody asked to keep, so the picker, its routes, its assets and this branch went with
+   * it. Profiles saved back then still carry `{kind: 'preset', preset: ...}` in `orb-avatar.json`,
+   * and that record is simply ignored here — the file's custom image wins, or the shipped GIF if
+   * there is none, without a migration step that could fail on someone's machine.
    */
   avatarSelection(): AvatarSelection {
-    const preset = record(readJson(join(this.dir, AVATAR_META_FILE)))?.preset
-    if (isAvatarPresetId(preset)) return { kind: 'preset', id: preset }
     const custom = this.readAvatar()
     if (custom !== undefined) return { kind: 'custom', mime: custom.mime }
     return { kind: 'default' }
@@ -551,15 +665,10 @@ export class ProfileStore {
     return { bytes, mime: declared ?? sniffed }
   }
 
-  /** One avatar per profile: an uploaded image drops the preset pick and the other way round. */
+  /** One avatar per profile: the upload replaces whatever was there. */
   writeAvatar(bytes: Uint8Array, mime: AvatarMime): void {
     writeBytes(join(this.dir, AVATAR_FILE), bytes)
     writeJson(join(this.dir, AVATAR_META_FILE), { kind: 'custom', mime })
-  }
-
-  selectAvatarPreset(id: string): void {
-    writeJson(join(this.dir, AVATAR_META_FILE), { kind: 'preset', preset: id })
-    removeIfPresent(join(this.dir, AVATAR_FILE))
   }
 
   restoreAvatar(): void {
@@ -650,6 +759,7 @@ function readWake(dir: string): WakeSettings {
   const value = record(readJson(join(dir, WAKE_FILE)))
   return {
     enabled: value?.enabled === true,
+    engine: readWakeEngine(value?.engine),
     keyword: readWakeKeyword(value?.keyword),
     threshold: readWakeThreshold(value?.threshold),
     assetDirectory: typeof value?.assetDirectory === 'string' && value.assetDirectory.length <= 1000
@@ -704,6 +814,21 @@ function readWakeThreshold(value: unknown): number {
   return Math.min(0.99, Math.max(0.05, value))
 }
 
+/**
+ * Which engine listens.
+ *
+ * The classifier is retired, so anything that is not the decoder means the decoder: a profile still
+ * carrying `"openwake"` is a profile whose models are no longer offered, and starting it would leave
+ * the ball listening with an engine the menu can no longer reach.
+ */
+function readWakeEngine(value: unknown): WakeEngine {
+  // Written as a constant, not as a comparison that still lets `openwake` through: the classifier
+  // has nothing to listen for that the decoder does not, and restoring it means changing both this
+  // line and `WAKE_ENGINES`, which is the one place that decides what the menu offers.
+  void value
+  return 'sherpa'
+}
+
 /** Speech settings, each field falling back to the default on its own. */
 function readSpeech(dir: string): SpeechSettings {
   const value = record(readJson(join(dir, SPEECH_FILE)))
@@ -713,6 +838,9 @@ function readSpeech(dir: string): SpeechSettings {
     enabled: value?.enabled === true,
     autoPlay: value?.autoPlay === true,
     endpoint: isSpeechEndpoint(value?.endpoint) ? value.endpoint : SPEECH_DEFAULTS.endpoint,
+    // A file written before this field existed has no voice at all, and the service's own default
+    // is what those profiles were already hearing — so missing and empty mean the same thing.
+    voice: isSpeechVoice(value?.voice) ? value.voice : SPEECH_DEFAULTS.voice,
   }
 }
 
@@ -728,6 +856,24 @@ function readReply(dir: string): ReplyStyleSettings {
     enabled: typeof value?.enabled === 'boolean' ? value.enabled : REPLY_DEFAULTS.enabled,
     maxReplyChars: readBounded(value?.maxReplyChars, REPLY_DEFAULTS.maxReplyChars, MIN_REPLY_CHARS, MAX_REPLY_CHARS),
   }
+}
+
+/**
+ * The persona for one voice, from `orb-persona.json`.
+ *
+ * The file maps voice ids to text under `voices`, so one profile can hold several characters and
+ * switching a voice switches the character with it. An unreadable, oversized, or unknown entry is
+ * "no persona" rather than an error the prompt assembly has to survive.
+ */
+function readPersona(dir: string, voice: string): string {
+  if (voice === '') return ''
+  const voices = record(record(readJson(join(dir, PERSONA_FILE)))?.voices)
+  if (voices === undefined) return ''
+  const bare = voice.startsWith(CLONED_VOICE_PREFIX) ? voice.slice(CLONED_VOICE_PREFIX.length) : voice
+  const entry = voices[voice] ?? voices[bare]
+  if (typeof entry !== 'string') return ''
+  const text = entry.trim()
+  return text.length > 0 && text.length <= MAX_PERSONA_CHARS ? text : ''
 }
 
 /**
@@ -749,6 +895,7 @@ function readChime(dir: string): ChimeSettings {
 function writeWake(dir: string, settings: WakeSettings): void {
   writeJson(join(dir, WAKE_FILE), {
     enabled: settings.enabled,
+    engine: settings.engine,
     keyword: settings.keyword,
     threshold: settings.threshold,
     assetDirectory: settings.assetDirectory,

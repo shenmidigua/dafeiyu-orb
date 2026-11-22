@@ -172,7 +172,7 @@ const speech = readFileSync(fileURLToPath(new URL('../assets/speech.js', import.
 
 describe('the page wiring for the continuous loop', () => {
   it('turns the speaker completion edge into one scheduled microphone opening', () => {
-    assert.match(shell, /import \{ ContinuousVoice \} from '\.\/voice-turn\.js'/)
+    assert.match(shell, /import \{[^}]*ContinuousVoice[^}]*\} from '\.\/voice-turn\.js'/)
     assert.match(shell, /if \(state\.finished !== speechFinished\) \{/)
     assert.match(shell, /const next = continuousVoice\.spoken\(\{/)
     assert.match(shell, /if \(next === 'opening'\) scheduleVoiceTurn\(\)/)
@@ -214,5 +214,18 @@ describe('the page wiring for the continuous loop', () => {
     const settle = speech.slice(speech.indexOf('  settle(generation, completed = false) {'))
     assert.ok(settle !== '', 'the settle signature is what the slice below hinges on')
     assert.match(settle.slice(0, settle.indexOf('\n  }')), /if \(completed\) this\.finished \+= 1/)
+  })
+
+  // The pinned conversation makes the exchange single-shot. The ball arms the loop at the wake
+  // word, before anything knows where the words will go; by the time the reply is being read, it
+  // knows, and the loop has to drop out — otherwise the microphone opens on the reading and the
+  // agent's own voice arrives as the next user turn.
+  it('ends the exchange when the turn went to another conversation', () => {
+    const handler = shell.slice(shell.indexOf("else if (type === 'voice-result')"))
+    assert.match(handler.slice(0, 1200), /if \(payload\.routed === true\) continuousVoice\.cancel\(\)/)
+    assert.ok(
+      handler.indexOf("payload.routed === true") < handler.indexOf('foldWakePanel('),
+      'the loop is called off before the panel rules run, so a routed turn folds like any other',
+    )
   })
 })

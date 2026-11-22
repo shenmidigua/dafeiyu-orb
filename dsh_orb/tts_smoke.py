@@ -6,7 +6,7 @@ import urllib.request
 
 URL = "http://127.0.0.1:8765/speak"
 TEXT = sys.argv[1] if len(sys.argv) > 1 else "这是一条测试音频，你简单回复我。"
-OUT = sys.argv[2] if len(sys.argv) > 2 else r"D:\tools\indextts\out\orb_check.wav"
+OUT = sys.argv[2] if len(sys.argv) > 2 else r"D:\tools\edgetts\out\orb_check.wav"
 
 body = json.dumps({"text": TEXT}).encode("utf-8")
 req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})

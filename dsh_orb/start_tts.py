@@ -1,5 +1,12 @@
 """Start the IndexTTS HTTP service detached, and wait until it answers /health.
 
+RETIRED 2026-11-21: the local IndexTTS model was deleted from this machine (weights, checkpoints,
+voice sample, `tts_server.py`). Nothing here can run any more, and it is kept only as the record of
+how the old engine was started — `HERE` and `CMD` below point at files that no longer exist.
+
+The engine the orb actually starts now is `D:\tools\edgetts\start_server.cmd`, its own launcher,
+which the helper spawns on the first sentence. Use that, or `restart_voice_service.py`.
+
 The sandbox reaps processes that stay inside the tool call's job object, so the server is
 launched with DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB and its output goes to a log file
 (the model needs ~23s to load; the log is the only way to tell loading from a hang).

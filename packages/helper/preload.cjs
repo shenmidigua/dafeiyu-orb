@@ -139,11 +139,36 @@ contextBridge.exposeInMainWorld('dshOrb', {
   wakeReport(status) {
     return ipcRenderer.invoke('orb:wake-report', status)
   },
+  /**
+   * One line for the helper's own log, from the page.
+   *
+   * Page-side `console` does not reach `stream.log`, and the one thing that has to be visible from
+   * outside is a click that went nowhere: a gesture whose release never arrived leaves the overlay
+   * capturing the whole window, and the user sees a rectangle that eats clicks with nothing drawn
+   * in it. This line is how that recovery proves it happened instead of being a mystery.
+   */
+  note(line) {
+    if (typeof line === 'string' && line !== '') ipcRenderer.send('orb:note', line)
+  },
   setWakeEnabled(enabled) {
     return ipcRenderer.invoke('orb:wake-enabled', Boolean(enabled))
   },
   onWake(callback) {
     ipcRenderer.on('orb:wake', (_event, payload) => callback(payload))
+  },
+  /**
+   * Hand one microphone frame to the decoder engine, when that is the engine in use.
+   *
+   * `send`, not `invoke`: a frame arrives every 80 ms and the page must not wait for the scoring
+   * process to answer before it takes the next one. The array is copied by the IPC layer, so the
+   * worklet's own buffer can be reused immediately.
+   */
+  wakeFeed(samples) {
+    ipcRenderer.send('orb:wake-feed', samples)
+  },
+  /** Drop the decoder's state; called wherever the page drops its own audio buffers. */
+  wakeReset() {
+    ipcRenderer.send('orb:wake-reset')
   },
   dictate(payload) {
     return ipcRenderer.invoke('orb:dictate', payload)

@@ -3,28 +3,6 @@ import assert from 'node:assert/strict'
 import { readAvatarChoice } from '../src/avatar.ts'
 
 describe('avatar messages', () => {
-  it('reads a preset as the relative source the ball page can load', () => {
-    assert.deepEqual(readAvatarChoice({ kind: 'preset', src: 'avatars/heart.gif', version: 7 }), {
-      kind: 'preset',
-      src: 'avatars/heart.gif',
-    })
-  })
-
-  it('refuses preset sources that leave the page folder or name another scheme', () => {
-    for (const src of [
-      '../../etc/passwd',
-      'avatars/../../orb-avatar',
-      '/etc/passwd',
-      'file:///etc/passwd',
-      'avatars/heart.png',
-      'avatars/heart.gif?x=1',
-      'Avatars/Heart.gif',
-      '',
-    ]) {
-      assert.deepEqual(readAvatarChoice({ kind: 'preset', src }), { kind: 'default' }, src)
-    }
-  })
-
   it('takes the custom avatar from the route and needs a version to refetch on', () => {
     assert.deepEqual(readAvatarChoice({ kind: 'custom', version: 1759250000000 }), {
       kind: 'custom',
@@ -38,5 +16,15 @@ describe('avatar messages', () => {
     assert.deepEqual(readAvatarChoice({ version: 12 }), { kind: 'default' })
     assert.deepEqual(readAvatarChoice({ kind: 'default', version: 12 }), { kind: 'default' })
     assert.deepEqual(readAvatarChoice({}), { kind: 'default' })
+  })
+
+  it('ignores the deleted preset kind, including a path that looks valid', () => {
+    // `kind: 'preset'` used to name a shipped GIF by relative path. The gallery is gone, so the
+    // helper must not turn one into a source the page would then try to load: the files are not in
+    // the bundle any more and the host's route that served them is deleted too.
+    assert.deepEqual(readAvatarChoice({ kind: 'preset', src: 'avatars/heart.gif', version: 7 }), {
+      kind: 'default',
+    })
+    assert.deepEqual(readAvatarChoice({ kind: 'preset', src: '../../etc/passwd' }), { kind: 'default' })
   })
 })

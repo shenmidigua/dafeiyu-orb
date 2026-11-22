@@ -20,7 +20,7 @@ produce such a run", and folding the cooldown in would mix in how many alarms a 
 
 Run with the interpreter the rest of the wake-word pipeline uses (see `wake_pipeline.py`):
 
-    D:\\tools\\indextts\\py311\\python.exe wake_margin_probe.py [--limit 40]
+    D:\\tools\\py311\\python.exe wake_margin_probe.py [--limit 40]
 """
 
 from __future__ import annotations

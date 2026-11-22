@@ -186,6 +186,7 @@ describe('settings routes', () => {
       enabled: true,
       autoPlay: false,
       endpoint: 'http://127.0.0.1:8765',
+      voice: '',
     })
 
     const speechEndpoint = response()
@@ -199,6 +200,7 @@ describe('settings routes', () => {
       enabled: true,
       autoPlay: true,
       endpoint: 'http://127.0.0.1:9000',
+      voice: '',
     })
 
     // A bad endpoint rejects the whole request rather than half-applying it.
@@ -269,50 +271,126 @@ describe('settings routes', () => {
     assert.equal(JSON.parse(restored.body.toString('utf8')).avatarUrl, '/.dsh-orb/avatar?v=0')
     assert.equal(calls.includes('chrome'), true)
 
-    // Built-in avatars: the page lists them, reads their bytes, and picks one.
+    // The built-in animation gallery is gone: no preset list in the snapshot, and both of its
+    // routes are 404s rather than something a stale page could still drive.
     const gallery = JSON.parse(settings.body.toString('utf8')) as {
-      avatarPresetId: string | null
-      avatarPresets: { id: string; url: string }[]
+      avatarPresetId?: string | null
+      avatarPresets?: { id: string; url: string }[]
     }
-    assert.equal(gallery.avatarPresetId, null)
-    assert.equal(gallery.avatarPresets.length > 0, true)
-    const [first] = gallery.avatarPresets
-    assert.equal(first.url, `/.dsh-orb/avatar/preset/${first.id}`)
+    assert.equal(gallery.avatarPresetId, undefined)
+    assert.equal(gallery.avatarPresets, undefined)
 
-    const presetBytes = response()
-    await handler(request('GET', first.url, undefined, { 'x-dsh-user': 'ok' }), presetBytes)
-    assert.equal(presetBytes.status, 200)
-    assert.equal(presetBytes.body.subarray(0, 6).toString('ascii'), 'GIF89a')
-    assert.equal(presetBytes.body.length > 100_000, true)
+    const presetRoute = response()
+    await handler(request('GET', '/.dsh-orb/avatar/preset/point', undefined, { 'x-dsh-user': 'ok' }), presetRoute)
+    assert.equal(presetRoute.status, 404)
 
-    const anonymousPreset = response()
-    await handler(request('GET', first.url), anonymousPreset)
-    assert.equal(anonymousPreset.status, 401)
-
-    const unknownPreset = response()
-    await handler(request('GET', `/.dsh-orb/avatar/preset/${first.id}%2F..%2Frestore`, undefined, { 'x-dsh-user': 'ok' }), unknownPreset)
-    assert.equal(unknownPreset.status, 404)
-
-    const picked = response()
-    await handler(request('POST', '/.dsh-orb/avatar/preset', JSON.stringify({ preset: first.id }), { 'x-dsh-user': 'ok' }), picked)
-    const pickedSnapshot = JSON.parse(picked.body.toString('utf8')) as { avatarUrl: string; avatarPresetId: string | null }
-    assert.equal(pickedSnapshot.avatarPresetId, first.id)
-    assert.match(pickedSnapshot.avatarUrl, /^\/\.dsh-orb\/avatar\?v=[1-9]/)
-    assert.equal(calls.includes('chrome'), true)
-
-    // The ball's own route (and the settings preview) then serves the same bytes.
-    const currentPreset = response()
-    await handler(request('GET', pickedSnapshot.avatarUrl, undefined, { 'x-dsh-orb-helper': 'helper-secret' }), currentPreset)
-    assert.equal(currentPreset.body.equals(presetBytes.body), true)
-
-    const wrongPreset = response()
-    await handler(request('POST', '/.dsh-orb/avatar/preset', JSON.stringify({ preset: 'gone' }), { 'x-dsh-user': 'ok' }), wrongPreset)
-    assert.equal(wrongPreset.status, 400)
-    assert.equal(JSON.parse(wrongPreset.body.toString('utf8')).error, 'invalid-preset')
+    const pickRoute = response()
+    await handler(request('POST', '/.dsh-orb/avatar/preset', JSON.stringify({ preset: 'point' }), { 'x-dsh-user': 'ok' }), pickRoute)
+    assert.equal(pickRoute.status, 404)
 
     const missing = response()
     await handler(request('GET', '/.dsh-orb/nope', undefined, { 'x-dsh-user': 'ok' }), missing)
     assert.equal(missing.status, 404)
+    dispose()
+  })
+
+  // The two routes that carry a wake turn's words into a fixed conversation. They are the only way
+  // into that conversation that does not go through the window's composer, so their refusals matter
+  // as much as their successes: the page reads the reason out rather than silently dropping words.
+  it('takes a wake turn\'s words to one conversation, and refuses them clearly', async () => {
+    const profile = join(root, 'voice-profile')
+    mkdirSync(profile, { recursive: true })
+    const store = new ProfileStore(profile)
+    const taken: string[] = []
+    const endings: [string, boolean][] = []
+    let found = 'session-voice'
+    const control: OrbControl = {
+      helperAuthorized: (token) => tokensMatch(token, 'helper-secret'),
+      async publishChrome() {},
+      async setOverlayModel(selection) { store.setOverlay(selection) },
+      async setBackgroundModel(selection) { store.setBackground(selection) },
+      async setSelectionEnabled(enabled) { store.setSelectionEnabled(enabled) },
+      async setMillifractionEnabled(enabled) { store.setMillifractionEnabled(enabled) },
+      async setBallEnabled(enabled) { store.setBallEnabled(enabled) },
+      async setWakeEnabled(enabled) { store.setWakeEnabled(enabled) },
+      async setSpeech(settings) { store.setSpeech(settings) },
+      async setWakeSilence() {},
+      takeMainVoice: () => null,
+      async sendVoiceText(text) {
+        if (found === '') return { ok: false, reason: '没有找到名为「语音总管」的对话' }
+        taken.push(text)
+        return { ok: true }
+      },
+      async voiceTargetInfo() { return { title: '语音总管', sessionId: found === '' ? null : found } },
+      noteVoiceResult(outcome, routed) { endings.push([outcome, routed === true]) },
+    } as OrbControl
+    let handler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined
+    const dispose = registerOrbRoutes({
+      ctx: {
+        webServer: {
+          register(route) {
+            handler = route.handler
+            return () => { handler = undefined }
+          },
+        },
+        connection: {
+          admit(req) {
+            return req.headers['x-dsh-user'] === 'ok' ? { peer: { id: 'local' } } : { rejection: 401 }
+          },
+        },
+        sessionController: { modelCatalog: () => ({ groups: [] }) },
+      },
+      store,
+      tcc: new TccMonitor(),
+      control,
+    })
+    assert.ok(handler)
+
+    const where = response()
+    await handler(request('GET', '/.dsh-orb/voice-target', undefined, { 'x-dsh-user': 'ok' }), where)
+    assert.deepEqual(JSON.parse(where.body.toString('utf8')), { title: '语音总管', sessionId: 'session-voice' })
+
+    const sent = response()
+    await handler(request('POST', '/.dsh-orb/voice-send', JSON.stringify({ text: '  今天几号  ' }), { 'x-dsh-user': 'ok' }), sent)
+    assert.equal(sent.status, 200)
+    assert.deepEqual(taken, ['今天几号'], 'the words are trimmed, not passed with the pause a transcription leaves')
+
+    const blank = response()
+    await handler(request('POST', '/.dsh-orb/voice-send', JSON.stringify({ text: '   ' }), { 'x-dsh-user': 'ok' }), blank)
+    assert.equal(blank.status, 400)
+    assert.equal(JSON.parse(blank.body.toString('utf8')).reason, 'empty-or-too-long')
+    assert.equal(taken.length, 1, 'nothing empty reaches a conversation')
+
+    const huge = response()
+    await handler(request('POST', '/.dsh-orb/voice-send', JSON.stringify({ text: 'a'.repeat(6_001) }), { 'x-dsh-user': 'ok' }), huge)
+    assert.equal(huge.status, 400)
+
+    // No conversation with that title: the page still gets an answer it can say out loud, and the
+    // status is not 200, because nothing was delivered.
+    found = ''
+    const absent = response()
+    await handler(request('POST', '/.dsh-orb/voice-send', JSON.stringify({ text: '你在吗' }), { 'x-dsh-user': 'ok' }), absent)
+    assert.equal(absent.status, 409)
+    assert.equal(JSON.parse(absent.body.toString('utf8')).ok, false)
+
+    const nowhere = response()
+    await handler(request('GET', '/.dsh-orb/voice-target', undefined, { 'x-dsh-user': 'ok' }), nowhere)
+    assert.equal(JSON.parse(nowhere.body.toString('utf8')).sessionId, null)
+
+    // Both routes sit behind the same door as the rest of the panel: a page without the user
+    // header is not this window.
+    const closed = response()
+    await handler(request('POST', '/.dsh-orb/voice-send', JSON.stringify({ text: 'hi' })), closed)
+    assert.equal(closed.status, 401)
+
+    // How the turn ended travels with it, and `routed` has to survive the trip: it is what makes
+    // the ball drop its continuous exchange instead of handing the microphone back.
+    const ending = response()
+    await handler(request('POST', '/.dsh-orb/main-voice-result', JSON.stringify({ outcome: 'sent', routed: true }), { 'x-dsh-user': 'ok' }), ending)
+    assert.equal(ending.status, 200)
+    const plain = response()
+    await handler(request('POST', '/.dsh-orb/main-voice-result', JSON.stringify({ outcome: 'empty' }), { 'x-dsh-user': 'ok' }), plain)
+    assert.deepEqual(endings, [['sent', true], ['empty', false]])
     dispose()
   })
 })

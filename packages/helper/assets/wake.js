@@ -59,11 +59,19 @@ const COOLDOWN_MS = 2500
  * rate at zero without costing a single held-out positive. See `runModels` for the measurement and
  * `dsh_orb/wake_rule_probe.py` for how the two rules compare.
  *
+ * Two, on a real microphone, is the compromise the synthetic corpus could not argue for. Three was
+ * chosen on fourteen TTS voices, where the phrase holds the score up for five windows in a row and
+ * the third one costs nothing. A two-syllable word said by a close mic at an uneven pace holds it
+ * for two to three windows instead, so requiring three turned every slightly rushed repetition into
+ * a miss: `小弟小弟` woke once in a dozen tries at 0.55 and became reliably responsive only after the
+ * threshold fell to 0.35 *and* this fell to two. The 0.26 s of latency three bought is not worth a
+ * detection that only happens on the well-paced take.
+ *
  * Exported because the meter under the ball draws one dot per window this rule needs, and that count
  * has to come from here: a meter with its own copy of the number would eventually be explaining a
  * rule the engine no longer runs.
  */
-export const CONSECUTIVE_WINDOWS = 3
+export const CONSECUTIVE_WINDOWS = 2
 /** How long the ball shows "detected" before it returns to plain listening. */
 const DETECTED_HOLD_MS = 4000
 /** One utterance that never starts speaking is abandoned after this long. */
@@ -87,12 +95,13 @@ const CLOSE_NOTES_HEARD = [{ at: 0, freq: 1320, len: 0.1 }, { at: 0.12, freq: 88
  */
 const CLOSE_NOTES_EMPTY = [{ at: 0, freq: 392, len: 0.09 }, { at: 0.16, freq: 294, len: 0.16 }]
 /**
- * Open cue for a continuous turn: one bright, very short note — the "叮" of a radio opening its
- * receiver. Higher than the wake chime and played at full scale: it also has to read from across
- * a room, and too quiet it leaves the one question this cue exists to answer — "did it open?" —
- * hanging.
+ * Level of the two-note "叮-咚" that opens the microphone.
+ *
+ * The take this was copied from runs its master gain at 32% on top of a fast exponential decay,
+ * which is a soft cue on a desk set; the ball's other cues were doubled to read across a room, so
+ * this one sits between the two rather than at its original 0.32.
  */
-const OPEN_NOTES = [{ at: 0, freq: 1568, len: 0.08 }]
+const WAKE_TONE_LEVEL = 0.6
 /**
  * Close cue for a continuous turn that heard nothing: one dull low note, the "嘟" that says the
  * microphone is shut again. Deliberately not the two-knock empty cue above — that one reports a
@@ -109,6 +118,27 @@ const SHUT_NOTES = [{ at: 0, freq: 440, len: 0.13 }]
 const ORIGIN = 'dsh-wake://assets/'
 
 /**
+ * The one output context every cue on this page plays through.
+ *
+ * It used to be one context per cue, built on the spot and closed when the tail had rung out, and
+ * that is what the "滋啦" on the front of every cue was: a new `AudioContext` is a new output
+ * stream on the device, and the first buffers of a stream that has just opened are what the mixer
+ * drops and the resampler tears. Keep one context for the life of the page instead — opened on the
+ * first cue, never closed, resumed whenever the browser has suspended it — and the cue starts on a
+ * stream that is already running. The reference take does the same thing by borrowing the
+ * microphone's own context.
+ */
+let cueContext
+function cueOutput() {
+  const Ctor = globalThis.AudioContext
+  if (typeof Ctor !== 'function') return undefined
+  if (cueContext === undefined || cueContext.state === 'closed') cueContext = new Ctor()
+  if (cueContext.state === 'suspended') void cueContext.resume().catch(() => {})
+  return cueContext
+}
+
+
+/**
  * The spoken confirmation played on a fresh detection, in the ball's own TTS voice.
  *
  * Three takes of "我在" so the acknowledgement does not sound canned. They ship in the helper's
@@ -119,6 +149,30 @@ const ORIGIN = 'dsh-wake://assets/'
  * one place has to be renamed in the other, or a wake quietly falls back to the chime.
  */
 export const WAKE_VOICES = Object.freeze(['voices/c1.wav', 'voices/c2.wav', 'voices/c3.wav'])
+
+/**
+ * What each take actually says, one entry per {@link WAKE_VOICES} entry.
+ *
+ * The bubble's caption is a lookup in this table, not a sentence typed into the page. It used to
+ * be typed there — `messages.wakeAck` said "我在。" — while the longest take says something longer,
+ * so a wake that drew that take showed a subtitle the clip was not saying. Declaring the words
+ * beside the file that speaks them keeps the caption on whichever take played: re-record a clip,
+ * describe it here, and the two cannot disagree.
+ *
+ * The middle take is "我在呢。", not "我在。" — it was written from the other two and the user heard
+ * the mismatch ("文字上没有呢"). The three files were then read back through the harness's own
+ * SenseVoice (`stt-test.mjs`, after resampling 24 kHz → 16 kHz) rather than by ear: c1 "我在。",
+ * c2 "我在呢。", c3 "我在听你说。". The punctuation of a short clip is the recognizer's, of course,
+ * but the words are now measured instead of guessed — an entry that drifts from its clip puts a
+ * wrong subtitle under a right voice, which is the exact bug this table exists to prevent.
+ *
+ * The third take was still wrong, and by one word the recognizer had not invented but this table
+ * had: the clip says "我在，你说。" ("I'm here, go ahead") and SenseVoice returned "我在你说", which
+ * was read as "我在听你说。" — a plausible sentence with a word nobody said. A comma is what the
+ * recognizer drops and what a reader needs, so the caption now carries one, while the clip itself
+ * is unchanged (there is no recorded "听" to take out).
+ */
+export const WAKE_VOICE_TEXTS = Object.freeze(['我在。', '我在呢。', '我在，你说。'])
 
 /**
  * Peak gain of the spoken confirmation.
@@ -216,7 +270,8 @@ registerProcessor('dsh-wake-word-tap', DshWakeTap);
  */
 export class WakeEngine {
   /**
-   * @param api - the preload bridge: `wakeConfig()`, `wakeReport(status)`.
+   * @param api - the preload bridge: `wakeConfig()`, `wakeReport(status)`, and — for the decoder
+   *   engine only — `wakeFeed(samples)` / `wakeReset()`.
    * @param options - `onStatus(status)` is called on every state change, for the page's
    *   own rendering; the same snapshot is also handed to the helper. `onScore(update)` is
    *   called for every scored window, for the page's own live meter, and is deliberately
@@ -228,6 +283,9 @@ export class WakeEngine {
     this.onStatus = typeof options.onStatus === 'function' ? options.onStatus : () => {}
     this.onScore = typeof options.onScore === 'function' ? options.onScore : () => {}
     this.config = {
+      // `openwake` scores in this page; `sherpa` forwards frames to the helper process. See
+      // `src/wake-engines.ts` for why there are two and what each is good at.
+      engine: 'openwake',
       keyword: 'hey_jarvis',
       threshold: 0.5,
       autoExpandOnWake: true,
@@ -275,6 +333,22 @@ export class WakeEngine {
     this.voiceBlobs = undefined
     this.voiceLoad = undefined
     this.voiceAudio = undefined
+    // A pre-rendered set for one voice, when the profile ships one — see `setVoiceSet`. `undefined`
+    // is the shipped takes above; a set replaces both the files and the sentences they say, which is
+    // why the caption table travels with it rather than being assumed.
+    this.voiceNames = undefined
+    this.voiceTexts = undefined
+    // Which take `playVoice()` drew, as an index into `WAKE_VOICES` / `WAKE_VOICE_TEXTS`; -1
+    // while no clip has started. `voiceText()` reads it back for the bubble's caption.
+    this.voiceTake = -1
+    // Set when the page speaks the acknowledgement itself in the chosen voice; `voiceText()` reads
+    // it back so the bubble captions exactly the line that was said.
+    this.spokenAck = undefined
+    this.spokenLine = undefined
+    // Resolves when that spoken line has finished playing. A clip reports its own end through
+    // `voiceAudio`; a line spoken by the page has no element here, so its playback promise is the
+    // only thing that can hold the hand-off closed while the greeting is still talking.
+    this.spokenDone = undefined
   }
 
   /**
@@ -287,6 +361,7 @@ export class WakeEngine {
    */
   configure(config) {
     if (config === null || typeof config !== 'object') return
+    if (config.engine === 'openwake' || config.engine === 'sherpa') this.config.engine = config.engine
     if (typeof config.keyword === 'string' && /^[a-z0-9_]+$/i.test(config.keyword)) this.config.keyword = config.keyword
     if (typeof config.threshold === 'number' && Number.isFinite(config.threshold)) {
       this.config.threshold = Math.min(0.99, Math.max(0.05, config.threshold))
@@ -348,11 +423,25 @@ export class WakeEngine {
     return {
       state: this.state,
       detail: this.detail,
+      engine: this.config.engine,
       keyword: this.config.keyword,
       threshold: this.config.threshold,
       frames: this.frames,
       peak: Number(this.peak.toFixed(3)),
     }
+  }
+
+  /**
+   * Whether the phrase is decided by the helper's decoder instead of this page's classifiers.
+   *
+   * The classifier is retired — the helper offers the decoder alone (`WAKE_ENGINES`) and reads a
+   * profile still saying `openwake` back as `sherpa` before it reaches this page — but the branch
+   * behind this test is left standing on purpose: nothing here had to be deleted for the page to stop
+   * using it, so putting the classifier back is a change in one file on the helper side, not in this
+   * one.
+   */
+  decoderEngine() {
+    return this.config.engine === 'sherpa'
   }
 
   /** Drop the level history, so the next utterance's waveform starts from silence. */
@@ -473,9 +562,18 @@ export class WakeEngine {
     if (this.models !== undefined) return
     const ort = await this.ensureRuntime()
     const options = { executionProviders: ['wasm'] }
+    const vad = await ort.InferenceSession.create(`${ORIGIN}silero_vad.onnx`, options)
+    // The decoder engine's models are native and live in the helper process (`wake-sherpa.ts`).
+    // This page still needs the VAD, because the recorder it owns uses it to find the end of an
+    // utterance — but none of the classifier chain, whose three models would be ~20 MB fetched to
+    // score nothing.
+    if (this.decoderEngine()) {
+      this.models = { vad }
+      this.reset()
+      return
+    }
     const mel = await ort.InferenceSession.create(`${ORIGIN}melspectrogram.onnx`, options)
     const emb = await ort.InferenceSession.create(`${ORIGIN}embedding_model.onnx`, options)
-    const vad = await ort.InferenceSession.create(`${ORIGIN}silero_vad.onnx`, options)
     const kw = await ort.InferenceSession.create(`${ORIGIN}${this.keywordFile()}`, options)
     this.models = { mel, emb, vad, kw }
     this.quietEmbedding = await this.silenceEmbedding()
@@ -565,6 +663,10 @@ export class WakeEngine {
     // the bar keeps the last reading of the stream that just ended, which reads as a live score for
     // audio nobody is speaking.
     this.emitScore(0, false, 0)
+    // The decoder keeps its own matched state in the helper process. Every caller of this method is
+    // an edge where audio must not be re-heard — a mute, the end of an utterance, a fresh start —
+    // so the other side has to drop that state at exactly the same edges.
+    if (this.decoderEngine()) this.api.wakeReset?.()
   }
 
   /**
@@ -725,6 +827,15 @@ export class WakeEngine {
     // model would score it. Checked after the dictation branch because an in-flight recording has
     // to keep collecting silence — dropping those frames would end the utterance as "no speech".
     if (this.muted) return
+    // The decoder engine's whole chain is in the helper process, so the frame is handed over as-is
+    // and nothing is scored here. The answer comes back as one `orb:wake` message per detection,
+    // which `heardKeyword()` turns into the same chime, status and recorder the other engine feeds.
+    // Skipping the VAD is deliberate: the decoder does not gate on it, and the recorder that does
+    // need it runs its own calls on the dictation path above.
+    if (this.decoderEngine()) {
+      this.api.wakeFeed?.(frame)
+      return
+    }
     const speech = await this.runVad(frame)
     if (speech) {
       this.speechActive = true
@@ -936,6 +1047,14 @@ export class WakeEngine {
       const score = kwOut[this.models.kw.outputNames[0]].data[0]
       if (score > this.peak) this.peak = score
 
+      // Diagnostic line for a keyword that will not fire: the score the current model actually gives
+      // the user's own voice, which no held-out clip can answer. At most one line per second, and
+      // only above a floor no filler sentence reaches, so a normal session logs nothing.
+      if (score >= 0.15 && Date.now() - (this.diagAt ?? 0) > 1000) {
+        this.diagAt = Date.now()
+        console.log(`wake ${this.config.keyword}: score ${score.toFixed(3)} (threshold ${this.config.threshold})`)
+      }
+
       // The score has to stay up for a few windows in a row, not just cross the line once.
       //
       // A window lands every 128 ms of speech, so an hour of talking is ~28k independent chances to
@@ -976,6 +1095,43 @@ export class WakeEngine {
   }
 
   /**
+   * A detection reported by the helper's decoder engine.
+   *
+   * The two engines differ in where the decision is made, not in what happens next: this is the same
+   * path `runModels` takes when its own threshold is crossed — chime, visible state, one recorder —
+   * so the ball behaves identically whichever engine is listening.
+   *
+   * The cooldown is here rather than in the helper because this page is the only place that knows
+   * about the utterance currently being recorded: a phrase recognised during one must not queue a
+   * second.
+   * @param keyword - the phrase the decoder matched.
+   * @param detail - `{ score, startTime }` from the helper; the score is its operating point.
+   */
+  heardKeyword(keyword, detail = {}) {
+    if (!this.running || this.muted || this.state === 'disabled') return
+    if (this.coolingDown) return
+    this.coolingDown = true
+    this.cooldownTimer = setTimeout(() => {
+      this.cooldownTimer = undefined
+      this.coolingDown = false
+    }, COOLDOWN_MS)
+    const score = typeof detail.score === 'number' && Number.isFinite(detail.score) ? detail.score : 1
+    // One dot on the meter, and only on a hit: the decoder reports a phrase, not a score per window,
+    // so there is no curve to draw while waiting. An empty meter here means "listening, nothing
+    // matched", which is exactly what it means for the other engine between phrases.
+    this.emitScore(score, true, CONSECUTIVE_WINDOWS)
+    void this.detected(score)
+  }
+
+  /**
+   * Report a failure this page cannot fix on its own — a decoder that would not load.
+   * @param detail - one line for the status line, already phrased for a person.
+   */
+  fail(detail) {
+    void this.publish('error', typeof detail === 'string' && detail !== '' ? detail : '语音引擎启动失败')
+  }
+
+  /**
    * One detection: confirmation, event, visible state, then back to listening.
    * @param score - the classifier score that fired.
    */
@@ -998,12 +1154,56 @@ export class WakeEngine {
    * promise is returned for the tests; `detected()` does not wait on playback.
    * @returns whether a clip or the chime was started.
    */
-  playChime() {
-    return this.playVoice().then((played) => {
+  async playChime() {
+    // A pre-rendered set for this voice answers the wake by itself: a file this page already has,
+    // so nothing is requested and nothing is awaited beyond the clip. Only when one of its files is
+    // missing does the hook below get a say.
+    if (this.voiceTexts !== undefined) {
+      const played = await this.playVoice()
+      if (played) return true
+    }
+    // A cloned voice is the ball's own voice, so the acknowledgement has to be in it. The three
+    // shipped takes are recorded in a fixed timbre; answering 德拉曼 with them would be a
+    // different person saying "我在". The hook is the page's: it owns the speech service and the
+    // chosen voice, and returning a line means it has already started speaking it.
+    if (typeof this.spokenAck === 'function') {
+      const ack = this.spokenAck()
+      // Two shapes: the line alone, or the line with the promise of its playback. The promise is
+      // what keeps the microphone shut for as long as the greeting lasts; a line on its own would
+      // let the hand-off open it while the page was still saying it.
+      const line = typeof ack === 'string'
+        ? ack
+        : (ack !== null && typeof ack === 'object' ? ack.line : undefined)
+      if (typeof line === 'string' && line !== '') {
+        this.voiceTake = -1
+        this.spokenLine = line
+        const done = ack !== null && typeof ack === 'object' ? ack.done : undefined
+        this.spokenDone = done !== null && done !== undefined && typeof done.then === 'function'
+          ? done
+          : undefined
+        return true
+      }
+    }
+    this.spokenLine = undefined
+    this.spokenDone = undefined
+    try {
+      const played = await this.playVoice()
       if (!played) this.playNotes(START_NOTES, 0.88)
-    }).catch(() => {
+      return played
+    } catch {
       this.playNotes(START_NOTES, 0.88)
-    })
+      return false
+    }
+  }
+
+  /**
+   * Let the page speak the acknowledgement itself, in whatever voice it is reading with.
+   *
+   * @param hook - returns the line it started speaking, or anything falsy to fall back to the
+   * shipped takes.
+   */
+  setSpokenAck(hook) {
+    this.spokenAck = hook
   }
 
   /**
@@ -1017,7 +1217,8 @@ export class WakeEngine {
    */
   preloadVoices() {
     if (this.voiceLoad !== undefined) return this.voiceLoad
-    this.voiceLoad = Promise.all(WAKE_VOICES.map(async (name) => {
+    const names = this.voiceNames ?? WAKE_VOICES
+    this.voiceLoad = Promise.all(names.map(async (name) => {
       try {
         const response = await fetch(`${ORIGIN}${name}`)
         if (!response.ok) return null
@@ -1053,7 +1254,11 @@ export class WakeEngine {
     // Uniform over the three takes. A missing slot is not swapped for another take: the user
     // asked for a random version of the sentence, and the beep is the honest answer to "that
     // version is not here".
-    const chosen = blobs[Math.floor(Math.random() * blobs.length)]
+    const index = Math.floor(Math.random() * blobs.length)
+    const chosen = blobs[index]
+    // Cleared first, set again only once the element is about to play: a take that never reaches
+    // the speakers ends in the chime, and a remembered sentence would caption that beep.
+    this.voiceTake = -1
     if (chosen === null || chosen === undefined) return false
     let url
     try {
@@ -1071,13 +1276,65 @@ export class WakeEngine {
       }
       audio.addEventListener('ended', release)
       audio.addEventListener('error', release)
+      // From here the caption has a sentence: the status update `detected()` sends next reads it
+      // back through `voiceText()`, and that is the whole of the subtitle's source.
+      this.voiceTake = index
       await audio.play()
       return true
     } catch {
       if (url !== undefined) URL.revokeObjectURL(url)
       this.voiceAudio = undefined
+      this.voiceTake = -1
       return false
     }
+  }
+
+  /**
+   * The sentence of the take that is playing, for the bubble's caption.
+   *
+   * `undefined` when no clip started — the chime path — so the page can keep its own fallback
+   * line instead of captioning a sound with words nothing said.
+   * @returns the drawn take's text, or `undefined`.
+   */
+  voiceText() {
+    if (typeof this.spokenLine === 'string' && this.spokenLine !== '') return this.spokenLine
+    const text = (this.voiceTexts ?? WAKE_VOICE_TEXTS)[this.voiceTake]
+    return typeof text === 'string' ? text : undefined
+  }
+
+  /**
+   * Point the confirmation at a pre-rendered set for one voice, or back at the shipped takes.
+   *
+   * A cloned voice normally speaks its greeting through the speech service, which costs a round
+   * trip at the exact moment the user wants an answer. The same two sentences can be rendered once
+   * and shipped beside the other takes, and then a wake is a file load and nothing else — no
+   * service, no synthesis, no wait. The set carries both the file names and the sentence each one
+   * says, because the caption is a lookup and a set whose texts were assumed would caption a clip
+   * with words it does not contain.
+   *
+   * `undefined` restores the shipped takes. Files that are missing stay missing: the caller's
+   * spoken hook is asked next, so a deleted asset costs the round trip rather than the greeting.
+   * @param set - `{ names, texts }` under `voices/`, or `undefined` for the shipped takes.
+   */
+  setVoiceSet(set) {
+    const names = set === undefined ? undefined : set.names
+    const texts = set === undefined ? undefined : set.texts
+    if (names !== undefined && (names.length === 0 || texts === undefined || texts.length !== names.length)) {
+      return
+    }
+    // Same set already loaded: nothing to reload, and a wake must not churn its own cache.
+    const same = this.voiceNames === undefined && names === undefined
+      ? true
+      : (this.voiceNames !== undefined && names !== undefined
+        && this.voiceNames.length === names.length
+        && this.voiceNames.every((name, index) => name === names[index]))
+    if (same) return
+    this.voiceNames = names
+    this.voiceTexts = texts
+    this.voiceLoad = undefined
+    this.voiceBlobs = undefined
+    this.voiceTake = -1
+    void this.preloadVoices()
   }
 
   /**
@@ -1091,11 +1348,57 @@ export class WakeEngine {
     this.playNotes(captured ? CLOSE_NOTES_HEARD : CLOSE_NOTES_EMPTY, captured ? 0.8 : 0.64)
   }
 
-  /** The microphone is reopening for the next turn: the short "叮" that starts listening. */
+  /** The microphone is opening: the two-note "叮-咚" of `playWakeChime` below. */
   playOpenTone() {
-    // Full scale: request ducking off in the OS and this still has to be audible over a room, so
-    // nothing is held back here. 1.0 on a single sine is the loudest sample value with no clipping.
-    this.playNotes(OPEN_NOTES, 1)
+    this.playWakeChime()
+  }
+
+  /**
+   * The two-note "叮-咚" that opens the microphone.
+   *
+   * Copied from `dsh-voice-wake`'s `playWakeChime()`: one master envelope, a 988 Hz "叮" for 0.12 s,
+   * then a 1319 Hz "咚" up to 0.36 s, with a 15 ms attack and an exponential decay to near silence
+   * at the end, so it lands as a chime rather than a square beep. Level comes from
+   * `WAKE_TONE_LEVEL`, the only number changed from the take.
+   *
+   * Two things are not verbatim, both about where the sound comes out rather than how it sounds.
+   * It plays on the page's one cue context (`cueOutput`) instead of a context made and closed per
+   * take — the take borrows the microphone's context, which is the same idea — and each note is
+   * faded out over its own last 20 ms instead of being stopped dead at whatever the shared envelope
+   * had left. A hard stop on a running sine is a step in the waveform, and a step is the tick that
+   * reads as crackle on the tail of a cue.
+   */
+  playWakeChime() {
+    try {
+      const context = cueOutput()
+      if (context === undefined) return
+      const now = context.currentTime + 0.05
+      const master = context.createGain()
+      master.gain.setValueAtTime(0.0001, now)
+      master.gain.exponentialRampToValueAtTime(Math.max(0.001, WAKE_TONE_LEVEL), now + 0.015)
+      master.gain.exponentialRampToValueAtTime(0.0001, now + 0.36)
+      master.connect(context.destination)
+      for (const note of [{ at: 0, freq: 988, len: 0.12 }, { at: 0.12, freq: 1319, len: 0.24 }]) {
+        const start = now + note.at
+        const end = start + note.len
+        const osc = context.createOscillator()
+        const fader = context.createGain()
+        osc.type = 'sine'
+        osc.frequency.setValueAtTime(note.freq, start)
+        osc.connect(fader)
+        fader.connect(master)
+        fader.gain.setValueAtTime(1, start)
+        fader.gain.setValueAtTime(1, end - 0.02)
+        fader.gain.linearRampToValueAtTime(0, end)
+        osc.start(start)
+        osc.stop(end + 0.01)
+      }
+      setTimeout(() => {
+        try { master.disconnect() } catch { /* the cue is already gone */ }
+      }, 900)
+    } catch {
+      /* a missing tone must never break the wake path */
+    }
   }
 
   /**
@@ -1110,6 +1413,24 @@ export class WakeEngine {
    * @returns a promise that always settles.
    */
   whenVoiceDone(timeoutMs = 4000) {
+    // A line spoken by the page is not an element here, so its own playback promise is what says
+    // the greeting is over. Same question as for a clip — "has it finished?" — asked of the side
+    // that knows: synthesis and playback both end when that promise settles. The timeout stays
+    // because a promise that never settles must not leave the microphone shut for the whole turn.
+    const spoken = this.spokenDone
+    if (spoken !== undefined && spoken !== null) {
+      return new Promise((resolve) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve()
+        }
+        const timer = setTimeout(finish, Math.max(0, timeoutMs))
+        spoken.then(finish, finish)
+      })
+    }
     const audio = this.voiceAudio
     if (audio === undefined || audio === null) return Promise.resolve()
     return new Promise((resolve) => {
@@ -1135,41 +1456,55 @@ export class WakeEngine {
   }
 
   /**
-   * Play one short sequence of sine notes on its own AudioContext.
+   * Play one short sequence of sine notes on the page's shared cue output.
    *
    * The cues stay tones rather than speech: they sound while the microphone is open, and a word
    * there would be captured and could be scored as speech. The one spoken clip — the wake
    * confirmation — runs at detection and relies on the echo cancellation `openMicrophone()` asks
    * for, not on being inaudible.
+   *
+   * Each note carries its own fade-out over the last 20 ms. A note stopped dead on a running sine is
+   * a step in the waveform, audible as the tick on the tail of a cue; and a `close()` on the context
+   * afterwards is a stream shutting under the next cue that is about to open — see `cueOutput`.
    * @param notes - `{ at, freq, len }` in seconds, relative to the sequence start.
    * @param level - peak gain of the whole sequence.
    */
   playNotes(notes, level) {
     try {
-      const Ctor = globalThis.AudioContext
-      if (typeof Ctor !== 'function') return
-      const ctx = new Ctor()
-      if (ctx.state === 'suspended') void ctx.resume().catch(() => {})
+      const ctx = cueOutput()
+      if (ctx === undefined) return
       const gain = ctx.createGain()
       gain.gain.value = 0.0001
       gain.connect(ctx.destination)
-      const start = ctx.currentTime + 0.03
+      const start = ctx.currentTime + 0.05
+      const faders = []
       for (const note of notes) {
         const osc = ctx.createOscillator()
+        const fader = ctx.createGain()
         osc.type = 'sine'
         osc.frequency.setValueAtTime(note.freq, start + note.at)
-        osc.connect(gain)
+        osc.connect(fader)
+        fader.connect(gain)
+        fader.gain.setValueAtTime(1, start + note.at)
+        const end = start + note.at + note.len
+        fader.gain.setValueAtTime(1, end - 0.02)
+        fader.gain.linearRampToValueAtTime(0, end)
         osc.start(start + note.at)
-        osc.stop(start + note.at + note.len)
+        osc.stop(end + 0.01)
+        faders.push(fader)
       }
-      // The envelope outlives the last note by a fixed tail, so every cue rings out to
-      // silence instead of being cut off by `close()`.
+      // The envelope outlives the last note by a fixed tail, so every cue rings out to silence.
       const last = notes[notes.length - 1]
       const total = (last === undefined ? 0 : last.at + last.len) + 0.08
       gain.gain.setValueAtTime(0.0001, start)
       gain.gain.exponentialRampToValueAtTime(level, start + 0.02)
       gain.gain.exponentialRampToValueAtTime(0.0001, start + total)
-      setTimeout(() => { void ctx.close().catch(() => {}) }, (total + 0.5) * 1000)
+      setTimeout(() => {
+        try { gain.disconnect() } catch { /* already gone */ }
+        for (const fader of faders) {
+          try { fader.disconnect() } catch { /* already gone */ }
+        }
+      }, (total + 0.5) * 1000)
     } catch {
       /* a missing tone must never break the wake path */
     }

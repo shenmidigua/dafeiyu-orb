@@ -1019,15 +1019,46 @@ describe('ball page module', () => {
     assert.match(main, /screen\.getCursorScreenPoint\(\)/, 'which it can read whatever the window is doing')
     assert.match(main, /setIgnoreMouseEvents\(!over, \{ forward: true \}\)/, 'turning click-through on away from them')
     assert.match(main, /setHitTest\(created, false\)/, 'and the window starts transparent to clicks')
-    // The regions are geometry, in the space the poll reads.
+    // The regions are geometry, in the page's own space — not screen space.
+    //
+    // They used to carry `window.screenX`/`screenY`, and that is what left a rect standing where
+    // nothing is drawn: a report taken while the helper was still moving or resizing the window kept
+    // the offset it was measured at, and the window kept capturing clicks over the desktop there.
+    // The page now reports its own coordinates and the helper converts them against the bounds it has
+    // at the moment of the poll, so a rect stays right wherever the window goes.
     assert.match(preload, /setHitTest\(regions\)\s*\{\s*\n\s*ipcRenderer\.send\('orb:hit-test', Array\.isArray\(regions\)/, 'the preload forwards them')
-    assert.match(pageFunction(shell, 'syncHitTest'), /window\.screenX/, 'reported in screen coordinates')
+    const regions = pageFunction(shell, 'syncHitTest')
+    assert.equal(/window\.screenX/.test(regions), false, 'reported in the page\'s own coordinates')
+    assert.match(regions, /getBoundingClientRect\(\)/, 'measured off the elements themselves')
+    assert.match(main, /getContentBounds\(\)/, 'and converted against the window the helper has now')
     for (const element of ['ball', 'panel', 'stop', 'dockTab']) {
-      assert.match(pageFunction(shell, 'syncHitTest'), new RegExp(`\\b${element}\\b`), `${element} captures over itself`)
+      assert.match(regions, new RegExp(`\\b${element}\\b`), `${element} captures over itself`)
     }
+    // Laid out is not the same as on screen. `body.docked` takes the card away with
+    // `visibility: hidden` and the fade to zero takes it away with opacity, and both leave the box
+    // in place — a region reported off that box swallows every click over desktop that shows
+    // nothing, which is how "the card is gone but something is still in the way" reads.
+    assert.match(regions, /visibleToMouse\(element\)/, 'only an element a click could land on is a region')
+    const visible = pageFunction(shell, 'visibleToMouse')
+    assert.match(visible, /checkVisibility\(\{ checkOpacity: true, checkVisibilityCSS: true \}\)/, 'the browser answers with its own rules')
+    assert.match(visible, /style\.visibility === 'hidden'/, 'and a build without it asks the computed style')
+    assert.match(visible, /parseFloat|Number\.parseFloat/, 'including an opacity of zero')
+    // A circle is not its bounding square. The ball is 288px round, so its four corners are about
+    // 60x60 of empty pixels each, and a square region there eats clicks that land on nothing.
+    assert.match(regions, /round: true/, 'the ball and the cap report the shape they are drawn as')
+    const isRound = pageFunction(shell, 'isRound')
+    assert.match(isRound, /borderTopLeftRadius/, 'read off the radius the browser resolved')
+    assert.match(isRound, /radiusPixels/, 'resolved per corner instead of trusted as a number')
+    assert.match(pageFunction(shell, 'radiusPixels'), /endsWith\('%'\)/, 'because "50%" is what the computed style actually says')
+    assert.match(main, /region\.round === true[\s\S]{0,260}?dx \* dx \+ dy \* dy <= 1/, 'and the helper tests it as a circle')
     // A drag overrides it: the window must not go transparent out from under a drag in progress,
-    // or the drag stops responding exactly when the pointer outruns the ball.
-    assert.match(pageFunction(shell, 'syncHitTest'), /pointer !== undefined \|\| dragging/, 'a drag widens the regions to the whole window')
+    // or the drag stops responding exactly when the pointer outruns the ball — but only while the
+    // gesture keeps proving it is alive, because a press whose release never arrived would otherwise
+    // hold the whole window over empty desktop for the rest of the session.
+    assert.match(regions, /gestureHold\(\)/, 'a drag widens the regions to the whole window')
+    const hold = pageFunction(shell, 'gestureHold')
+    assert.match(hold, /pointer !== undefined \|\| dragging/, 'and a gesture is a pointer or a drag')
+    assert.match(hold, /GESTURE_HOLD_MS/, 'that has been heard from recently')
     assert.match(shell, /ball\.addEventListener\('pointerdown'[\s\S]*?syncHitTest\(\)/, 'reported when the drag starts')
     assert.match(pageFunction(shell, 'finishPointer'), /syncHitTest\(\)/, 'and again when it ends')
   })
@@ -1078,6 +1109,26 @@ describe('ball page module', () => {
     // The badge sits over the ball and is a label, so it must not be what a hit test finds there.
     const floating = readFileSync(join(here, '../assets/floating.css'), 'utf8')
     assert.match(floating, /#wake-badge \{[^}]*pointer-events: none/s, 'the label over the ball is transparent to the pointer')
+  })
+
+  it('folds the card away when nothing new has arrived in it for a while', () => {
+    const shell = readFileSync(join(here, '../assets/shell.js'), 'utf8')
+    // The card closes when the pointer leaves it, which covers the card the user opened and walked
+    // away from. It does not cover one that opened itself — a message or a wake raising the card
+    // while the pointer is somewhere else — because that card never sees a leave. Without its own
+    // clock it sits over the desktop indefinitely.
+    const idle = pageFunction(shell, 'foldIdleCard')
+    assert.match(idle, /if \(!expanded \|\| docked !== undefined\) return/, 'nothing to fold when there is no card')
+    for (const busy of ['pinned', 'running', 'asking\\(\\)', 'dragging', 'hovering', 'bubbleHasSelection\\(\\)']) {
+      assert.match(idle, new RegExp(busy), `${busy} keeps the card up`)
+    }
+    assert.match(idle, /noteCardActivity\(\)[\s\S]*?void setExpanded\(false\)/, 'and a busy card re-arms rather than closes')
+    assert.match(pageFunction(shell, 'noteCardActivity'), /CARD_IDLE_MS/, 'one clock, armed from the constant')
+    for (const arriving of ['pushBubble', 'appendBubbleStream', 'settleBubbleStream']) {
+      assert.match(pageFunction(shell, arriving), /noteCardActivity\(\)/, `${arriving} restarts the clock`)
+    }
+    assert.match(pageFunction(shell, 'setExpanded'), /clearTimeout\(cardIdleTimer\)[\s\S]*?noteCardActivity\(\)/,
+      'and it is dropped on every open or close, then armed again for a card that is open')
   })
 
   it('leaves nothing holding the ball across an open', () => {

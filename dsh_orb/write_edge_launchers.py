@@ -29,7 +29,7 @@ rem Endpoints: GET http://127.0.0.1:8765/health   POST http://127.0.0.1:8765/spe
 cd /d D:\\tools\\edgetts
 if not exist logs mkdir logs
 echo [%date% %time%] starting edge_server>>logs\\launcher.log
-D:\\tools\\indextts\\py311\\python.exe edge_server.py
+D:\\tools\\py311\\python.exe edge_server.py
 echo [%date% %time%] edge_server exited with %errorlevel%>>logs\\launcher.log
 """
 
@@ -40,9 +40,13 @@ rem This is the file DSH_ORB_TTS_LAUNCH points at, which makes it the switch bet
 rem forwards to the Edge read-aloud proxy, which has no download leg and is therefore an order of
 rem magnitude quicker than either host before it.
 rem
-rem Every earlier engine is still installed and still works. To go back, change the call below:
+rem The local IndexTTS model was removed from this machine on 2026-11-21: on an 8 GB laptop GPU it
+rem needed 4.94 GB and minutes per sentence, so it is gone from disk (weights, checkpoints, voice
+rem sample). The dir this file lives in now holds nothing else. Its launcher was
+rem `start_indextts.cmd`, and the script behind it was `tts_server.py` - both deleted with it.
+rem
+rem One other engine is still installed and still works. To go back, change the call below:
 rem   D:\\tools\\milora\\start_server.cmd      Milora AIvoice - free, public docs, ~10s per sentence
-rem   D:\\tools\\indextts\\start_indextts.cmd   the local IndexTTS model - clone of your own voice
 rem All of them listen on 8765, so only one can be up at a time.
 call "D:\\tools\\edgetts\\start_server.cmd"
 """

@@ -6,12 +6,11 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type { Appearance, ThemePreference } from './appearance.ts'
-import { avatarPresetSrc } from './avatar-presets.ts'
 import { accountClientMetadata, readBalance, type AccountService, type BalanceReport } from './balance.ts'
 import { readTurnEnding } from './failure.ts'
 import { normalizeCatalog } from './catalog.ts'
@@ -23,6 +22,7 @@ import {
   DICTATION_NO_SPEECH_MS,
   isAgentModelSelection,
   isPermissionPreset,
+  isSpeechVoice,
   MAX_SILENCE_MS,
   MIN_SILENCE_MS,
   type AgentModelSelection,
@@ -30,9 +30,22 @@ import {
   type PermissionPreset,
   type ProfileStore,
   type SpeechSettings,
+  type WakeEngine,
 } from './preferences.ts'
 import { tokensMatch, type MainVoiceCommand } from './routes.ts'
 import { createOverlayGuard } from './overlay-guard.ts'
+
+/**
+ * Phrases the decoder engine can listen for.
+ *
+ * Mirrors `ENGINE_KEYWORDS.sherpa` in `packages/helper/src/wake-engines.ts`, which owns the list and
+ * builds the keyword files. This copy exists for one job: deciding, on the menu click that switches
+ * engines, whether the phrase already selected is one the new engine can run — the ball relaunches
+ * before it could report that mismatch back.
+ */
+const SHERPA_KEYWORDS: readonly string[] = Object.freeze([
+  'xiaodi', 'xiaohui', 'dacheng', 'dafeiyu', 'laode', 'heilaode',
+])
 import {
   openSystemUrl,
   productionAccessibility,
@@ -41,7 +54,7 @@ import {
 } from './selection.ts'
 import { pinSessionId, type SessionLike } from './services.ts'
 import { selectModelKeepDefault } from './select-model.ts'
-import { resolveWakeAssets } from './wake-assets.ts'
+import { resolveWakeAssets, WAKE_DEFAULT_KEYWORD } from './wake-assets.ts'
 import { createTranscriber } from './transcribe.ts'
 import { createForegroundMemory } from './windows-foreground.ts'
 
@@ -100,6 +113,26 @@ const MAIN_VOICE_NO_SPEECH_MS = DICTATION_NO_SPEECH_MS
  * All this needs to cover is the page seeing the stop button gone — a DOM update, not a sentence.
  */
 const MAIN_VOICE_FOLLOW_UP_MS = 150
+/**
+ * The conversation a wake-word turn is sent to, by title.
+ *
+ * The user pinned a session called 「语音总管」 and asked for every voice-wake turn to land there
+ * whatever window they are looking at. A title rather than an id: the session can be re-created,
+ * renamed and re-opened, and an id stored in a file would then point at a conversation that no
+ * longer exists. Resolved per hand-off for the same reason, and the cost is one local list call.
+ *
+ * When no session carries this title the hand-off falls through to the old behaviour — the words
+ * go to whatever conversation the main window is showing — rather than failing a turn the user has
+ * already spoken into.
+ */
+const VOICE_TARGET_TITLE = '语音总管'
+/**
+ * How long a hand-off waits for that lookup before going ahead without it, milliseconds.
+ *
+ * The page polls five times a second, so returning "nothing yet" is cheap; it exists only so a
+ * list call that hangs cannot hold the microphone shut for longer than a blink.
+ */
+const VOICE_ROUTE_WAIT_MS = 3_000
 
 /** Host services the plugin injects. Shapes match the official 0.1.7-rc.2 controllers. */
 export interface OrbContext {
@@ -328,6 +361,9 @@ export class OrbRuntime {
    */
   private otherTextBuffer = ''
   private otherTextTimer: ReturnType<typeof setTimeout> | undefined
+  /** Reasoning from another conversation, waiting to be sent for the ball's voice. */
+  private otherReasonBuffer = ''
+  private otherReasonTimer: ReturnType<typeof setTimeout> | undefined
   /** Whether this plugin has ever seen a session event through the global subscription. Logged once. */
   private userMessageSeenLogged = false
   /** Keys of the newest settled assistant message: the turn's final answer so far. */
@@ -353,6 +389,16 @@ export class OrbRuntime {
    */
   private mainVoiceRequest = 0
   private mainVoiceAt = 0
+  /**
+   * Where this wake's words are to land.
+   *
+   * `pending` covers the moment between the ball handing a turn over and the title lookup
+   * answering: the page may poll inside it, and a command without a target would send the words to
+   * whatever window the user happens to be looking at — the one thing the pinning was asked to
+   * stop. `sessionId` is `undefined` when no conversation carries {@link VOICE_TARGET_TITLE}, which
+   * is the ordinary behaviour, not an error.
+   */
+  private voiceRoute: { pending: boolean; since: number; sessionId?: string } = { pending: false, since: 0 }
   private readonly tcc: { status(): TccStatus; open(right: TccRight): Promise<void> }
   private readonly selection: SelectionController
   private readonly overlay = createOverlayGuard({
@@ -558,7 +604,10 @@ export class OrbRuntime {
    */
   private announceOtherText(text: string): void {
     if (text === '') return
-    this.otherTextBuffer = `${this.otherTextBuffer}${text}`.slice(-ORB_OTHER_TEXT_CHARS)
+    // Held whole, trimmed only in the copy that goes out. The bubble wants the tail — the part
+    // arriving now — but the voice reads the turn from its first sentence, so the two cannot share
+    // one window: a tail read aloud would skip whatever was cut off the front.
+    this.otherTextBuffer = `${this.otherTextBuffer}${text}`
     if (this.otherTextTimer !== undefined) return
     this.otherTextTimer = setTimeout(() => {
       this.otherTextTimer = undefined
@@ -572,10 +621,55 @@ export class OrbRuntime {
       clearTimeout(this.otherTextTimer)
       this.otherTextTimer = undefined
     }
-    const text = this.otherTextBuffer
+    const whole = this.otherTextBuffer
     this.otherTextBuffer = ''
+    if (whole === '') return
+    if (whole.length <= ORB_OTHER_TEXT_CHARS) {
+      this.broadcast({ type: 'session-turn', outcome: 'text', text: whole })
+      return
+    }
+    // Only the card is trimmed. `spoken` carries what was written verbatim, and only appears when
+    // there is a difference — the ordinary case stays a single field.
+    this.broadcast({
+      type: 'session-turn',
+      outcome: 'text',
+      text: whole.slice(-ORB_OTHER_TEXT_CHARS),
+      spoken: whole,
+    })
+  }
+
+  /**
+   * Collect what another conversation is *thinking*, for the ball's voice.
+   *
+   * The same buffering as {@link announceOtherText} and for the same reason — one message per delta
+   * would be hundreds a turn — but unlike the prose this is never trimmed to a tail: a reader wants
+   * the whole of it, and a tail would drop the part not yet reached.
+   *
+   * Sent regardless of whether the page reads it out. Whether a deliberation is worth narrating is
+   * the page's decision (`SPEAK_THINKING` in `assets/shell.js`, currently off — a model talking to
+   * itself is not the answer), and the host has no view of that switch. Keeping the stream here
+   * means turning the narration back on costs one word instead of a rebuild of both ends.
+   */
+  private announceOtherReasoning(text: string): void {
     if (text === '') return
-    this.broadcast({ type: 'session-turn', outcome: 'text', text })
+    this.otherReasonBuffer = `${this.otherReasonBuffer}${text}`
+    if (this.otherReasonTimer !== undefined) return
+    this.otherReasonTimer = setTimeout(() => {
+      this.otherReasonTimer = undefined
+      this.flushOtherReasoning()
+    }, ORB_OTHER_TEXT_MS)
+  }
+
+  /** Send the reasoning that is waiting, now. Called by its timer and by the end of the attempt. */
+  private flushOtherReasoning(): void {
+    if (this.otherReasonTimer !== undefined) {
+      clearTimeout(this.otherReasonTimer)
+      this.otherReasonTimer = undefined
+    }
+    const text = this.otherReasonBuffer
+    this.otherReasonBuffer = ''
+    if (text === '') return
+    this.broadcast({ type: 'session-turn', outcome: 'reason', text })
   }
 
   /**
@@ -669,7 +763,9 @@ export class OrbRuntime {
       if (session?.id === this.sessionId) this.attemptPositions.delete(attemptId)
       else {
         // The words still waiting in the buffer are the end of the answer: send them before the end
-        // cue, so the line the page settles on is the whole reply rather than a prefix of it.
+        // cue, so the line the page settles on is the whole reply rather than a prefix of it. The
+        // reasoning goes first, because it was written first — the ball reads the turn in that order.
+        this.flushOtherReasoning()
         this.flushOtherText()
         this.announceOtherStreamEnded()
       }
@@ -684,10 +780,20 @@ export class OrbRuntime {
       if (news !== null) {
         this.announceOtherStream(news.kind, typeof session?.id === 'string' ? session.id : '', news.tool)
         // Words as well as the face, on their own cadence: the face needs one message a second, the
-        // bubble's line needs the sentences. Only prose — reasoning is not something the ball says.
-        if (news.kind === 'typing' && frame.type === 'chunk') {
+        // bubble's line needs the sentences. Prose goes to the card and to the voice; reasoning goes
+        // to the voice alone, because the ball reads the whole turn out and the bubble is for the
+        // answer (`assets/shell.js` collects both under `otherSpeech`).
+        //
+        // The two are told apart by the face's own kind, not by re-reading the chunk: `streamNews`
+        // already decided that a reasoning delta is `thinking` and a prose delta is `typing`, and a
+        // second classifier here is a second answer to the same question.
+        if (frame.type === 'chunk') {
           const chunk = asRecord(frame.chunk)
-          if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') this.announceOtherText(chunk.text)
+          if (news.kind === 'typing' && chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+            this.announceOtherText(chunk.text)
+          } else if (news.kind === 'thinking' && chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+            this.announceOtherReasoning(chunk.text)
+          }
         }
       }
       return
@@ -1588,13 +1694,22 @@ export class OrbRuntime {
     const settings = this.store.wake()
     const tuning = JSON.stringify({
       enabled: settings.enabled,
+      engine: settings.engine,
       keyword: settings.keyword,
       threshold: settings.threshold,
       autoExpandOnWake: settings.autoExpandOnWake,
       dictation: settings.dictation,
       continuous: settings.continuous,
     })
-    const assets = resolveWakeAssets(settings)
+    // Which keyword the directory has to be validated against depends on the engine: the classifier
+    // ships one `.onnx` per phrase, but the decoder reads its phrase list from inside the helper and
+    // only needs the shared runtime here — the WebAssembly, `silero_vad.onnx` and the mel/embedding
+    // pair. Validating a decoder phrase against `<keyword>.onnx` rejects a directory that is perfectly
+    // usable, the page then fails to fetch onnxruntime, and the microphone never opens — which looks
+    // exactly like a broken wake word.
+    const assets = resolveWakeAssets(
+      settings.engine === 'sherpa' ? { ...settings, keyword: WAKE_DEFAULT_KEYWORD } : settings,
+    )
     if (assets === undefined) {
       if (settings.enabled) {
         const configured = settings.assetDirectory === ''
@@ -1804,11 +1919,27 @@ export class OrbRuntime {
     const current = this.store.speech()
     if (current.enabled === settings.enabled
       && current.autoPlay === settings.autoPlay
-      && current.endpoint === settings.endpoint) {
+      && current.endpoint === settings.endpoint
+      && current.voice === settings.voice) {
       return
     }
     this.store.setSpeech(settings)
     await this.publishChrome()
+  }
+
+  /**
+   * Choose the voice the ball reads in, as asked by the ball's own menu.
+   *
+   * One field of the speech record, so it goes the same way as the others: written, published, and
+   * the page hands it to the speaker. The service routes on the voice inside each `/speak` request,
+   * which is why no relaunch and no service restart is involved — the next sentence is a new voice.
+   */
+  async setSpeechVoice(voice: string): Promise<void> {
+    const current = this.store.speech()
+    if (current.voice === voice) return
+    this.store.setSpeech({ ...current, voice })
+    await this.publishChrome()
+    this.noteOtherStream(`speech: voice is now ${voice === '' ? 'the service default' : voice}`)
   }
 
   async setBallEnabled(enabled: boolean): Promise<void> {    this.store.setBallEnabled(enabled)
@@ -1831,6 +1962,90 @@ export class OrbRuntime {
   async setWakeEnabled(enabled: boolean): Promise<void> {
     this.store.setWakeEnabled(enabled)
     await this.publishChrome()
+  }
+
+  /**
+   * Switch which engine listens, as asked by the ball's own menu.
+   *
+   * Also a relaunch, for the reason {@link setWakeKeyword} gives: the engine is read out of the
+   * launch environment, and the page is built for exactly one of them. The threshold sidecar is only
+   * re-read when the engine change also forces a phrase change, because a threshold belongs to
+   * openWakeWord's classifier and the decoder ignores it.
+   *
+   * A phrase the new engine cannot run is replaced rather than left there: switching to the decoder
+   * while `hey_jarvis` is selected would otherwise leave the ball listening for an English word over
+   * a Chinese keyword file, which fires on nothing and reports nothing.
+   * @param engine - the engine the menu row just chose.
+   */
+  async setWakeEngine(engine: WakeEngine): Promise<void> {
+    const current = this.store.wake()
+    if (current.engine === engine) return
+    this.store.setWakeEngine(engine)
+    if (engine === 'sherpa' && !SHERPA_KEYWORDS.includes(current.keyword)) {
+      const keyword = SHERPA_KEYWORDS[0] ?? current.keyword
+      this.store.setWakeKeyword(keyword)
+      await this.applyKeywordThreshold(keyword)
+      console.error(`dsh-orb: ${engine} cannot listen for "${current.keyword}"; using "${keyword}"`)
+    }
+    await this.publishChrome()
+    if (process.platform === 'linux') return
+    this.halt()
+    await this.start()
+  }
+
+  /**
+   * Listen for a different phrase, as asked by the ball's own menu.
+   *
+   * The one wake setting that cannot take effect where it stands. The engine loads exactly one
+   * keyword ONNX when the page boots, and the asset whitelist the helper serves is built for that
+   * one keyword, so a new phrase means a new engine — not a message to the old one. `halt()` and
+   * `start()` are the pair that already rebuilds the ball for "disable the ball", so they are
+   * reused here rather than a second way to relaunch being invented: the ball vanishes for about
+   * a second and comes back listening for the new word, with this turn's own transcript gone.
+   *
+   * Nothing is written when the keyword did not change: a click on the row that is already live
+   * should not cost a blink.
+   * @param keyword - the model's file stem, taken from the menu's own list.
+   */
+  async setWakeKeyword(keyword: string): Promise<void> {
+    if (this.store.wake().keyword === keyword) return
+    this.store.setWakeKeyword(keyword)
+    await this.applyKeywordThreshold(keyword)
+    await this.publishChrome()
+    if (process.platform === 'linux') return
+    this.halt()
+    await this.start()
+  }
+
+  /**
+   * Take the threshold the new model was measured at, out of the sidecar deployed beside it.
+   *
+   * There is one `threshold` in `orb-wake.json` and it belongs to whichever keyword was last
+   * selected, so switching words without this would run 小弟 at 大肥鱼's 0.95: recall would still be
+   * 100% on held-out clips, but the near-miss false-positive rate measured 10% at that cut-off and
+   * 5% at 0.999. The number is not invented here — `wake_deploy.py` writes `<keyword>.json` from the
+   * model's own eval report, and a keyword deployed without one keeps the current setting rather
+   * than guessing.
+   * @param keyword - the file stem whose sidecar to read.
+   */
+  private async applyKeywordThreshold(keyword: string): Promise<void> {
+    const directory = this.store.wake().assetDirectory
+    if (directory === '') return
+    try {
+      const parsed = JSON.parse(await readFile(join(directory, `${keyword}.json`), 'utf8')) as {
+        threshold?: unknown
+      }
+      if (typeof parsed.threshold === 'number' && Number.isFinite(parsed.threshold)) {
+        this.store.setWakeThreshold(parsed.threshold)
+        console.error(`dsh-orb: ${keyword} measured at ${String(parsed.threshold)}; using that`)
+      }
+    } catch (error) {
+      // A missing or unreadable sidecar is not a failure: the model still runs, at the threshold the
+      // profile already holds. Only say so at debug volume.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error(`dsh-orb: ${keyword}.json could not be read: ${String(error)}`)
+      }
+    }
   }
 
   /**
@@ -1894,7 +2109,33 @@ export class OrbRuntime {
    * {@link createTranscriber} already promises.
    */
   async transcribe(audio: Buffer): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+    await this.keepHeard(audio)
     return await this.transcriber().transcribe(audio)
+  }
+
+  /**
+   * Write every recorded utterance to disk before it is recognised.
+   *
+   * The audio otherwise lives only in memory: the page holds a Blob, POSTs it, this process hands
+   * the bytes to the recogniser and nothing ever names them. That is right for the machine and
+   * useless for a person trying to hear what the microphone actually caught — whether the opening
+   * cue leaked in, whether the level is too low, whether the noise is in the room or in the
+   * pipeline. A file per utterance, named by the minute it arrived, is the only way to tell.
+   *
+   * Nothing depends on this: a failure to write is logged and the turn is transcribed anyway.
+   */
+  private async keepHeard(audio: Buffer): Promise<void> {
+    try {
+      const folder = dshHomePath('dsh-orb', 'heard')
+      await mkdir(folder, { recursive: true })
+      const at = new Date()
+      const stamp = `${at.getFullYear()}${String(at.getMonth() + 1).padStart(2, '0')}${String(at.getDate()).padStart(2, '0')}-${String(at.getHours()).padStart(2, '0')}${String(at.getMinutes()).padStart(2, '0')}${String(at.getSeconds()).padStart(2, '0')}`
+      const file = join(folder, `heard-${stamp}.wav`)
+      await writeFile(file, audio)
+      console.error(`dsh-orb: heard ${Math.round(audio.length / 1024)} KB -> ${file}`)
+    } catch (error) {
+      console.error(`dsh-orb: could not keep the recording: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   /**
@@ -1953,12 +2194,27 @@ export class OrbRuntime {
       this.run('wake', () => this.setWakeEnabled(record.enabled === true))
       return
     }
+    if (record.type === 'set-wake-word' && typeof record.keyword === 'string') {
+      const keyword = record.keyword
+      this.run('wake-word', () => this.setWakeKeyword(keyword))
+      return
+    }
+    if (record.type === 'set-wake-engine' && typeof record.engine === 'string') {
+      const engine: WakeEngine = record.engine === 'sherpa' ? 'sherpa' : 'openwake'
+      this.run('wake-engine', () => this.setWakeEngine(engine))
+      return
+    }
     if (record.type === 'set-reply' && typeof record.enabled === 'boolean') {
       this.run('reply', () => this.setReplyEnabled(record.enabled === true))
       return
     }
     if (record.type === 'set-chime' && typeof record.enabled === 'boolean') {
       this.run('chime', () => this.setChimeEnabled(record.enabled === true))
+      return
+    }
+    if (record.type === 'set-speech-voice' && isSpeechVoice(record.voice)) {
+      const voice = record.voice
+      this.run('speech-voice', () => this.setSpeechVoice(voice))
       return
     }
     if (record.type === 'transcribe' && typeof record.id === 'string' && typeof record.audioBase64 === 'string') {
@@ -2000,6 +2256,14 @@ export class OrbRuntime {
       // The first of three readouts on the hand-off: the ball asked, the page collected, or neither.
       // A wake that opens no microphone is one of those three and they look identical from outside.
       this.noteOtherStream('wake: the ball handed a turn to the main window')
+      // Which conversation the words belong to is decided before the page can collect the command:
+      // a command that goes out without a target would send them to whatever window is in front,
+      // and the page consumes the hand-off on its very next poll — a fifth of a second later.
+      this.voiceRoute = { pending: true, since: Date.now() }
+      void this.resolveVoiceTarget().then(
+        (sessionId) => { this.voiceRoute = { pending: false, since: 0, sessionId } },
+        () => { this.voiceRoute = { pending: false, since: 0 } },
+      )
       // Bring the main window forward, then let its page take the hand-off on its next poll. The
       // page presses the microphone button itself, so this process never types into or clicks on
       // the page it does not own.
@@ -2114,6 +2378,83 @@ export class OrbRuntime {
     }
   }
 
+  /**
+   * Find the conversation a wake turn belongs to, by title.
+   *
+   * Unfiltered on purpose: {@link historyRecords} narrows to the ball's own workspace so the ball's
+   * history list reads like the ball's history, while `语音总管` is an ordinary conversation in
+   * whatever workspace the user made it. Exact title first, then a title that merely contains it —
+   * the pinning the user described is a title, and a title is a thing people retype with a suffix.
+   *
+   * `subagent` rows are skipped: their titles are generated from the task, and a subagent that
+   * happened to be called 语音总管 is not a conversation anyone can talk to.
+   */
+  private async resolveVoiceTarget(): Promise<string | undefined> {
+    let exact: string | undefined
+    let loose: string | undefined
+    try {
+      const listed = await this.ctx.sessionController.list({}, AbortSignal.timeout(15_000))
+      const rows = Array.isArray(listed) ? listed : (listed as { items?: readonly unknown[] }).items ?? []
+      for (const row of rows) {
+        const record = asRecord(row)
+        if (record === undefined || typeof record.sessionId !== 'string') continue
+        if (record.origin === 'subagent') continue
+        const title = projection(record, 'title')
+        if (typeof title !== 'string') continue
+        const name = title.trim()
+        if (name === VOICE_TARGET_TITLE) {
+          if (exact === undefined) exact = record.sessionId
+        } else if (loose === undefined && name.includes(VOICE_TARGET_TITLE)) {
+          loose = record.sessionId
+        }
+      }
+    } catch (error) {
+      // A list that fails is a turn that goes where it used to go. Worth a line, not a failure.
+      this.noteOtherStream(`wake: could not list conversations: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
+    const found = exact ?? loose
+    this.noteOtherStream(found === undefined
+      ? `wake: no conversation titled 「${VOICE_TARGET_TITLE}」 — the words go to the focused window`
+      : `wake: 「${VOICE_TARGET_TITLE}」 is ${found}${exact === undefined ? ' (matched on a longer title)' : ''}`)
+    return found
+  }
+
+  /**
+   * Send one voice turn's words into the conversation the ball was told to use.
+   *
+   * The host's own prompt call, the same one the ball's session takes, so the words arrive as a new
+   * turn in that conversation with nothing typed into, clicked on, or switched in any window. When
+   * the target went away between the wake and the words, the lookup is repeated once here rather
+   * than dropping the sentence the user already spoke.
+   */
+  async sendVoiceText(text: string): Promise<{ ok: boolean; reason?: string }> {
+    const sessionId = this.voiceRoute.sessionId ?? await this.resolveVoiceTarget()
+    if (sessionId === undefined) {
+      return { ok: false, reason: `没有找到名为「${VOICE_TARGET_TITLE}」的对话` }
+    }
+    try {
+      await this.ctx.sessionController.prompt({
+        requestId: randomUUID(),
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text }],
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      }, new AbortController().signal)
+      this.noteOtherStream(`wake: the words went to 「${VOICE_TARGET_TITLE}」 (${sessionId})`)
+      return { ok: true }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      this.noteOtherStream(`wake: sending the words failed: ${reason}`)
+      return { ok: false, reason }
+    }
+  }
+
+  /** What {@link resolveVoiceTarget} currently finds, for the one route that answers "which one". */
+  async voiceTargetInfo(): Promise<{ title: string; sessionId: string | null }> {
+    return { title: VOICE_TARGET_TITLE, sessionId: (await this.resolveVoiceTarget()) ?? null }
+  }
+
   private resetTranscript(): void {
     this.blocks.clear()
     this.blockOrder.length = 0
@@ -2203,6 +2544,10 @@ export class OrbRuntime {
    */
   takeMainVoice(): MainVoiceCommand | null {
     if (this.mainVoiceRequest === 0) return null
+    // Still deciding where the words go. The hand-off is not consumed, so the page's next poll —
+    // 250 ms later — collects it whole, with its target. Past the wait the lookup is abandoned
+    // rather than held: a spoken sentence must not be lost to a slow list call.
+    if (this.voiceRoute.pending && Date.now() - this.voiceRoute.since < VOICE_ROUTE_WAIT_MS) return null
     this.mainVoiceRequest = 0
     const age = Date.now() - this.mainVoiceAt
     if (age > MAIN_VOICE_TTL_MS) {
@@ -2213,6 +2558,7 @@ export class OrbRuntime {
     // while the line above exists means the page is not running this plugin's client half.
     this.noteOtherStream(`wake: the main window collected the hand-off after ${age} ms`)
     const wake = this.store.wake()
+    const target = this.voiceRoute.sessionId
     return {
       start: true,
       noSpeechMs: MAIN_VOICE_NO_SPEECH_MS,
@@ -2221,7 +2567,29 @@ export class OrbRuntime {
       send: wake.dictation.autoSend || wake.continuous.enabled,
       continuous: wake.continuous.enabled,
       followUpMs: MAIN_VOICE_FOLLOW_UP_MS,
+      // Present only when a conversation carries the title. Its presence is what tells the page
+      // "post these words to the host" instead of "type them into the box in front of the user".
+      ...(target === undefined ? {} : { sendTo: target }),
     }
+  }
+
+  /**
+   * How the turn the main window recorded ended; see `OrbControl.noteVoiceResult`.
+   *
+   * The ball folds back the panel it opened for the wake on every ending that left nothing behind.
+   * `sent` and `draft` are the two that did leave something — words that are now in a conversation,
+   * or words waiting in the main window's box — so those keep the panel up.
+   */
+  noteVoiceResult(outcome: string, routed = false): void {
+    // Written first: a panel that folded and a panel that never opened look the same from outside,
+    // and the ending is the only line that tells them apart.
+    this.noteOtherStream(routed
+      ? `wake: the main window ended the turn: ${outcome} (routed, so no microphone comes back)`
+      : `wake: the main window ended the turn: ${outcome}`)
+    // `routed` is not an ending the ball folds on; it is the one that says "do not open the
+    // microphone again for this exchange". The reply the ball is about to read belongs to another
+    // conversation, and the page that recorded the turn cannot wait for it.
+    this.broadcast(routed ? { type: 'voice-result', outcome, routed: true } : { type: 'voice-result', outcome })
   }
 }
 
@@ -2276,10 +2644,6 @@ function toolName(data: unknown): string {
 function avatarMessage(store: ProfileStore): Record<string, unknown> {
   const version = Math.trunc(store.avatarVersion())
   const selection = store.avatarSelection()
-  if (selection.kind === 'preset') {
-    const src = avatarPresetSrc(selection.id)
-    if (src !== undefined) return { type: 'avatar', kind: 'preset', src, version }
-  }
   return { type: 'avatar', kind: selection.kind === 'custom' ? 'custom' : 'default', version }
 }
 

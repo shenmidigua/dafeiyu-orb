@@ -115,18 +115,23 @@ describe('profile preferences', () => {
       enabled: false,
       autoPlay: false,
       endpoint: 'http://127.0.0.1:8765',
+      // Empty is "whatever the service defaults to", which is how the field shipped and why an
+      // untouched profile keeps the voice it always had.
+      voice: '',
     })
 
-    store.setSpeech({ enabled: true, autoPlay: false, endpoint: 'http://127.0.0.1:9000' })
+    store.setSpeech({ enabled: true, autoPlay: false, endpoint: 'http://127.0.0.1:9000', voice: 'stella' })
     assert.deepEqual(new ProfileStore(path).speech(), {
       enabled: true,
       autoPlay: false,
       endpoint: 'http://127.0.0.1:9000',
+      voice: 'stella',
     })
     assert.deepEqual(JSON.parse(readFileSync(join(path, 'orb-speech.json'), 'utf8')), {
       enabled: true,
       autoPlay: false,
       endpoint: 'http://127.0.0.1:9000',
+      voice: 'stella',
     })
   })
 
@@ -143,6 +148,9 @@ describe('profile preferences', () => {
       enabled: false,
       autoPlay: true,
       endpoint: 'http://127.0.0.1:8765',
+      // A voice that is not one of the known ids is ignored rather than passed to the service, which
+      // would answer with a 400 the user could do nothing about.
+      voice: '',
     })
 
     writeFileSync(join(path, 'orb-speech.json'), '{')
@@ -193,26 +201,20 @@ describe('profile preferences', () => {
     assert.equal(isSpeechEndpoint(`http://${'x'.repeat(300)}`), false, 'a runaway value is refused')
   })
 
-  it('keeps one avatar per profile: a built-in pick replaces the upload and the other way round', () => {
+  it('keeps one avatar per profile, and ignores the deleted preset record', () => {
     const path = dir('avatar-preset')
     const store = new ProfileStore(path)
     assert.deepEqual(store.avatarSelection(), { kind: 'default' })
-
-    store.selectAvatarPreset('heart')
-    assert.deepEqual(store.avatarSelection(), { kind: 'preset', id: 'heart' })
-    assert.equal(store.readAvatar(), undefined)
-    assert.ok(store.avatarVersion() > 0)
 
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00])
     store.writeAvatar(png, 'image/png')
     assert.deepEqual(store.avatarSelection(), { kind: 'custom', mime: 'image/png' })
 
-    store.selectAvatarPreset('point')
-    assert.equal(existsSync(join(path, 'orb-avatar')), false)
-    assert.deepEqual(new ProfileStore(path).avatarSelection(), { kind: 'preset', id: 'point' })
-
-    // A preset that this build no longer ships falls back to the shipped GIF.
-    writeFileSync(join(path, 'orb-avatar.json'), JSON.stringify({ kind: 'preset', preset: 'gone' }))
+    // A profile saved by the version that had the built-in gallery still carries a preset record
+    // and no upload. The gallery is gone, so that record has to read as "the shipped image" — a
+    // profile must not be able to fail on the strength of a deleted feature.
+    rmSync(join(path, 'orb-avatar'))
+    writeFileSync(join(path, 'orb-avatar.json'), JSON.stringify({ kind: 'preset', preset: 'heart' }))
     assert.deepEqual(new ProfileStore(path).avatarSelection(), { kind: 'default' })
 
     // Meta written by the older shape still means "uploaded image".

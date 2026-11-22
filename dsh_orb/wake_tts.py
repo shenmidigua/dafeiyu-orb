@@ -20,19 +20,18 @@ assumed, by `wake_fmt_probe.py`. 24 kHz MP3 is taken and resampled here. The rat
 so `resample_poly` is an exact rational resampler rather than an approximation, and decoding is
 libsndfile's (1.2.2 reads MP3 natively), which is why no ffmpeg is needed on a machine that has none.
 
-The handshake is not duplicated here. `D:\\tools\\edgetts\\edge_server.py` is the read-aloud service
-the orb actually uses, and its constants are the ones that go out on the wire; the version string in
-particular is load-bearing and must not drift, so it is read from that file rather than retyped.
+The handshake is not written here at all any more. It used to be *executed out of*
+`D:\\tools\\edgetts\\edge_server.py` — that file used to carry the protocol constants (`WSS`, `TOKEN`,
+`config_message`), and a second process could not import it because it opens its log at module scope.
+That file was rewritten on 2026-11-16: the protocol moved into the `edge_tts` library it now vendors,
+the constants this generator read stopped existing, and the read-aloud service speaks the same
+protocol without exposing its pieces. So the generator calls `edge_tts` directly — the same library
+the service runs — and the version token problem is the library's to keep current instead of ours.
 
-Read, but not `import`ed — and that distinction cost an afternoon. The service opens its log file at
-module scope and holds the handle for its whole life. That is correct for the service; for a second
-process importing it, it is fatal, because the running service owns the file:
-
-    PermissionError: [Errno 13] Permission denied: 'D:\\tools\\edgetts\\logs\\edge-server.log'
-
-The service is running whenever the orb can speak, which is exactly when this generator wants to
-produce training audio. So `_load_service()` executes the source with that one line neutered and
-nothing else changed: same constants, same `sec_ms_gec`, same `config_message`, one owner of the log.
+`edge_tts` is found in the service's own vendor directory rather than installed for this interpreter,
+for one reason: the voice ids, the prosody parameters and the returned MP3 are the service's contract,
+and pinning the generator to the exact copy the service speaks through is what keeps the training
+audio and the spoken replies the same kind of object.
 
 Usage: wake_tts.py probe        # three voices, one phrase, report what came back
 """
@@ -55,36 +54,16 @@ import websockets
 from scipy.signal import resample_poly
 
 # The read-aloud service the orb speaks through. Its constants go on the wire here too.
-EDGE_SERVER = pathlib.Path(r"D:\tools\edgetts\edge_server.py")
+VENDOR = pathlib.Path(r"D:\tools\edgetts\vendor")
+if str(VENDOR) not in sys.path:
+    sys.path.insert(0, str(VENDOR))
 
+import edge_tts  # noqa: E402  (path set up just above)
 
-def _load_service() -> types.ModuleType:
-    """Load the read-aloud service's protocol half without touching its log file.
+# Every turn dials its own session inside the library, so the connection is only a handle: this class
+# exists because four other probes and the generator already call `open()`/`say()`/`close()` and
+# there is no reason for them to learn a second vocabulary.
 
-    Executed rather than imported so one line can be substituted: the service does
-    `_LOG_HANDLE = LOG_PATH.open("a", ...)` at module scope and keeps it, so a second process can
-    never import it while the service is up. Everything else — TOKEN, WSS, HEADERS, sec_ms_gec,
-    config_message, and above all CHROMIUM, whose value the endpoint validates — comes through
-    verbatim. Retyping those would let the client version quietly stop matching what Microsoft
-    expects, and the failure mode of that is a 403 with no hint in it.
-    """
-    source = EDGE_SERVER.read_text(encoding="utf-8")
-    original = '_LOG_HANDLE = LOG_PATH.open("a", encoding="utf-8")'
-    if original not in source:
-        raise RuntimeError(f"{EDGE_SERVER} no longer opens its log the way this expects; "
-                           "check whether the handle is still created at module scope")
-    source = source.replace(
-        original, '_LOG_HANDLE = open(__import__("os").devnull, "w", encoding="utf-8")')
-    # A native-fault dump is only meaningful in the process that owns the service.
-    source = source.replace("faulthandler.enable(file=_LOG_HANDLE)",
-                            "pass  # faulthandler deliberately not enabled for this loader")
-    module = types.ModuleType("edge_protocol")
-    module.__file__ = str(EDGE_SERVER)          # LOG_PATH is derived from it
-    exec(compile(source, str(EDGE_SERVER), "exec"), module.__dict__)
-    return module
-
-
-es = _load_service()
 
 # The endpoint accepts exactly three formats and every 16 kHz, riff, raw and ogg variant it is asked
 # for is refused with `Unsupported Edge output format` — see wake_fmt_probe.py. Of the three, this is
@@ -166,50 +145,45 @@ def write_wav(path: pathlib.Path, samples: np.ndarray) -> None:
 
 
 class Connection:
-    """One websocket, reused for many turns.
+    """One handle for many turns.
 
-    Reusing matters here for the same reason it mattered at playback: the handshake costs over a
-    second while a turn costs a fraction of one, so dialling per clip would make this generator an
-    order of magnitude slower than it needs to be.
+    It used to hold a websocket open across turns, because dialling cost over a second while a turn
+    cost a fraction of one. That is no longer how audio arrives: `edge_tts` opens a session per
+    utterance, and pretending otherwise would mean reimplementing it. Eight workers still run at
+    once — that concurrency, not the socket reuse, is what keeps a five-thousand-clip stage inside
+    half an hour.
     """
 
-    def __init__(self, ws) -> None:
-        self.ws = ws
+    def __init__(self) -> None:
         self.turns = 0
 
     @classmethod
     async def open(cls) -> "Connection":
-        url = (f"{es.WSS}&ConnectionId={uuid.uuid4().hex}&Sec-MS-GEC={es.sec_ms_gec()}"
-               f"&Sec-MS-GEC-Version={es.SEC_MS_GEC_VERSION}")
-        ws = await websockets.connect(url, additional_headers=es.HEADERS, max_size=None,
-                                      open_timeout=20.0)
-        # The format frame is per-session, so it is sent once, here, rather than per turn.
-        await ws.send(es.config_message(AUDIO_FORMAT))
-        return cls(ws)
+        """Kept as the one way to start: every caller already spells the stage this way."""
+        return cls()
 
     async def say(self, voice: str, text: str, rate: str = "+0%", pitch: str = "+0Hz",
                   timeout: float = 30.0) -> np.ndarray:
         """One request, returning 16 kHz mono float32."""
-        request_id = uuid.uuid4().hex
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        await self.ws.send(f"X-RequestId:{request_id}\r\nContent-Type:application/ssml+xml\r\n"
-                           f"X-Timestamp:{stamp}Z\r\nPath:ssml\r\n\r\n{ssml(voice, text, rate, pitch)}")
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
         pieces: list[bytes] = []
-        while True:
-            message = await asyncio.wait_for(self.ws.recv(), timeout)
-            if isinstance(message, bytes):
-                header_length = int.from_bytes(message[:2], "big")
-                if b"Path:audio" in message[2:2 + header_length]:
-                    pieces.append(message[2 + header_length:])
-            elif "Path:turn.end" in message:
-                break
+
+        async def collect() -> None:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    pieces.append(chunk["data"])
+
+        await asyncio.wait_for(collect(), timeout)
+        if not pieces:
+            # A voice id that the endpoint has retired comes back as a successful stream with no
+            # audio in it, so an empty answer has to be a failure here or the clip stage writes a
+            # zero-length wav and calls it a clip.
+            raise RuntimeError(f"no audio from {voice} for {text[:12]!r}")
         self.turns += 1
         return to_pcm16(b"".join(pieces))
 
     async def close(self) -> None:
-        await self.ws.close()
-
-
+        """Nothing to hang up: the library closed the session at the end of the turn."""
 async def probe() -> int:
     """Confirm the decode-and-resample chain, and report what it produced.
 

@@ -943,7 +943,10 @@ describe('the hover shows the ball before it plays the clip', () => {
     // Hidden ball: only the strip counts, and its own margin — the peek has not been raised, so
     // there is nothing on the screen but a 34px line to aim at.
     assert.equal(at(2030), true, 'the middle of the strip is the strip')
-    assert.equal(at(2010), true, `the strip counts out to ${DOCK_ARRIVE_MARGIN_PX}px past its own edge`)
+    assert.equal(at(STRIP.left - (DOCK_ARRIVE_MARGIN_PX - 1)), true,
+      `the strip counts out to ${DOCK_ARRIVE_MARGIN_PX - 1}px past its own edge`)
+    assert.equal(at(STRIP.left - (DOCK_ARRIVE_MARGIN_PX + 1)), false,
+      `and ${DOCK_ARRIVE_MARGIN_PX + 1}px past it is off the strip`)
     assert.equal(at(1980), false, 'but not anywhere near the ball while it is still hidden')
 
     probe.peek()

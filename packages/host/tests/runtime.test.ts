@@ -325,6 +325,55 @@ describe('ball control socket', { concurrency: 1 }, () => {
     }
   })
 
+  // The wake-word hand-off names the conversation its words belong to, so the page can post them
+  // there instead of typing them into whichever window is in front. The pin is a title, so the
+  // lookup has to be exact-first and has to refuse a subagent that merely carries the name.
+  it('points a wake hand-off at the conversation named 语音总管', async () => {
+    const harness = boot()
+    const client = await connect(harness.runtime)
+    try {
+      harness.listItems.push(
+        { sessionId: 'session-voice', cwd: orb, origin: 'user', projections: { values: { agentPreset: 'computer-use', title: '语音总管' } } },
+        { sessionId: 'session-sub', cwd: orb, origin: 'subagent', projections: { values: { title: '语音总管' } } },
+        { sessionId: 'session-longer', cwd: orb, origin: 'user', projections: { values: { agentPreset: 'computer-use', title: '语音总管 · 备用' } } },
+        { sessionId: 'session-other', cwd: orb, origin: 'user', projections: { values: { agentPreset: 'computer-use', title: '凌晨一点播报天气' } } },
+      )
+      client.send({ type: 'main-voice-start' })
+      // The hand-off is held while the title is being looked up, then handed over whole.
+      let command = harness.runtime.takeMainVoice()
+      const started = Date.now()
+      while (command === null && Date.now() - started < 3_000) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        command = harness.runtime.takeMainVoice()
+      }
+      assert.ok(command !== null, 'the hand-off has to arrive, with its target or without one')
+      assert.equal(command.sendTo, 'session-voice', 'the exact title wins over a longer one that contains it')
+
+      const delivered = await harness.runtime.sendVoiceText('今天几号')
+      assert.equal(delivered.ok, true)
+      assert.equal(harness.calls.prompt.at(-1)?.sessionId, 'session-voice')
+
+      // The pin goes away between two wakes: the next hand-off is the ordinary one — no target, so
+      // the page falls back to typing into the visible conversation rather than failing.
+      harness.listItems.splice(0, harness.listItems.length, harness.listItems.at(-1) as Row)
+      client.send({ type: 'main-voice-start' })
+      let second = harness.runtime.takeMainVoice()
+      const again = Date.now()
+      while (second === null && Date.now() - again < 3_000) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        second = harness.runtime.takeMainVoice()
+      }
+      assert.ok(second !== null)
+      assert.equal(second.sendTo, undefined, 'no pin means the old behaviour, not a failed turn')
+      const refused = await harness.runtime.sendVoiceText('你在吗')
+      assert.equal(refused.ok, false, 'and words that arrive after it went away are said to have failed')
+      assert.equal(harness.calls.prompt.length, 1, 'nothing is retargeted to whichever session was last used')
+    } finally {
+      client.socket.end()
+      harness.runtime.halt()
+    }
+  })
+
   it('skips the helper chrome windows the helper reports', async () => {
     const harness = boot()
     const client = await connect(harness.runtime)
@@ -587,7 +636,7 @@ describe('ball control socket', { concurrency: 1 }, () => {
     }
   })
 
-  it('tells the ball which avatar to load, on connect and after a pick', async () => {
+  it('tells the ball which avatar to load, on connect and after an upload', async () => {
     const harness = boot()
     try {
       const shipped = await connect(harness.runtime)
@@ -598,12 +647,12 @@ describe('ball control socket', { concurrency: 1 }, () => {
       })
       shipped.socket.destroy()
 
-      harness.store.selectAvatarPreset('cheer')
+      // The pick is an uploaded image now: the built-in animation gallery is gone, so the message
+      // has two shapes only, and `custom` names a version the helper refetches through the route.
+      harness.store.writeAvatar(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]), 'image/png')
       const picked = await connect(harness.runtime)
-      const message = picked.messages.find((entry) => entry.type === 'avatar') as { kind: string; src: string; version: number }
-      assert.equal(message.kind, 'preset')
-      // The ball resolves this against its own document, so no bytes cross the socket.
-      assert.equal(message.src, 'avatars/cheer.gif')
+      const message = picked.messages.find((entry) => entry.type === 'avatar') as { kind: string; version: number }
+      assert.equal(message.kind, 'custom')
       assert.ok(message.version > 0)
       picked.socket.destroy()
     } finally {

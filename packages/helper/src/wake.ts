@@ -14,10 +14,11 @@
  */
 
 import { protocol } from 'electron'
-import { createReadStream } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import { Readable } from 'node:stream'
+import { isWakeEngine, WAKE_ENGINE_DEFAULT, type WakeEngineId } from './wake-engines.ts'
 
 /** Custom scheme the ball page loads wake assets from. */
 export const WAKE_SCHEME = 'dsh-wake'
@@ -77,11 +78,31 @@ const MIME: Readonly<Record<string, string>> = Object.freeze({
  */
 export const WAKE_VOICE_DIRECTORY = 'voices'
 
-/** One WAV inside the wake confirmation folder, and nothing else. */
-const VOICE_FILE = /^voices\/[A-Za-z0-9._-]+\.wav$/
+/**
+ * One WAV inside the wake confirmation folder, and nothing else.
+ *
+ * Letters rather than ASCII on purpose: the takes are named for what they say (`德拉曼-3-我在请您吩咐.wav`), because a person opening the folder is the one who has to tell them apart, and a voice id plus a number tells them nothing. Everything a filesystem chokes on — separators, wildcards, quotes — stays out, and `..` is rejected before this test by `wakeVoicePath`.
+ */
+const VOICE_FILE = /^voices\/[\p{L}\p{N}._-]+\.wav$/u
+
+/**
+ * The three files sherpa-onnx's keyword spotter needs, under `assets/kws`.
+ *
+ * Named here rather than inside `wake-sherpa.ts` so the availability check and the loader cannot
+ * disagree about what "the models are there" means: a package missing one of these loads nothing,
+ * and the menu should grey the engine out instead of letting a click fail.
+ */
+const KWS_MODEL_FILES: readonly string[] = Object.freeze([
+  'encoder-epoch-12-avg-2-chunk-16-left-64.onnx',
+  'decoder-epoch-12-avg-2-chunk-16-left-64.onnx',
+  'joiner-epoch-12-avg-2-chunk-16-left-64.onnx',
+  'tokens.txt',
+])
 
 /** Tuning the engine reads before it starts. */
 export interface WakeConfig {
+  /** Which engine listens: the openWakeWord classifiers, or the sherpa-onnx decoder. */
+  readonly engine: WakeEngineId
   /** Absolute model directory, or `''` when the host found none. */
   readonly assetDirectory: string
   /** openWakeWord keyword name. */
@@ -123,6 +144,7 @@ export interface DictationConfig {
 
 /** What a helper started by an older host, or without assets, uses. */
 export const WAKE_DEFAULTS: WakeConfig = Object.freeze({
+  engine: WAKE_ENGINE_DEFAULT,
   assetDirectory: '',
   keyword: 'hey_jarvis',
   threshold: 0.5,
@@ -146,6 +168,7 @@ export function readWakeConfig(env: NodeJS.ProcessEnv = process.env): WakeConfig
   const directory = typeof env[ASSETS_ENV] === 'string' ? env[ASSETS_ENV].trim() : ''
   const parsed = parseConfig(env[CONFIG_ENV])
   return {
+    engine: isWakeEngine(parsed?.engine) ? parsed.engine : WAKE_DEFAULTS.engine,
     assetDirectory: directory === '' ? '' : resolve(directory),
     keyword: readKeyword(parsed?.keyword),
     threshold: readThreshold(parsed?.threshold),
@@ -187,8 +210,24 @@ function readBounded(value: unknown, fallback: number, min: number, max: number)
   return Math.min(max, Math.max(min, Math.round(value)))
 }
 
-/** Whether the config names a directory at all; the page decides if it is usable. */
-export function wakeAvailable(config: WakeConfig): boolean {
+/**
+ * Whether this helper can honour the configured engine at all.
+ *
+ * The two engines look for different things: openWakeWord needs the host-seeded model directory and
+ * that directory's files are served to the page, while sherpa-onnx reads models that ship **inside
+ * this package** (`assets/kws`) and needs no external folder. A profile pointed at the decoder but
+ * with no `dsh-voice-dialog` assets is therefore still usable — and that is the case this split
+ * exists for.
+ * @param config - the launch configuration.
+ * @param assets - this helper's own asset folder, which holds `kws`.
+ */
+export function wakeAvailable(config: WakeConfig, assets = ''): boolean {
+  if (config.engine === 'sherpa') {
+    if (assets === '') return false
+    const folder = join(assets, 'kws')
+    return [...KWS_MODEL_FILES, `keywords-${config.keyword}.txt`]
+      .every((name) => existsSync(join(folder, name)))
+  }
   return config.assetDirectory !== ''
 }
 

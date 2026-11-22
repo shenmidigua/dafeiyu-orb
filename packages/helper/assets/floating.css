@@ -1559,9 +1559,75 @@ body.asking #panel {
   color: var(--pin, #8a8f98);
 }
 
+/* The conversation is text, so it can be copied. The page's own `html, body` rule turns selection
+   off — the ball is a translucent overlay over somebody else's work, and a stray drag selecting a
+   label behind it would look like a bug — but these words belong to the user and get the same
+   treatment the transcript had: draggable, double-clickable, Ctrl+C-able. The cursor says so too. */
+#bubble-log,
+.bubble-text {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
 /* A question is the one thing on this card that has to be answered, and it gets the full
    420×520 (see `body.asking` above). A chat from a moment ago would only squeeze the options,
    so it steps aside while the question is up. */
 body.asking #bubble-log {
   display: none;
+}
+
+/* ── narration folds (2026-11-20) ───────────────────────────────────────────
+   A tool-calling answer narrates what it is about to do, then what it found, then answers — and the
+   main window narrates per attempt. Every one of those landed in the card as its own message, so the
+   card read like the model thinking out loud and the answer sat at the bottom of it. The row that a
+   later message replaced is folded instead of deleted: two dim lines and a toggle. Deleting would have
+   been simpler, and it would have made the card claim the answer came from nowhere. */
+.bubble-msg[data-folded] {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.bubble-msg[data-folded][data-role="me"] {
+  align-items: flex-end;
+}
+
+/* Dim and without its bubble shape, so a folded line reads as asides rather than as something the
+   ball is still saying. The corner radius goes with it: there is no tail to point at nobody. */
+.bubble-msg[data-folded] .bubble-text {
+  padding: 2px 2px 0;
+  border-radius: 0;
+  font-size: 12.5px;
+  background: transparent;
+  color: var(--pin, #8a8f98);
+}
+
+/* Two lines and an ellipsis while folded, the whole text once the toggle opens it. `-webkit-line-clamp`
+   needs the box display; `overflow` is what actually cuts what is left over. */
+.bubble-msg[data-folded]:not([data-open]) .bubble-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+/* A button rather than "click the bubble": the bubble is selectable text now, and the click that
+   would fold a paragraph is the same click that places a caret in it. */
+.bubble-more {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--pin, #8a8f98);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.bubble-more:hover {
+  color: var(--dsw-alias-label-primary, #23252b);
 }

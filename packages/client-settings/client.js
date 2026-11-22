@@ -19,17 +19,8 @@ window.__ModuleLoader__.load({
       ball: '启用悬浮球',
       ballDescription: '关闭后插件仍在，Computer Use 仍可在主窗口使用。',
       avatarTitle: '悬浮球头像',
-      avatarDescription: '点一张内置动图，或选择自己的图片。上传支持 GIF、PNG、WebP，2 MB 以内。',
+      avatarDescription: '选择自己的图片。上传支持 GIF、PNG、WebP，2 MB 以内。',
       avatarAlt: '悬浮球头像预览',
-      avatarBuiltin: '内置动图',
-      avatarPresetNames: {
-        point: '指点',
-        rice: '干饭',
-        heart: '比心',
-        cheer: '欢呼',
-        cheeks: '托腮',
-        smile: '微笑',
-      },
       chooseImage: '选择图片',
       restoreDefault: '恢复默认',
       tooLarge: '图片超过 2 MB。',
@@ -107,17 +98,8 @@ window.__ModuleLoader__.load({
       ball: 'Enable the floating ball',
       ballDescription: 'Turning this off keeps the plugin loaded. Computer Use stays available in the main window.',
       avatarTitle: 'Ball image',
-      avatarDescription: 'Pick a built-in animation, or choose your own image. Uploads accept GIF, PNG, and WebP up to 2 MB.',
+      avatarDescription: 'Choose your own image. Uploads accept GIF, PNG, and WebP up to 2 MB.',
       avatarAlt: 'Floating-ball image preview',
-      avatarBuiltin: 'Built-in animations',
-      avatarPresetNames: {
-        point: 'Point',
-        rice: 'Rice',
-        heart: 'Heart',
-        cheer: 'Cheer',
-        cheeks: 'Cheeks',
-        smile: 'Smile',
-      },
       chooseImage: 'Choose image',
       restoreDefault: 'Restore default',
       tooLarge: 'The image is larger than 2 MB.',
@@ -617,8 +599,7 @@ window.__ModuleLoader__.load({
                   disabled,
                   onClick: () => { void mutate('/.dsh-orb/avatar/restore', {}) },
                 }, text.restoreDefault))),
-            avatarMessage ? h('p', { className: 'dsh-orb-set-error', role: 'alert' }, avatarMessage) : null,
-            presetGallery(text, snap, disabled, mutate)),
+            avatarMessage ? h('p', { className: 'dsh-orb-set-error', role: 'alert' }, avatarMessage) : null),
           card(text.overlayTitle, text.overlayDescription, h(ModelPicker, {
             label: text.overlayTitle,
             catalog: state.catalog,
@@ -764,31 +745,6 @@ window.__ModuleLoader__.load({
         invalid ? h('p', { className: 'dsh-orb-set-error', role: 'alert' }, props.text.speechEndpointInvalid) : null)
     }
 
-    /** The shipped GIFs as clickable animated thumbnails; the host owns the list, this page the names. */
-    function presetGallery(text, snap, disabled, mutate) {
-      const presets = Array.isArray(snap.avatarPresets) ? snap.avatarPresets : []
-      if (presets.length === 0) return null
-      const names = text.avatarPresetNames || {}
-      return h('div', { className: 'dsh-orb-set-presets' },
-        h('p', { className: 'dsh-orb-set-presets-title', id: 'dsh-orb-presets-label' }, text.avatarBuiltin),
-        h('div', { className: 'dsh-orb-set-presets-row', role: 'group', 'aria-labelledby': 'dsh-orb-presets-label' },
-          ...presets.map((preset) => {
-            const name = names[preset.id] || preset.id
-            const selected = snap.avatarPresetId === preset.id
-            return h('button', {
-              key: preset.id,
-              type: 'button',
-              className: `dsh-orb-set-preset${selected ? ' is-selected' : ''}`,
-              'aria-pressed': selected ? 'true' : 'false',
-              title: name,
-              disabled,
-              onClick: () => { void mutate('/.dsh-orb/avatar/preset', { preset: preset.id }) },
-            },
-              h('img', { src: preset.url, alt: '', draggable: false }),
-              h('span', null, name))
-          })))
-    }
-
     function tccCard(text, snap, disabled, mutate) {
       const name = snap.tcc.appName || ''
       return h('section', { className: 'dsh-orb-set-card' },
@@ -824,14 +780,6 @@ window.__ModuleLoader__.load({
 .dsh-orb-set-row, .dsh-orb-set-avatar-row, .dsh-orb-set-tcc { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
 .dsh-orb-set h3, .dsh-orb-set h4 { margin: 0; font-size: 14px; }
 .dsh-orb-set-avatar { width: 72px; height: 72px; border-radius: 50%; object-fit: cover; background: color-mix(in srgb, currentColor 8%, transparent); }
-.dsh-orb-set-presets { margin-top: 10px; }
-.dsh-orb-set-presets-title { margin: 0; font-size: 12px; }
-.dsh-orb-set-presets-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.dsh-orb-set-preset { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 72px; padding: 5px 2px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
-.dsh-orb-set-preset img { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; background: color-mix(in srgb, currentColor 8%, transparent); }
-.dsh-orb-set-preset span { font-size: 11px; line-height: 1.2; }
-.dsh-orb-set-preset:hover { border-color: color-mix(in srgb, currentColor 20%, transparent); }
-.dsh-orb-set-preset.is-selected { border-color: var(--dsw-alias-button-info-fill, #2f6fed); }
 .dsh-orb-set-actions, .dsh-orb-set-pickers { display: flex; gap: 8px; align-items: center; }
 .dsh-orb-set-button, .dsh-orb-set select { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); background: transparent; color: inherit; border-radius: 8px; padding: 6px 10px; font: inherit; }
 .dsh-orb-set-ghost { border-color: transparent; }
@@ -1003,7 +951,11 @@ window.__ModuleLoader__.load({
       // person who learned "up means it listens, down means it stopped" on the ball hears the same
       // language here. Nothing to read while the microphone is open, so sound is the only feedback
       // this page can give at all.
-      const CUE_OPEN = [{ at: 0, freq: 1568, len: 0.08 }]
+      //
+      // `CUE_OPEN` is the two-note "叮-咚" (988 then 1319 Hz) lifted from dsh-voice-wake's
+      // `playWakeChime()`: a single bright blip said "something happened", two notes that land one
+      // after the other say "receiver open", which is the thing this cue is for.
+      const CUE_OPEN = [{ at: 0, freq: 988, len: 0.12 }, { at: 0.12, freq: 1319, len: 0.24 }]
       const CUE_HEARD = [{ at: 0, freq: 1320, len: 0.1 }, { at: 0.12, freq: 880, len: 0.18 }]
       const CUE_EMPTY = [{ at: 0, freq: 392, len: 0.09 }, { at: 0.16, freq: 294, len: 0.16 }]
       const CUE_SHUT = [{ at: 0, freq: 440, len: 0.13 }]
@@ -1057,16 +1009,27 @@ window.__ModuleLoader__.load({
           gain.connect(ctx.destination)
           const start = ctx.currentTime + 0.02
           const oscs = []
+          const faders = []
           for (const note of notes) {
             const osc = ctx.createOscillator()
+            // Every note gets a 20 ms fade of its own before it stops. Stopping a sine dead leaves a
+            // step in the waveform, and on a two-note cue the step lands between the notes, where it
+            // is heard as a tick on an otherwise clean chime rather than as part of it.
+            const fader = ctx.createGain()
             // A note may name its own waveform; the ball's cues are all sine, and only the sent cue
             // wants to sound like a different instrument.
             osc.type = note.type === undefined ? 'sine' : note.type
             osc.frequency.setValueAtTime(note.freq, start + note.at)
-            osc.connect(gain)
+            osc.connect(fader)
+            fader.connect(gain)
+            const end = start + note.at + note.len
+            fader.gain.setValueAtTime(1, start + note.at)
+            fader.gain.setValueAtTime(1, end - 0.02)
+            fader.gain.linearRampToValueAtTime(0, end)
             osc.start(start + note.at)
-            osc.stop(start + note.at + note.len)
+            osc.stop(end + 0.01)
             oscs.push(osc)
+            faders.push(fader)
           }
           // The envelope outlives the last note by a fixed tail, so the cue rings out to silence
           // instead of being cut off, and the node is dropped once it has.
@@ -1080,6 +1043,9 @@ window.__ModuleLoader__.load({
           ringing = { gain, oscs }
           setTimeout(() => {
             try { gain.disconnect() } catch { /* already gone */ }
+            for (const fader of faders) {
+              try { fader.disconnect() } catch { /* already gone */ }
+            }
             if (ringing !== undefined && ringing.gain === gain) ringing = undefined
           }, (total + 0.5) * 1000)
         } catch {
@@ -1107,8 +1073,144 @@ window.__ModuleLoader__.load({
       try {
         document.addEventListener('pointerdown', armAudio, true)
         document.addEventListener('keydown', armAudio, true)
+        warmOpenCue()
       } catch {
         /* a document without listeners is a document without cues */
+      }
+
+      // The microphone-open chime, baked into the page.
+      //
+      // This is the one cue whose job is to answer immediately, and it used to be assembled
+      // oscillator by oscillator at the exact moment the device opened. Assembling it is
+      // microseconds, but a cue exists to remove doubt about whether anything happened, so the
+      // cheapest version of it is none at all: the wav below is that cue at full scale, decoded
+      // once while nothing is happening, and played by a buffer source that has nothing left to do
+      // but start. The level stays in the playback gain, so 0.7 still leaves the same headroom it
+      // had when the notes were synthesised.
+      const CUE_OPEN_WAV = 'data:audio/wav;base64,UklGRmJPAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YT5PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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0f8cAGIAmgC9AMUAsgCGAEcA/v+2/3j/Tf87/0T/aP+h/+f/MAByAKQAvwDAAKUAdAAyAOn/pP9s/0j/Pv9P/3j/tf/7/0IAgACsAL8AuACXAGEAHQDW/5T/Yv9F/0P/W/+K/8n/EABUAIwAsQC9AK4AhwBNAAkAw/+G/1r/Rf9K/2n/nP/d/yMAZACXALQAuACjAHcAOgD1/7L/ev9U/0f/U/93/6//8f81AHIAnwC1ALIAlgBlACYA4v+i/2//Uf9K/17/h//C/wUARwB/AKUAtACqAIgAUwATAND/lP9n/0//UP9q/5j/1f8XAFYAiQCpALEAoAB5AEEAAAC//4f/YP9Q/1j/d/+q/+j/KQBlAJIAqwCsAJQAaQAuAO3/r/98/1z/Uv9h/4b/u//6/zoAcgCZAKsApQCIAFgAGwDb/6H/c/9Z/1f/bP+V/83/DQBKAH0AngCpAJwAegBGAAkAy/+U/2z/Wf9d/3j/pf/f/x4AWACGAKEApQCSAGsANQD3/7v/if9n/1r/Zf+F/7b/8f8vAGUAjQCiAJ8AhwBbACMA5v+t/3//Y/9d/27/k//H/wMAPgBwAJMAoQCYAHoASwASANb/oP93/2L/Yv95/6L/2P8UAEwAegCXAJ4AjwBtADsAAQDH/5X/cf9i/2n/hf+y/+n/JABZAIIAmQCaAIUAXgAqAPD/uP+L/23/ZP9x/5L/wf/6/zMAZQCIAJkAlAB6AE8AGgDg/6z/g/9r/2j/e/+f/9L/CgBBAG8AjQCXAIwAbgBAAAkA0f+g/3z/av9u/4X/rv/i/xoATgB3AI8AlACDAGEAMAD5/8P/lv93/2z/df+R/73/8v8pAFkAfgCQAI8AeQBTACEA6v+3/43/dP9u/33/nv/M/wEANgBkAIMAkACJAG4ARAARANv/q/+G/3P/c/+G/6v/2/8QAEMAbACGAI4AgQBiADYAAgDO/6H/gf9z/3j/kf+5/+r/HwBPAHQAiACKAHgAVQAnAPP/wf+Y/33/df+A/5z/x//5/ywAWQB5AIgAhABuAEgAGADl/7X/kP97/3j/iP+p/9X/CAA5AGIAfgCHAH4AYwA6AAkA1/+r/4r/ev99/5H/tv/k/xYARQBqAIAAhAB2AFcALAD7/8v/ov+G/3v/g/+c/8P/8v8jAE8AcACBAIAAbQBLAB4A7f+//5r/g/9+/4r/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yf/J/9D/3v/x/wUAGQApADMANgAyACYAFQABAO3/2//P/8n/y//U/+T/9/8LAB4ALAA0ADUALgAhAA8A+//o/9j/zf/K/87/2f/p//z/EAAiAC4ANAAzACoAHAAKAPb/4//V/8z/y//R/97/7/8CABUAJQAwADQAMAAmABcABADx/9//0//M/83/1f/i//T/CAAaACgAMQAzAC4AIgARAP7/7P/c/9H/zP/P/9n/6P/6/w0AHgArADEAMQAqAB0ADAD5/+f/2f/Q/83/0v/d/+3///8SACEALAAxAC8AJgAYAAcA9P/j/9b/z//P/9X/4f/y/wQAFgAkAC4AMQAtACIAEwABAO//3//U/8//0f/Z/+b/9/8JABoAJwAvAC8AKgAeAA4A/P/r/9z/0//Q/9P/3f/r//z/DgAeACkALwAuACYAGQAJAPf/5//a/9L/0f/W/+H/8P8BABMAIQArAC4AKwAiABUABADy/+P/2P/S/9L/2f/l//X/BgAXACQALAAtACkAHgAQAP//7v/g/9b/0v/U/93/6v/6/wsAGgAmACwALAAmABoACwD6/+r/3f/V/9P/1//g/+7///8PAB4AKAAsACoAIgAWAAYA9v/m/9v/1P/U/9n/5P/z/wQAEwAgACkAKwAoAB8AEQABAPH/4//Z/9T/1f/d/+n/+P8IABcAIwApACoAJQAbAA0A/f/t/+D/2P/V/9j/4P/t//z/DAAaACUAKgApACIAFwAIAPj/6v/e/9f/1f/a/+T/8f8BABAAHQAmACkAJwAfABMABAD0/+b/3P/W/9f/3f/o//b/BQAUACAAJwApACUAGwAOAP//8P/j/9r/1//Z/+D/7P/6/wkAFwAiACcAJwAiABgACgD7/+3/4f/Z/9f/2//j//D///8NABoAIwAnACYAHwAUAAYA9//p/9//2f/Y/93/5//0/wMAEQAdACQAJwAkABwAEAACAPP/5v/d/9n/2v/g/+v/+P8HABQAHwAlACYAIQAYAAwA/f/v/+T/3P/Z/9z/4//v//z/CwAXACEAJQAlAB8AFQAIAPn/7P/i/9v/2v/e/+b/8/8AAA4AGgAiACUAIwAcABEABAD2/+n/4P/b/9v/4P/q//f/BAASABwAIwAkACEAGQANAAAA8v/m/97/2//d/+P/7v/7/wgAFQAeACMAIwAeABUACQD8/+//5P/d/9v/3//m//H//v8MABcAHwAjACIAHAASAAUA+P/s/+L/3f/c/+H/6f/1/wIADwAZACAAIwAgABkADgACAPX/6f/h/93/3v/j/+3/+f8GABIAGwAhACIAHgAWAAsA/v/x/+f/4P/d/9//5v/w//3/CQAVAB0AIQAhABwAEwAHAPr/7v/l/9//3v/h/+n/9P8AAAwAFwAeACEAHwAZAA8AAwD3/+z/4//f/9//4//s//f/BAAPABkAHwAgAB0AFgAMAAAA9P/p/+L/3//g/+b/7//7/wcAEgAbAB8AIAAbABMACAD8//H/5//h/9//4v/p//P//v8KABQAHAAfAB4AGQAQAAUA+f/u/+b/4f/g/+T/6//2/wIADQAXAB0AHwAdABYADQACAPb/7P/k/+H/4f/m/+7/+f8FABAAGAAdAB4AGwAUAAoA/v/z/+r/4//h/+P/6f/y//3/CAASABoAHgAdABkAEQAGAPv/8P/o/+P/4f/k/+v/9f8AAAsAFAAbAB0AHAAXAA4AAwD4/+7/5v/i/+L/5v/u//j/AwAOABYAHAAdABoAFAALAAAA9f/s/+X/4v/j/+n/8f/7/wYAEAAYABwAHAAZABEACAD9//P/6v/k/+P/5f/r//T//v8JABIAGQAcABsAFgAPAAUA+v/w/+j/5P/j/+f/7f/3/wEACwAUABoAHAAaABQADAACAPf/7v/n/+T/5P/p//D/+v8EAA4AFgAaABsAGAASAAkA///1/+z/5v/k/+b/6//z//3/BwAQABcAGgAaABYADwAGAPz/8v/q/+b/5P/n/+3/9v8AAAkAEgAYABoAGQAUAAwAAwD5//D/6f/m/+b/6f/w//n/AgALABMAGAAZABcAEQAJAAAA9//v/+n/5//o/+z/8//8/wUADQATABcAFwAUAA4ABgD+//X/7v/q/+j/6v/v//b//v8HAA4AEwAWABUAEgALAAQA+//0/+7/6v/q/+z/8f/5/wEACAAPABMAFQATAA8ACQABAPn/8//u/+v/6//v//T/+/8DAAoADwATABMAEQANAAYA///4//L/7v/s/+3/8f/3//3/BAALABAAEgASAA8ACgAEAP3/9//x/+7/7f/v//P/+f///wYADAAPABEAEAANAAgAAgD7//b/8f/v/+//8f/1//v/AQAHAAwADwAQAA4ACwAGAAAA+v/1//H/8P/w//P/9//9/wMACAAMAA4ADwANAAkABAD+//n/9f/y//H/8v/1//n///8EAAkADAAOAA0ACwAHAAIA/f/4//T/8v/y//T/9//7/wAABQAJAAwADQAMAAkABQABAPz/+P/1//P/8//1//n//f8BAAYACQALAAsACgAHAAQA///7//f/9f/0//X/9//6//7/AgAGAAkACgAKAAkABgACAP7/+v/3//X/9f/2//j//P///wMABgAJAAkACQAHAAQAAQD9//r/+P/2//b/9//6//3/AAAEAAYACAAJAAgABgADAAAA/f/6//j/9//3//n/+//+/wEABAAGAAcACAAHAAUAAgD///z/+v/4//j/+P/6//z///8CAAQABgAHAAYABQADAAEA/v/8//r/+f/5//r/+//9/wAAAgAEAAUABgAFAAQAAgAAAP7//P/6//r/+v/7//z//v8AAAIABAAFAAUABAADAAEA///+//z/+//6//v//P/9////AQACAAMABAAEAAMAAgABAP///f/8//v/+//8//3//v///wEAAgADAAMAAwACAAEAAAD///3//f/8//z//f/9////AAABAAIAAgADAAIAAgABAAAA///+//3//f/9//3//v///wAAAQABAAIAAgABAAEAAAD//////v/+//7//v/+//////8AAAEAAQABAAEAAQAAAAAA//////7//v/+//7//////wAAAAAAAAAAAAAAAAAAAAAAAP////////////////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+      let openCueBuffer
+      let openCueLoading = false
+      /** Decode the cue once, off the path to the first wake. Failure just means synthesising. */
+      function warmOpenCue() {
+        try {
+          if (openCueBuffer !== undefined || openCueLoading) return
+          const Ctor = globalThis.AudioContext || globalThis.webkitAudioContext
+          if (typeof Ctor !== 'function') return
+          if (toneCtx === undefined || toneCtx.state === 'closed') toneCtx = new Ctor()
+          const ctx = toneCtx
+          openCueLoading = true
+          void fetch(CUE_OPEN_WAV)
+            .then((response) => response.arrayBuffer())
+            .then((bytes) => ctx.decodeAudioData(bytes))
+            .then((buffer) => { openCueBuffer = buffer })
+            .catch(() => { /* the synthesis path still works */ })
+            .finally(() => { openCueLoading = false })
+        } catch {
+          /* no webaudio here; the synthesis path would fail the same way */
+        }
+      }
+      /**
+       * Keep the output stream open, with something inaudible in it.
+       *
+       * A cue is 0.44 s of sound after minutes of silence, and a context whose output has been idle
+       * may have to reopen a device stream at the moment it is asked to play — that reopen is what a
+       * crack, a burst of "滋啦", sounds like, and it lands exactly on the cue. A looping buffer at
+       * −80 dBFS costs nothing anybody can hear and means the stream is never idle, so the cue starts
+       * on an output that has been running all along.
+       */
+      let warmOutput
+      function keepOutputWarm(ctx) {
+        if (warmOutput !== undefined) return
+        try {
+          const frames = Math.max(1, Math.round(ctx.sampleRate * 0.5))
+          const buffer = ctx.createBuffer(1, frames, ctx.sampleRate)
+          const data = buffer.getChannelData(0)
+          for (let at = 0; at < data.length; at += 1) data[at] = (Math.random() * 2 - 1) * 1e-4
+          const source = ctx.createBufferSource()
+          source.buffer = buffer
+          source.loop = true
+          const gain = ctx.createGain()
+          gain.gain.value = 1
+          source.connect(gain)
+          gain.connect(ctx.destination)
+          source.start()
+          warmOutput = { source, gain }
+        } catch {
+          /* a page without audio simply has no warm output */
+        }
+      }
+      /**
+       * Play the open cue: baked if it is ready, synthesised if it is not.
+       *
+       * Resolves when the cue has finished sounding, or after `waitMs` if it is still going — the
+       * caller uses that to hold the microphone shut until then. The device is opened by
+       * `getUserMedia`, and opening a capture device on a machine that is already rendering
+       * something makes the audio engine reconfigure; when that lands in the middle of a 0.44 s
+       * chime it is heard as a click inside the chime, which is the one thing a cue must never do.
+       * Waiting for the whole cue is the safe version of that and it costs the listener 0.44 s
+       * before the microphone exists. `waitMs` is the dial between the two: the click lives in the
+       * first frames, so most of the protection is in the first fraction of a second, and 240 ms
+       * buys nearly all of it while opening the microphone before the second note dies away.
+       *
+       * Never rejects and never hangs: a missing context, a refused synthesis or a cue cut short all
+       * resolve, because a late microphone is worse than a chime nobody heard.
+       */
+      function openCue(level, { waitMs = 240 } = {}) {
+        return new Promise((resolve) => {
+          let finished = false
+          const done = (why) => {
+            if (finished) return
+            finished = true
+            resolve(why)
+          }
+          // The guard is what makes this safe to await: a cue that never reports `ended` — because
+          // the context was suspended and never resumed, because the buffer was cut — must not cost
+          // the turn its microphone.
+          const guard = setTimeout(() => done(`cut at ${waitMs} ms`), waitMs)
+          if (openCueBuffer === undefined) {
+            warmOpenCue()
+            tone(CUE_OPEN, level)
+            setTimeout(() => done('synth'), 0)
+            clearTimeout(guard)
+            return
+          }
+          try {
+            const Ctor = globalThis.AudioContext || globalThis.webkitAudioContext
+            if (typeof Ctor !== 'function') { done('no-audio'); clearTimeout(guard); return }
+            if (toneCtx === undefined || toneCtx.state === 'closed') toneCtx = new Ctor()
+            const ctx = toneCtx
+            keepOutputWarm(ctx)
+            hush(ctx.currentTime)
+            // A context that is suspended and resumed *at this moment* starts sounding a few frames
+            // in, and the first frames it owes are the first frames of the cue. Asking for the resume
+            // and starting the note a breath later is the whole difference between a chime and a
+            // chime with something broken at its head.
+            const late = ctx.state === 'suspended'
+            if (late) void ctx.resume().catch(() => {})
+            const at = ctx.currentTime + (late ? 0.12 : 0.01)
+            const gain = ctx.createGain()
+            gain.gain.value = level
+            gain.connect(ctx.destination)
+            const source = ctx.createBufferSource()
+            source.buffer = openCueBuffer
+            source.connect(gain)
+            source.onended = () => {
+              clearTimeout(guard)
+              done('ended')
+            }
+            source.start(at)
+            ringing = { gain, oscs: [source] }
+            tell(`cue: ${late ? 'resumed first' : 'context running'}, ${openCueBuffer.duration.toFixed(2)}s`)
+            setTimeout(() => {
+              try { gain.disconnect() } catch { /* already gone */ }
+              if (ringing !== undefined && ringing.gain === gain) ringing = undefined
+            }, (openCueBuffer.duration + 1.0) * 1000)
+          } catch {
+            tone(CUE_OPEN, level)
+            clearTimeout(guard)
+            done('fallback')
+          }
+        })
       }
       /**
        * Press send, and report whether it went.
@@ -1834,6 +1936,33 @@ window.__ModuleLoader__.load({
       window.__dshOrbListening = () => listening
 
       /**
+       * Hand one transcribed sentence to the host, to be delivered to the conversation the wake
+       * named.
+       *
+       * A POST rather than a composer round trip: the target is another session, and the host's
+       * prompt is the only thing here that can put words into a session this window is not showing.
+       * Returns a reason instead of throwing, so the caller can say why nothing was sent.
+       */
+      async function postWords(text) {
+        try {
+          const signal = giveUpAfter(30_000)
+          const response = await fetch('/.dsh-orb/voice-send', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ text }),
+            credentials: 'same-origin',
+            ...(signal === undefined ? {} : { signal }),
+          })
+          const body = await response.json().catch(() => null)
+          if (response.ok) return { ok: true }
+          const reason = body !== null && typeof body.reason === 'string' ? body.reason : `voice-send said ${response.status}`
+          return { ok: false, reason }
+        } catch (error) {
+          return { ok: false, reason: String((error && error.message) || error) }
+        }
+      }
+
+      /**
        * One sentence, start to finish, on the ball's own line.
        *
        * This opens the device itself, measures the level of the samples it actually receives and
@@ -1844,7 +1973,7 @@ window.__ModuleLoader__.load({
        * Every ending is a cue, because nothing on screen says what happened. A closing phrase is
        * the user getting off: it is dropped rather than typed, the same way the ball drops it.
        */
-      async function voiceTurn(limits, send, graceMs = 0) {
+      async function voiceTurn(limits, send, graceMs = 0, sendTo = '') {
         try {
           // Before the device opens, for the reason `waitForQuiet` gives: a microphone opened into a
           // reply that is still being read records the reply, not the user.
@@ -1858,10 +1987,15 @@ window.__ModuleLoader__.load({
             return 'empty'
           }
           markListening(true)
-          // Still before the device opens, so the cue is not part of the recording. Full scale:
-          // over room noise anything less was easy to miss, and the one thing this cue has to
-          // answer is "did it start listening".
-          tone(CUE_OPEN, 1)
+          // The cue gets a 240 ms head start and then the device opens, mid-chime — the click from a
+          // device reconfiguration lives in the first frames, so the first 240 ms are most of the
+          // protection, and the rest of the wait was costing the listener a fifth of a second for
+          // very little. It is also not part of the recording: the echo canceller is asked for, and
+          // anything it misses sits behind the chime rather than at the head of the utterance. 0.7
+          // rather than the old full scale: the two-note chime rings longer than the single blip it
+          // replaced, and the same peak would land louder than the cue it is standing in for.
+          const cue = await openCue(0.7)
+          tell(`composer recorder: microphone opens after the cue (${cue})`)
           const recorded = await recordUtterance(limits)
           // The device is closed now: the button may go quiet while the words are on their way.
           markListening(false)
@@ -1877,7 +2011,7 @@ window.__ModuleLoader__.load({
           // turn is going to send them instead, the sending cue says the same thing and more, and
           // the two arrive close enough together that the first used to be cut off by the second.
           // One event, one sound.
-          if (!send) tone(CUE_HEARD, 0.8)
+          if (!send && sendTo === '') tone(CUE_HEARD, 0.8)
           let body = null
           let status = 0
           try {
@@ -1905,6 +2039,21 @@ window.__ModuleLoader__.load({
             tone(CUE_SHUT, 0.48)
             tell('composer recorder: the user closed the exchange')
             return 'closing'
+          }
+          // A wake turn can be aimed at one fixed conversation — the one the user pinned and told
+          // the ball to use — and then nothing is written here at all: this window is showing
+          // some other conversation, and words put in its box would be words in the wrong place.
+          // The host owns the target and the prompt, so this is one POST and no DOM.
+          if (sendTo !== '') {
+            const posted = await postWords(text)
+            if (!posted.ok) {
+              tone(CUE_EMPTY, 0.64)
+              tell(`voice target refused the words: ${posted.reason}`)
+              return 'failed'
+            }
+            tell(`sent the transcript to the wake target (${sendTo})`)
+            tone(CUE_SENT, 0.45)
+            return 'sent'
           }
           const before = composerText()
           const blank = before.trim() === ''
@@ -1993,6 +2142,9 @@ window.__ModuleLoader__.load({
           noSpeechMs: numberOr(command.noSpeechMs, DICTATION_FALLBACK.noSpeechMs),
         }
         tell(`wake turn: pause ${limits.silenceMs}ms, no speech ${limits.noSpeechMs}ms, ceiling ${limits.maxSeconds}s, send=${command.send === true}${afterReply ? ' (follow-up)' : ''}`)
+        // A wake turn can name the conversation it belongs to. That is the ball's decision, made
+        // before it handed anything over; this page only carries it along to `voiceTurn`.
+        const sendTo = typeof command.sendTo === 'string' ? command.sendTo : ''
         // A follow-up follows a reply that auto-read may still be fetching, so it gives that job a
         // moment to be queued; a wake turn follows whatever was already playing and waits only for
         // it to end, because four seconds between "我在" and listening is a broken wake word.
@@ -2005,20 +2157,61 @@ window.__ModuleLoader__.load({
             grace = 0
           }
         }
-        return await voiceTurn(limits, command.send === true, grace)
+        return await voiceTurn(limits, command.send === true, grace, sendTo)
+      }
+
+      /**
+       * Tell the ball how the exchange it handed over ended.
+       *
+       * The ball opened its panel for this turn and cannot see this page's microphone, so without
+       * this line it has no way to tell "no words came back" from "words on their way": the panel
+       * it opened would sit there empty until the user closed it by hand. `sent` and `draft` leave
+       * something behind and keep it up; every other ending folds it back.
+       *
+       * `routed` says the words went to another conversation, which the ball also needs: it keeps
+       * a continuous exchange armed for a wake turn and hands the microphone back when the reply
+       * has been read. For a routed turn there is no next sentence to read here — the reply is in
+       * another window — so the ball has to drop that exchange instead of reopening the microphone
+       * on top of a reply it is still speaking.
+       */
+      async function reportTurnOutcome(outcome, routed = false) {
+        try {
+          await fetch('/.dsh-orb/main-voice-result', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(routed ? { outcome, routed: true } : { outcome }),
+            credentials: 'same-origin',
+          })
+        } catch (_error) {
+          // A page without the host, or a host that went away mid-turn. The panel stays open, which
+          // is the same thing the user gets today, and a readout is not worth failing a turn over.
+        }
       }
 
       async function run(command) {
         if (busy) return
         busy = true
+        // Every `return` below is inside the try, and `finally` still runs: an exchange that stopped
+        // because a reply never ended stopped on a turn that *was* sent, so the last value written by
+        // `oneTurn` — `sent` — is the one the ball has to hear, not the default.
+        let outcome = 'failed'
+        // A hand-off that names a conversation belongs to one turn only: the reply is written in
+        // another window, so there is nothing here to wait for and nothing to hand the microphone
+        // back for. Decided once, because the ending report needs it too.
+        const routed = typeof command.sendTo === 'string' && command.sendTo !== ''
         try {
           tell(`hand-off received ${JSON.stringify(command)}; page visible=${document.visibilityState}`)
-          let outcome = await oneTurn(command)
+          outcome = await oneTurn(command)
           // Continuous conversation, as the ball runs it: a sent voice turn hands the microphone
           // back when the reply finishes, so the next sentence needs no wake word. Every other
           // ending — silence, a closing phrase, a failed press — is the user getting off, and the
           // loop ends there.
-          while (outcome === 'sent' && command.continuous === true) {
+          //
+          // A turn that went to another conversation does not continue. Its reply is running in a
+          // window this page is not showing, so there is no reply to wait for here: the loop would
+          // give up on the wait in a couple of seconds and open the microphone on top of an answer
+          // that is still being spoken. The user wakes it again when they want the next sentence.
+          while (outcome === 'sent' && command.continuous === true && !routed) {
             if (!(await waitForReply())) {
               tell('the reply never ended; the exchange stops here')
               return
@@ -2040,6 +2233,7 @@ window.__ModuleLoader__.load({
           tell(`the hand-off failed: ${error && error.message ? error.message : String(error)}`)
         } finally {
           busy = false
+          void reportTurnOutcome(outcome, routed)
         }
       }
       // Baseline, once the composer has had time to mount. This one line answers the first
